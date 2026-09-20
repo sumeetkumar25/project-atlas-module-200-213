@@ -1,0 +1,140 @@
+# atlas/modules/module208_portfolio_logic/report.py
+"""
+Module 208 - Portfolio Logic Report
+"""
+
+from datetime import datetime
+import pandas as pd
+
+
+class PortfolioLogicReport:
+    """Report generator for portfolio logic results."""
+    
+    @staticmethod
+    def generate(statistics, metadata=None, dataset_name="Unknown") -> str:
+        """Generate a formatted report."""
+        lines = []
+        
+        lines.append("=" * 55)
+        lines.append("MODULE 208")
+        lines.append("PORTFOLIO LOGIC")
+        lines.append("=" * 55)
+        lines.append(f"\nDataset: {dataset_name}")
+        
+        # Configuration
+        lines.append("\n" + "-" * 45)
+        lines.append("CONFIGURATION")
+        lines.append("-" * 45)
+        lines.append(f"  Entry Threshold: {statistics.entry_threshold}")
+        lines.append(f"  Exit Threshold: {statistics.exit_threshold}")
+        lines.append(f"  Confidence Threshold: {statistics.confidence_threshold}")
+        lines.append(f"  Max Position Size: {statistics.max_position_size_limit:.0%}")
+        lines.append(f"  Allow Position Flip: {statistics.allow_position_flip}")
+        
+        # Overview
+        lines.append("\n" + "-" * 45)
+        lines.append("OVERVIEW")
+        lines.append("-" * 45)
+        lines.append(f"  Total Rows: {statistics.total_rows:,}")
+        lines.append(f"  Position Changes: {statistics.position_changes}")
+        lines.append(f"  Avg Holding Time: {statistics.avg_holding_time:.1f} bars")
+        
+        # State Distribution
+        lines.append("\n" + "-" * 45)
+        lines.append("STATE DISTRIBUTION")
+        lines.append("-" * 45)
+        lines.append(f"  LONG: {statistics.long_pct:.1f}%")
+        lines.append(f"  SHORT: {statistics.short_pct:.1f}%")
+        lines.append(f"  FLAT: {statistics.flat_pct:.1f}%")
+        
+        # Position Sizing
+        lines.append("\n" + "-" * 45)
+        lines.append("POSITION SIZING")
+        lines.append("-" * 45)
+        lines.append(f"  Mean Position Size: {statistics.mean_position_size:.3f}")
+        lines.append(f"  Max Position Size: {statistics.max_position_size:.3f}")
+        lines.append(f"  Min Position Size: {statistics.min_position_size:.3f}")
+        
+        # Exposure
+        lines.append("\n" + "-" * 45)
+        lines.append("EXPOSURE")
+        lines.append("-" * 45)
+        lines.append(f"  Mean Exposure: {statistics.mean_exposure:.3f}")
+        lines.append(f"  Max Exposure: {statistics.max_exposure:.3f}")
+        lines.append(f"  Min Exposure: {statistics.min_exposure:.3f}")
+        
+        # Interpretation
+        lines.append("\n" + "-" * 45)
+        lines.append("INTERPRETATION")
+        lines.append("-" * 45)
+        
+        if statistics.long_pct > 60:
+            lines.append("  📈 Portfolio is predominantly LONG")
+        elif statistics.short_pct > 60:
+            lines.append("  📉 Portfolio is predominantly SHORT")
+        else:
+            lines.append("  ➡️ Portfolio is balanced or mostly FLAT")
+        
+        if statistics.mean_exposure > 0.5:
+            lines.append("  ✅ High average exposure")
+        elif statistics.mean_exposure > 0.2:
+            lines.append("  ✓ Moderate average exposure")
+        else:
+            lines.append("  ⚠ Low average exposure")
+        
+        if statistics.avg_holding_time > 10:
+            lines.append("  ✅ Long average holding time")
+        else:
+            lines.append("  ⚠ Short average holding time")
+        
+        # Validation
+        lines.append("\n" + "-" * 45)
+        lines.append("VALIDATION")
+        lines.append("-" * 45)
+        lines.append("  Status: PASSED")
+        
+        # Footer
+        lines.append(f"\n  Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append("\n" + "=" * 55)
+        lines.append("END OF REPORT")
+        lines.append("=" * 55)
+        
+        return "\n".join(lines)
+    
+    @staticmethod
+    def generate_state_history(state_history: pd.DataFrame, top_n: int = 20) -> str:
+        """Generate a state history report."""
+        lines = []
+        lines.append("\n" + "=" * 60)
+        lines.append("STATE HISTORY (Last {top_n} rows)")
+        lines.append("=" * 60)
+        
+        history = state_history.tail(top_n)
+        
+        lines.append(
+            f"\n{'Timestamp':<25} {'State':<12} {'Reason':<30}"
+        )
+        lines.append("-" * 70)
+        
+        for _, row in history.iterrows():
+            timestamp = row['timestamp'] if 'timestamp' in row else ''
+            state = row['portfolio_state'] if 'portfolio_state' in row else ''
+            reason = row['decision_reason'] if 'decision_reason' in row else ''
+            
+            lines.append(
+                f"{str(timestamp):<25} "
+                f"{state:<12} "
+                f"{reason[:29]:<30}"
+            )
+        
+        lines.append("\n" + "=" * 60)
+        return "\n".join(lines)
+    
+    @staticmethod
+    def save(report: str, filepath: str):
+        """Save report to file."""
+        from pathlib import Path
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(report)

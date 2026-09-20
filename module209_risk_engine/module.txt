@@ -1,0 +1,267 @@
+# atlas/modules/module209_risk_engine/module.py
+"""
+Module 209
+Risk Engine
+
+Decides whether the desired position is allowed and applies risk constraints.
+
+Pipeline: load portfolio → volatility scaling → position limits → exposure limits →
+          leverage limits → risk approval → statistics → validation → report → export
+"""
+
+from typing import Optional, Dict, Any
+import pandas as pd
+from pathlib import Path
+
+from atlas.core.base_research_module import BaseResearchModule
+from atlas.framework.registry import AtlasRegistry
+
+from .engine import RiskEngine, RiskConfig
+from .statistics import RiskEngineStatisticsEngine
+from .validator import run_validation
+from .report import RiskEngineReport
+from .exporter import RiskEngineExporter
+
+
+class RiskEngineResearch(BaseResearchModule):
+    """Main research module for risk engine."""
+    
+    MODULE_OUTPUT = "module209"
+    METADATA = RiskEngineStatisticsEngine.METADATA
+    
+    def __init__(
+        self,
+        registry: Optional[AtlasRegistry] = None,
+        max_position_size: float = 1.0,
+        max_gross_exposure: float = 1.0,
+        max_net_exposure: float = 1.0,
+        leverage_limit: float = 1.0,
+        volatility_target: float = 0.20,
+        use_volatility_scaling: bool = True,
+        allow_short: bool = True,
+        allow_leverage: bool = False,
+        volatility_window: int = 20,
+        volatility_min_multiplier: float = 0.25,
+        volatility_max_multiplier: float = 1.00,
+        timestamp_column: str = "timestamp",
+        price_column: str = "close"
+    ):
+        """
+        Initialize the risk engine module.
+        
+        Args:
+            registry: Optional Atlas registry
+            max_position_size: Maximum position size (0-1)
+            max_gross_exposure: Maximum gross exposure (0-1)
+            max_net_exposure: Maximum net exposure (0-1)
+            leverage_limit: Maximum leverage
+            volatility_target: Target volatility for scaling
+            use_volatility_scaling: Whether to use volatility scaling
+            allow_short: Whether short positions are allowed
+            allow_leverage: Whether leverage is allowed
+            volatility_window: Window for volatility calculation
+            volatility_min_multiplier: Minimum volatility multiplier
+            volatility_max_multiplier: Maximum volatility multiplier
+            timestamp_column: Name of the timestamp column
+            price_column: Name of the price column
+        """
+        super().__init__(
+            module_name="Risk Engine",
+            module_version=self.METADATA["version"],
+        )
+        
+        self.registry = registry or AtlasRegistry()
+        
+        self.config = RiskConfig(
+            max_position_size=max_position_size,
+            max_gross_exposure=max_gross_exposure,
+            max_net_exposure=max_net_exposure,
+            leverage_limit=leverage_limit,
+            volatility_target=volatility_target,
+            use_volatility_scaling=use_volatility_scaling,
+            allow_short=allow_short,
+            allow_leverage=allow_leverage,
+            volatility_window=volatility_window,
+            volatility_min_multiplier=volatility_min_multiplier,
+            volatility_max_multiplier=volatility_max_multiplier
+        )
+        
+        self.engine = RiskEngine(
+            config=self.config,
+            timestamp_column=timestamp_column,
+            price_column=price_column
+        )
+        self.stats_engine = RiskEngineStatisticsEngine()
+        self.result_data = None
+        self.statistics = None
+        self.risk_events_report = None
+        self._output_dir = None
+        self._paths = None
+
+    def _register_pipeline_steps(self):
+        """Register pipeline steps."""
+        self.pipeline_steps = [
+            ("risk_engine", self._compute_risk),
+            ("statistics", self._compute_statistics),
+            ("validate", self._validate),
+            ("export", self._export_results),
+        ]
+    
+    def _prepare_data(self) -> Dict[str, Any]:
+        """Prepare data."""
+        if self._paths is None:
+            raise ValueError("File paths not provided. Use run_risk_engine() method.")
+        return self._paths
+    
+    def _compute_risk(self) -> Dict[str, Any]:
+        """Step 1: Compute risk engine."""
+        self.logger.info("Step 1: Computing risk engine")
+        
+        prepared = self._prepare_data()
+        
+        self.result_data = self.engine.compute(
+            portfolio_matrix_path=prepared["portfolio_matrix"],
+            output_dir=self._output_dir
+        )
+        
+        self.logger.metric(
+            "Total Rows",
+            f"{self.result_data.summary_statistics['total_rows']:,}"
+        )
+        self.logger.metric(
+            "Approved",
+            f"{self.result_data.summary_statistics['approved_pct']:.1f}%"
+        )
+        self.logger.metric(
+            "Reduced",
+            f"{self.result_data.summary_statistics['reduced_pct']:.1f}%"
+        )
+        self.logger.metric(
+            "Rejected",
+            f"{self.result_data.summary_statistics['rejected_pct']:.1f}%"
+        )
+        self.logger.metric(
+            "Risk Events",
+            str(self.result_data.summary_statistics['total_risk_events'])
+        )
+        self.logger.success("Risk engine computed")
+        
+        # Generate risk events report
+        self.risk_events_report = RiskEngineReport.generate_risk_events_report(
+            self.result_data.risk_events,
+            top_n=20
+        )
+        
+        return {
+            "total_rows": self.result_data.summary_statistics["total_rows"],
+            "approved_pct": self.result_data.summary_statistics["approved_pct"],
+            "reduced_pct": self.result_data.summary_statistics["reduced_pct"],
+            "rejected_pct": self.result_data.summary_statistics["rejected_pct"],
+            "total_risk_events": self.result_data.summary_statistics["total_risk_events"]
+        }
+    
+    def _compute_statistics(self) -> Dict[str, Any]:
+        """Step 2: Computing statistics."""
+        self.logger.info("Step 2: Computing statistics")
+        self.statistics = self.stats_engine.analyze(self.result_data)
+        
+        self.logger.metric(
+            "Mean Abs Position",
+            f"{self.statistics.mean_abs_position:.3f}"
+        )
+        self.logger.metric(
+            "Max Exposure",
+            f"{self.statistics.max_exposure:.3f}"
+        )
+        self.logger.success("Statistics computed")
+        
+        return self.stats_engine.summary_dict(self.statistics)
+    
+    def _validate(self) -> Dict[str, Any]:
+        """Step 3: Validation."""
+        self.logger.info("Step 3: Validation")
+        passed = run_validation(self.result_data, self.statistics)
+        self.logger.success("Validation complete")
+        return {"software_validation_passed": passed}
+    
+    def _export_results(self) -> Dict[str, Any]:
+        """Step 4: Export."""
+        self.logger.info("Step 4: Export")
+        
+        # Register DataFrames as artifacts
+        self.result.artifacts["risk_adjusted_portfolio"] = self.result_data.risk_adjusted_portfolio
+        self.result.artifacts["approved_positions"] = self.result_data.approved_positions
+        self.result.artifacts["risk_events"] = self.result_data.risk_events
+        
+        # Store summary
+        stats_df = pd.DataFrame([self.result_data.summary_statistics])
+        self.result.artifacts["risk_statistics"] = stats_df
+        
+        # Generate and register reports
+        main_report = RiskEngineReport.generate(
+            self.statistics,
+            metadata=self.METADATA,
+            dataset_name=self.result.dataset_identifier,
+        )
+        self.result.artifacts["risk_engine_report"] = main_report
+        self.result.artifacts["risk_events_report"] = self.risk_events_report
+        
+        self.logger.metric("Artifacts", str(len(self.result.artifacts)))
+        self.logger.success("Export complete")
+        
+        return {
+            "export_status": "complete",
+            "artifact_count": len(self.result.artifacts),
+            "total_rows": self.result_data.summary_statistics["total_rows"],
+            "total_risk_events": self.result_data.summary_statistics["total_risk_events"]
+        }
+    
+    def compute(self) -> Dict[str, Any]:
+        """Run the full computation pipeline."""
+        self.logger.section("Risk Engine Pipeline")
+        results = self.execute_pipeline()
+        self.result.status = "completed"
+        self.logger.success("Module 209 complete")
+        return results
+    
+    def run(self, filepath: str, output_dir=None):
+        """Run module on file."""
+        self._output_dir = Path(output_dir) if output_dir else None
+        return super().run(filepath, output_dir)
+    
+    def run_dataframe(self, df, dataset_id="in_memory", output_dir=None):
+        """Run module on a single DataFrame."""
+        self._output_dir = Path(output_dir) if output_dir else None
+        return super().run_dataframe(df, dataset_id, output_dir)
+    
+    def run_risk_engine(
+        self,
+        portfolio_matrix_path: Path,
+        dataset_id: str = "risk_engine",
+        output_dir: Optional[Path] = None
+    ) -> Any:
+        """
+        Run the risk engine.
+        
+        Args:
+            portfolio_matrix_path: Path to portfolio_matrix.parquet from Module 208
+            dataset_id: Identifier for the dataset
+            output_dir: Output directory for results
+        """
+        self._paths = {
+            "portfolio_matrix": portfolio_matrix_path
+        }
+        self._output_dir = Path(output_dir) if output_dir else Path("data/feature_store/risk")
+        
+        # Create a dummy DataFrame to satisfy BaseResearchModule
+        dummy = pd.DataFrame(
+            {
+                "timestamp": [pd.Timestamp("2000-01-01")]
+            }
+        )
+        
+        return super().run_dataframe(
+            dummy,
+            dataset_id=dataset_id,
+            output_dir=self._output_dir
+        )

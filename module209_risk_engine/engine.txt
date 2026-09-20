@@ -1,0 +1,496 @@
+"""
+Module 209 - Risk Engine
+
+Decides whether the desired position is allowed and applies risk constraints.
+
+Pipeline:
+  Desired Position → Volatility Scaling → Position Limits → Exposure Limits →
+  Leverage Limits → Risk Approval → Approved Position
+
+Output: Risk-adjusted portfolio with approval status.
+"""
+
+import numpy as np
+import pandas as pd
+from dataclasses import dataclass
+from typing import Optional, Dict, Any, List, Tuple
+from pathlib import Path
+import warnings
+warnings.filterwarnings('ignore')
+
+
+@dataclass
+class RiskConfig:
+    """Configuration for risk engine."""
+    max_position_size: float = 1.0
+    max_gross_exposure: float = 1.0
+    max_net_exposure: float = 1.0
+    leverage_limit: float = 1.0
+    volatility_target: float = 0.20
+    use_volatility_scaling: bool = True
+    allow_short: bool = True
+    allow_leverage: bool = False
+    volatility_window: int = 20
+    volatility_min_multiplier: float = 0.25
+    volatility_max_multiplier: float = 1.00
+
+
+@dataclass
+class RiskEngineResult:
+    """Results from risk engine analysis."""
+    risk_adjusted_portfolio: pd.DataFrame
+    approved_positions: pd.DataFrame
+    risk_events: pd.DataFrame
+    summary_statistics: Dict[str, Any]
+
+
+class RiskEngine:
+    """Core engine for risk management."""
+
+    # Valid risk states
+    RISK_STATES = [
+        "APPROVED",
+        "REDUCED",
+        "REJECTED",
+        "FLAT",
+        "VOLATILITY_REDUCTION",
+        "EXPOSURE_LIMIT",
+        "LEVERAGE_LIMIT",
+        "SHORT_DISABLED"
+    ]
+
+    def __init__(
+        self,
+        config: Optional[RiskConfig] = None,
+        timestamp_column: str = "timestamp",
+        price_column: str = "close"
+    ):
+        """
+        Initialize the risk engine.
+        
+        Args:
+            config: RiskConfig with risk parameters
+            timestamp_column: Name of the timestamp column
+            price_column: Name of the price column
+        """
+        self.config = config or RiskConfig()
+        self.timestamp_column = timestamp_column
+        self.price_column = price_column
+
+    def load_portfolio_matrix(self, matrix_path: Path) -> pd.DataFrame:
+        """Load the portfolio matrix from Module 208."""
+        if not matrix_path.exists():
+            raise FileNotFoundError(f"Portfolio matrix not found: {matrix_path}")
+        
+        if matrix_path.suffix == '.parquet':
+            df = pd.read_parquet(matrix_path)
+        else:
+            df = pd.read_csv(matrix_path)
+            if self.timestamp_column in df.columns:
+                df[self.timestamp_column] = pd.to_datetime(df[self.timestamp_column])
+        
+        return df
+
+    def compute_volatility_scaling(
+        self,
+        portfolio_df: pd.DataFrame
+    ) -> Tuple[pd.Series, pd.Series]:
+        """
+        Compute volatility scaling multiplier.
+        
+        multiplier = target_vol / rolling_volatility
+        Clipped to [volatility_min_multiplier, volatility_max_multiplier]
+        """
+        if not self.config.use_volatility_scaling:
+            return pd.Series(1.0, index=portfolio_df.index), pd.Series(0.0, index=portfolio_df.index)
+        
+        # Check if we have price data
+        if self.price_column not in portfolio_df.columns:
+            print("  Warning: Price column not found, using no volatility scaling")
+            return pd.Series(1.0, index=portfolio_df.index), pd.Series(0.0, index=portfolio_df.index)
+        
+        # Calculate returns
+        returns = portfolio_df[self.price_column].pct_change()
+        rolling_vol = returns.rolling(window=self.config.volatility_window, min_periods=5).std()
+        
+        # Calculate multiplier
+        multiplier = self.config.volatility_target / (rolling_vol + 1e-12)
+        multiplier = np.clip(multiplier, self.config.volatility_min_multiplier, self.config.volatility_max_multiplier)
+        multiplier = multiplier.fillna(1.0)
+        
+        return multiplier, rolling_vol
+
+    def compute_position_limit(
+        self,
+        desired_position: pd.Series,
+        volatility_multiplier: pd.Series
+    ) -> pd.Series:
+        """
+        Apply position limit and volatility scaling.
+        """
+        # Scale by volatility
+        scaled_position = desired_position * volatility_multiplier
+        
+        # Clip to max position size
+        limited_position = scaled_position.clip(
+            lower=-self.config.max_position_size,
+            upper=self.config.max_position_size
+        )
+        
+        return limited_position
+
+    def compute_exposure_limit(
+        self,
+        position: pd.Series,
+        max_exposure: float
+    ) -> Tuple[pd.Series, pd.Series]:
+        """
+        Apply exposure limits using clip.
+        """
+        gross = position.abs()
+        exceeded = gross > max_exposure
+        
+        limited = position.clip(
+            lower=-max_exposure,
+            upper=max_exposure
+        )
+        
+        return limited, exceeded
+
+    def compute_leverage_limit(
+        self,
+        position: pd.Series,
+        leverage_limit: float
+    ) -> Tuple[pd.Series, pd.Series]:
+        """
+        Apply leverage limits using clip.
+        """
+        leverage = position.abs()
+        exceeded = leverage > leverage_limit
+        
+        limited = position.clip(
+            lower=-leverage_limit,
+            upper=leverage_limit
+        )
+        
+        return limited, exceeded
+
+    def approve_position(
+        self,
+        desired_position: pd.Series,
+        size: pd.Series,
+        volatility_multiplier: pd.Series,
+        position_limit: pd.Series,
+        exposure_limit: pd.Series,
+        leverage_limit: pd.Series
+    ) -> Tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
+        """
+        Approve position with risk reasons based on the pipeline stages.
+        
+        The approval stage determines the risk_reason by comparing:
+        1. desired_position (original)
+        2. volatility_scaled (after volatility scaling)
+        3. position_limited (after position limit)
+        4. exposure_limited (after exposure limit)
+        5. leverage_limited (after leverage limit)
+        """
+        n = len(desired_position)
+        
+        approved_position = pd.Series(0.0, index=desired_position.index)
+        approved_size = pd.Series(0.0, index=desired_position.index)
+        risk_reason = pd.Series("", index=desired_position.index, dtype='object')
+        risk_state = pd.Series("FLAT", index=desired_position.index, dtype='object')
+        
+        for i in range(n):
+            des_pos = desired_position.iloc[i]
+            pos_size = size.iloc[i]
+            vol_mult = volatility_multiplier.iloc[i]
+            pos_lim = position_limit.iloc[i]
+            exp_lim = exposure_limit.iloc[i]
+            lev_lim = leverage_limit.iloc[i]
+            
+            # If desired position is FLAT
+            if des_pos == 0:
+                approved_position.iloc[i] = 0.0
+                approved_size.iloc[i] = 0.0
+                risk_reason.iloc[i] = "FLAT"
+                risk_state.iloc[i] = "FLAT"
+                continue
+            
+            # Check short positions
+            if des_pos < 0 and not self.config.allow_short:
+                approved_position.iloc[i] = 0.0
+                approved_size.iloc[i] = 0.0
+                risk_reason.iloc[i] = "SHORT_DISABLED"
+                risk_state.iloc[i] = "REJECTED"
+                continue
+            
+            # Determine the final position and reason by comparing pipeline stages
+            # Start with desired position
+            current_pos = des_pos
+            final_reason = "APPROVED"
+            final_state = "APPROVED"
+            
+            # Stage 1: Volatility scaling
+            if self.config.use_volatility_scaling:
+                scaled_pos = des_pos * vol_mult
+                if abs(scaled_pos) < abs(des_pos):
+                    # Volatility reduced the position
+                    final_reason = "VOLATILITY_REDUCTION"
+                    final_state = "REDUCED"
+                    current_pos = scaled_pos
+                else:
+                    current_pos = scaled_pos
+            
+            # Stage 2: Position limit
+            if abs(current_pos) > abs(pos_lim):
+                if abs(current_pos) > self.config.max_position_size:
+                    final_reason = "POSITION_LIMIT"
+                    final_state = "REDUCED"
+                current_pos = pos_lim
+            
+            # Stage 3: Exposure limit
+            if abs(current_pos) > abs(exp_lim):
+                if abs(current_pos) > self.config.max_gross_exposure:
+                    final_reason = "EXPOSURE_LIMIT"
+                    final_state = "REDUCED"
+                current_pos = exp_lim
+            
+            # Stage 4: Leverage limit
+            if abs(current_pos) > abs(lev_lim):
+                if abs(current_pos) > self.config.leverage_limit:
+                    final_reason = "LEVERAGE_LIMIT"
+                    final_state = "REDUCED"
+                current_pos = lev_lim
+            
+            # If final position is 0 but desired was non-zero
+            if current_pos == 0 and des_pos != 0:
+                final_reason = "REJECTED"
+                final_state = "REJECTED"
+            
+            # If position was fully approved (no reduction)
+            if final_reason == "APPROVED" and current_pos == des_pos:
+                final_reason = "APPROVED"
+                final_state = "APPROVED"
+            
+            approved_position.iloc[i] = current_pos
+            approved_size.iloc[i] = abs(current_pos)
+            risk_reason.iloc[i] = final_reason
+            risk_state.iloc[i] = final_state
+        
+        return approved_position, approved_size, risk_reason, risk_state
+
+    def compute_statistics(
+        self,
+        portfolio_df: pd.DataFrame,
+        approved_position: pd.Series,
+        risk_state: pd.Series,
+        risk_reason: pd.Series
+    ) -> Dict[str, Any]:
+        """
+        Compute risk statistics.
+        """
+        total_rows = len(portfolio_df)
+        
+        # Risk state counts
+        approved_count = np.sum(risk_state == "APPROVED")
+        reduced_count = np.sum(risk_state == "REDUCED")
+        rejected_count = np.sum(risk_state == "REJECTED")
+        flat_count = np.sum(risk_state == "FLAT")
+        
+        # Position statistics
+        non_flat = approved_position[risk_state != "FLAT"]
+        
+        # Exposure
+        exposure = np.abs(approved_position)
+        
+        # Risk events
+        exposure_events = np.sum(risk_reason == "EXPOSURE_LIMIT")
+        leverage_events = np.sum(risk_reason == "LEVERAGE_LIMIT")
+        volatility_events = np.sum(risk_reason == "VOLATILITY_REDUCTION")
+        short_events = np.sum(risk_reason == "SHORT_DISABLED")
+        
+        stats = {
+            'total_rows': total_rows,
+            'approved_count': int(approved_count),
+            'reduced_count': int(reduced_count),
+            'rejected_count': int(rejected_count),
+            'flat_count': int(flat_count),
+            'approved_pct': approved_count / total_rows * 100,
+            'reduced_pct': reduced_count / total_rows * 100,
+            'rejected_pct': rejected_count / total_rows * 100,
+            'flat_pct': flat_count / total_rows * 100,
+            'mean_position': float(approved_position.mean()),
+            'max_position': float(approved_position.max()),
+            'min_position': float(approved_position.min()),
+            'mean_abs_position': float(np.abs(approved_position).mean()),
+            'max_abs_position': float(np.abs(approved_position).max()),
+            'mean_exposure': float(exposure.mean()),
+            'max_exposure': float(exposure.max()),
+            'exposure_events': int(exposure_events),
+            'leverage_events': int(leverage_events),
+            'volatility_events': int(volatility_events),
+            'short_events': int(short_events),
+            'total_risk_events': int(exposure_events + leverage_events + volatility_events + short_events),
+            'max_position_size': self.config.max_position_size,
+            'max_gross_exposure': self.config.max_gross_exposure,
+            'leverage_limit': self.config.leverage_limit,
+            'volatility_target': self.config.volatility_target,
+            'allow_short': self.config.allow_short,
+            'allow_leverage': self.config.allow_leverage,
+            'use_volatility_scaling': self.config.use_volatility_scaling
+        }
+        
+        return stats
+
+    def save_outputs(
+        self,
+        risk_adjusted_portfolio: pd.DataFrame,
+        approved_positions: pd.DataFrame,
+        risk_events: pd.DataFrame,
+        stats: Dict[str, Any],
+        output_dir: Path
+    ) -> None:
+        """Save all outputs."""
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Risk adjusted portfolio
+        matrix_path = output_dir / "risk_adjusted_portfolio.parquet"
+        risk_adjusted_portfolio.to_parquet(matrix_path, index=False)
+        print(f"  Saved risk adjusted portfolio to {matrix_path}")
+        
+        # Approved positions
+        positions_path = output_dir / "approved_positions.csv"
+        approved_positions.to_csv(positions_path, index=False)
+        print(f"  Saved approved positions to {positions_path}")
+        
+        # Risk events
+        events_path = output_dir / "risk_events.csv"
+        risk_events.to_csv(events_path, index=False)
+        print(f"  Saved risk events to {events_path}")
+        
+        # Statistics
+        stats_df = pd.DataFrame([stats])
+        stats_path = output_dir / "risk_statistics.csv"
+        stats_df.to_csv(stats_path, index=False)
+        print(f"  Saved risk statistics to {stats_path}")
+
+    def compute(
+        self,
+        portfolio_matrix_path: Path,
+        output_dir: Optional[Path] = None
+    ) -> RiskEngineResult:
+        """
+        Main computation method.
+        """
+        print("\n  Computing Risk Engine...")
+        print(f"  Max Position Size: {self.config.max_position_size}")
+        print(f"  Max Exposure: {self.config.max_gross_exposure}")
+        print(f"  Leverage Limit: {self.config.leverage_limit}")
+        print(f"  Volatility Target: {self.config.volatility_target}")
+        print(f"  Allow Short: {self.config.allow_short}")
+        
+        if output_dir is None:
+            output_dir = Path("data/feature_store/risk")
+        
+        # Load portfolio matrix
+        print(f"  Loading portfolio matrix from: {portfolio_matrix_path}")
+        portfolio_df = self.load_portfolio_matrix(portfolio_matrix_path)
+        print(f"  Shape: {portfolio_df.shape}")
+        
+        # Extract columns
+        required_cols = ['signal', 'confidence', 'desired_position', 'position_size', 'actual_position']
+        missing = set(required_cols) - set(portfolio_df.columns)
+        if missing:
+            raise ValueError(f"Missing columns in portfolio matrix: {missing}")
+        
+        signal = portfolio_df['signal']
+        confidence = portfolio_df['confidence']
+        desired_position = portfolio_df['desired_position']
+        position_size = portfolio_df['position_size']
+        actual_position = portfolio_df['actual_position']
+        
+        # Compute volatility scaling
+        print("  Computing volatility scaling...")
+        volatility_multiplier, rolling_vol = self.compute_volatility_scaling(portfolio_df)
+        
+        # Compute position limit
+        print("  Computing position limits...")
+        position_limit = self.compute_position_limit(desired_position, volatility_multiplier)
+        
+        # Compute exposure limit
+        print("  Computing exposure limits...")
+        exposure_limited, exposure_exceed = self.compute_exposure_limit(
+            position_limit, self.config.max_gross_exposure
+        )
+        
+        # Compute leverage limit
+        print("  Computing leverage limits...")
+        leverage_limited, leverage_exceed = self.compute_leverage_limit(
+            exposure_limited, self.config.leverage_limit
+        )
+        
+        # Approve position
+        print("  Approving positions...")
+        approved_position, approved_size, risk_reason, risk_state = self.approve_position(
+            desired_position,
+            position_size,
+            volatility_multiplier,
+            position_limit,
+            exposure_limited,
+            leverage_limited
+        )
+        
+        # Compute statistics
+        print("  Computing risk statistics...")
+        stats = self.compute_statistics(
+            portfolio_df, approved_position, risk_state, risk_reason
+        )
+        
+        # Build risk adjusted portfolio
+        risk_adjusted_portfolio = pd.DataFrame({
+            self.timestamp_column: portfolio_df[self.timestamp_column],
+            'signal': signal.values,
+            'confidence': confidence.values,
+            'desired_position': desired_position.values,
+            'requested_size': position_size.values,
+            'approved_size': approved_size.values,
+            'approved_position': approved_position.values,
+            'volatility_multiplier': volatility_multiplier.values,
+            'risk_reason': risk_reason.values,
+            'risk_state': risk_state.values
+        })
+        
+        # Build approved positions DataFrame
+        approved_positions = risk_adjusted_portfolio[
+            risk_adjusted_portfolio['risk_state'] == "APPROVED"
+        ].copy()
+        
+        # Build risk events DataFrame
+        risk_events = risk_adjusted_portfolio[
+            risk_adjusted_portfolio['risk_state'].isin(["REDUCED", "REJECTED"])
+        ].copy()
+        
+        # Save outputs
+        print("\n  Saving outputs...")
+        self.save_outputs(
+            risk_adjusted_portfolio,
+            approved_positions,
+            risk_events,
+            stats,
+            output_dir
+        )
+        
+        print(f"\n  Risk Summary:")
+        print(f"    Total Rows: {stats['total_rows']:,}")
+        print(f"    Approved: {stats['approved_pct']:.1f}%")
+        print(f"    Reduced: {stats['reduced_pct']:.1f}%")
+        print(f"    Rejected: {stats['rejected_pct']:.1f}%")
+        print(f"    Risk Events: {stats['total_risk_events']}")
+        
+        return RiskEngineResult(
+            risk_adjusted_portfolio=risk_adjusted_portfolio,
+            approved_positions=approved_positions,
+            risk_events=risk_events,
+            summary_statistics=stats
+        )

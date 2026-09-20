@@ -1,0 +1,505 @@
+"""
+Module 210 - Integration Test
+
+Tests execution simulation engine, statistics, validator, report, and pipeline.
+"""
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
+
+import numpy as np
+import pandas as pd
+import tempfile
+
+from atlas.modules.module210_execution_simulation.engine import ExecutionSimulationEngine, ExecutionConfig
+from atlas.modules.module210_execution_simulation.statistics import ExecutionStatisticsEngine
+from atlas.modules.module210_execution_simulation.validator import run_validation
+from atlas.modules.module210_execution_simulation.module import ExecutionSimulationResearch
+
+
+def create_test_data(n=100, seed=42):
+    """Create synthetic test data for execution simulation."""
+    np.random.seed(seed)
+    
+    timestamps = pd.date_range('2020-01-01', periods=n, freq='1h')
+    
+    # Create portfolio data with fractional positions
+    approved_position = np.random.choice(
+        [-1.0, 0.0, 1.0],
+        n,
+        p=[0.2, 0.6, 0.2]
+    ).astype(float)
+    
+    approved_size = np.abs(approved_position) * np.random.uniform(0.2, 0.8, n)
+    risk_state = np.random.choice(['APPROVED', 'REDUCED', 'REJECTED', 'FLAT'], n)
+    
+    portfolio_df = pd.DataFrame({
+        'timestamp': timestamps,
+        'approved_position': approved_position,
+        'approved_size': approved_size,
+        'risk_state': risk_state,
+        'signal': np.random.randn(n) * 0.3,
+        'confidence': np.random.uniform(0.4, 0.9, n),
+        'open': 100 + np.random.randn(n) * 0.5,
+        'high': 100 + np.random.randn(n) * 0.5 + np.abs(np.random.randn(n) * 0.2),
+        'low': 100 + np.random.randn(n) * 0.5 - np.abs(np.random.randn(n) * 0.2),
+        'close': 100 + np.random.randn(n) * 0.5
+    })
+    
+    return {
+        'portfolio_matrix': portfolio_df
+    }
+
+
+def test_engine_load_portfolio():
+    """Test 1: Load portfolio matrix."""
+    print("\n" + "=" * 60)
+    print("TEST 1: Load Portfolio Matrix")
+    print("=" * 60)
+    
+    data = create_test_data()
+    engine = ExecutionSimulationEngine()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        matrix_path = tmp_path / "portfolio_matrix.parquet"
+        data['portfolio_matrix'].to_parquet(matrix_path, index=False)
+        
+        loaded_df = engine.load_portfolio(matrix_path)
+        
+        assert not loaded_df.empty
+        assert 'timestamp' in loaded_df.columns
+        assert 'approved_position' in loaded_df.columns
+    
+    print("  ✓ Load portfolio matrix test passed")
+    return True
+
+
+def test_engine_generate_orders():
+    """Test 2: Generate orders."""
+    print("\n" + "=" * 60)
+    print("TEST 2: Generate Orders")
+    print("=" * 60)
+    
+    data = create_test_data()
+    engine = ExecutionSimulationEngine()
+    
+    portfolio_df = data['portfolio_matrix']
+    orders_df = engine.generate_orders(portfolio_df)
+    
+    assert not orders_df.empty
+    assert 'order_type' in orders_df.columns
+    assert 'size_change' in orders_df.columns
+    
+    print(f"  Generated {len(orders_df)} orders")
+    print("  ✓ Generate orders test passed")
+    return True
+
+
+def test_engine_execution_delay():
+    """Test 3: Execution delay."""
+    print("\n" + "=" * 60)
+    print("TEST 3: Execution Delay")
+    print("=" * 60)
+    
+    config = ExecutionConfig(latency_bars=1)
+    engine = ExecutionSimulationEngine(config=config)
+    
+    data = create_test_data()
+    portfolio_df = data['portfolio_matrix']
+    orders_df = engine.generate_orders(portfolio_df)
+    
+    delayed_orders = engine.apply_execution_delay(orders_df, portfolio_df)
+    
+    if not delayed_orders.empty:
+        assert 'execution_index' in delayed_orders.columns
+        assert 'execution_timestamp' in delayed_orders.columns
+        # Check delay applied
+        for _, order in delayed_orders.iterrows():
+            if order['order_index'] + config.latency_bars < len(portfolio_df):
+                assert order['execution_index'] == order['order_index'] + config.latency_bars
+    
+    print("  ✓ Execution delay test passed")
+    return True
+
+
+def test_engine_slippage():
+    """Test 4: Slippage."""
+    print("\n" + "=" * 60)
+    print("TEST 4: Slippage")
+    print("=" * 60)
+    
+    config = ExecutionConfig(slippage_rate=0.0001)
+    engine = ExecutionSimulationEngine(config=config)
+    
+    data = create_test_data()
+    portfolio_df = data['portfolio_matrix']
+    
+    # Test buy order (positive slippage)
+    price, slippage = engine.apply_slippage(portfolio_df, 0, "BUY")
+    assert slippage >= 0
+    assert price >= portfolio_df['open'].iloc[0]
+    
+    # Test sell order (negative slippage)
+    price, slippage = engine.apply_slippage(portfolio_df, 0, "SELL")
+    assert slippage >= 0
+    assert price <= portfolio_df['open'].iloc[0]
+    
+    print("  ✓ Slippage test passed")
+    return True
+
+
+def test_engine_commission():
+    """Test 5: Commission."""
+    print("\n" + "=" * 60)
+    print("TEST 5: Commission")
+    print("=" * 60)
+    
+    config = ExecutionConfig(commission_rate=0.0004)
+    engine = ExecutionSimulationEngine(config=config)
+    
+    commission = engine.apply_commission(1.0, 100.0)
+    assert commission == 0.04
+    
+    commission = engine.apply_commission(2.5, 50.0)
+    assert commission == 0.05
+    
+    print("  ✓ Commission test passed")
+    return True
+
+
+def test_engine_long_trade():
+    """Test 6: Long trade execution."""
+    print("\n" + "=" * 60)
+    print("TEST 6: Long Trade Execution")
+    print("=" * 60)
+    
+    data = create_test_data()
+    engine = ExecutionSimulationEngine()
+    
+    portfolio_df = data['portfolio_matrix']
+    
+    # Force a long trade sequence with fractional positions
+    portfolio_df.loc[0, 'approved_position'] = 0.0
+    portfolio_df.loc[1, 'approved_position'] = 0.5
+    portfolio_df.loc[5, 'approved_position'] = 0.0
+    
+    orders_df = engine.generate_orders(portfolio_df)
+    delayed_orders = engine.apply_execution_delay(orders_df, portfolio_df)
+    execution_events, position_history = engine.execute_orders(portfolio_df, delayed_orders)
+    
+    if not execution_events.empty:
+        # Should have BUY and SELL events
+        event_types = execution_events['event_type'].unique()
+        assert 'BUY' in event_types or 'OPEN_LONG' in event_types
+    
+    print("  ✓ Long trade test passed")
+    return True
+
+
+def test_engine_short_trade():
+    """Test 7: Short trade execution."""
+    print("\n" + "=" * 60)
+    print("TEST 7: Short Trade Execution")
+    print("=" * 60)
+    
+    data = create_test_data()
+    engine = ExecutionSimulationEngine()
+    
+    portfolio_df = data['portfolio_matrix']
+    
+    # Force a short trade sequence with fractional positions
+    portfolio_df.loc[0, 'approved_position'] = 0.0
+    portfolio_df.loc[1, 'approved_position'] = -0.5
+    portfolio_df.loc[5, 'approved_position'] = 0.0
+    
+    orders_df = engine.generate_orders(portfolio_df)
+    delayed_orders = engine.apply_execution_delay(orders_df, portfolio_df)
+    execution_events, position_history = engine.execute_orders(portfolio_df, delayed_orders)
+    
+    if not execution_events.empty:
+        # Should have SHORT and COVER events
+        event_types = execution_events['event_type'].unique()
+        assert 'SHORT' in event_types or 'OPEN_SHORT' in event_types
+    
+    print("  ✓ Short trade test passed")
+    return True
+
+
+def test_engine_trade_lifecycle():
+    """Test 8: Complete trade lifecycle with fractional positions."""
+    print("\n" + "=" * 60)
+    print("TEST 8: Trade Lifecycle")
+    print("=" * 60)
+    
+    data = create_test_data()
+    engine = ExecutionSimulationEngine()
+    
+    portfolio_df = data['portfolio_matrix']
+    
+    # Force a complete trade lifecycle with fractional positions
+    portfolio_df.loc[0, 'approved_position'] = 0.0
+    portfolio_df.loc[1, 'approved_position'] = 0.5
+    portfolio_df.loc[2, 'approved_position'] = 0.5
+    portfolio_df.loc[3, 'approved_position'] = 0.0
+    portfolio_df.loc[4, 'approved_position'] = -0.3
+    portfolio_df.loc[5, 'approved_position'] = -0.3
+    portfolio_df.loc[6, 'approved_position'] = 0.0
+    portfolio_df.loc[7, 'approved_position'] = 0.75
+    portfolio_df.loc[8, 'approved_position'] = 0.75
+    portfolio_df.loc[9, 'approved_position'] = 0.0
+    
+    orders_df = engine.generate_orders(portfolio_df)
+    delayed_orders = engine.apply_execution_delay(orders_df, portfolio_df)
+    execution_events, position_history = engine.execute_orders(portfolio_df, delayed_orders)
+    trade_log = engine.build_trade_log(execution_events, portfolio_df)
+    
+    # Should have created trades
+    if not trade_log.empty:
+        # Check trade fields
+        assert 'trade_id' in trade_log.columns
+        assert 'direction' in trade_log.columns
+        assert 'entry_price' in trade_log.columns
+        assert 'exit_price' in trade_log.columns
+        assert 'executed_size' in trade_log.columns
+        
+        # Check fractional positions
+        for _, trade in trade_log.iterrows():
+            assert trade['executed_size'] > 0
+            # Size should be a float (0.5, 0.3, 0.75, etc.)
+            assert isinstance(trade['executed_size'], float)
+    
+    print("  ✓ Trade lifecycle test passed")
+    return True
+
+
+def test_engine_statistics():
+    """Test 9: Statistics."""
+    print("\n" + "=" * 60)
+    print("TEST 9: Statistics")
+    print("=" * 60)
+    
+    engine = ExecutionSimulationEngine()
+    
+    # Create sample trade log
+    trade_log = pd.DataFrame({
+        'trade_id': [1, 2],
+        'direction': ['LONG', 'SHORT'],
+        'holding_bars': [10, 5],
+        'total_slippage': [0.01, 0.02],
+        'total_commission': [0.04, 0.03],
+        'executed_size': [0.5, 0.3]
+    })
+    
+    execution_events = pd.DataFrame({
+        'event_type': ['BUY', 'SELL', 'SHORT', 'COVER']
+    })
+    
+    stats = engine.compute_statistics(trade_log, execution_events)
+    
+    assert stats['long_trades'] == 1
+    assert stats['short_trades'] == 1
+    assert stats['average_holding_bars'] == 7.5
+    
+    print("  ✓ Statistics test passed")
+    return True
+
+
+def test_engine_compute():
+    """Test 10: Full engine computation."""
+    print("\n" + "=" * 60)
+    print("TEST 10: Full Engine Computation")
+    print("=" * 60)
+    
+    data = create_test_data()
+    engine = ExecutionSimulationEngine()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        output_dir = tmp_path / "output"
+        
+        matrix_path = tmp_path / "portfolio_matrix.parquet"
+        data['portfolio_matrix'].to_parquet(matrix_path, index=False)
+        
+        result = engine.compute(
+            portfolio_matrix_path=matrix_path,
+            output_dir=output_dir
+        )
+        
+        assert not result.executed_trade_log.empty
+        assert not result.execution_events.empty
+        assert not result.position_history.empty
+        assert result.summary_statistics['total_events'] > 0
+        
+        # Check outputs were saved
+        assert (output_dir / "executed_trade_log.parquet").exists()
+        assert (output_dir / "execution_events.csv").exists()
+        assert (output_dir / "position_history.csv").exists()
+        assert (output_dir / "execution_statistics.csv").exists()
+    
+    print("  ✓ Full engine test passed")
+    return True
+
+
+def test_statistics():
+    """Test 11: Statistics engine."""
+    print("\n" + "=" * 60)
+    print("TEST 11: Statistics Engine")
+    print("=" * 60)
+    
+    data = create_test_data()
+    engine = ExecutionSimulationEngine()
+    stats_engine = ExecutionStatisticsEngine()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        output_dir = tmp_path / "output"
+        
+        matrix_path = tmp_path / "portfolio_matrix.parquet"
+        data['portfolio_matrix'].to_parquet(matrix_path, index=False)
+        
+        result = engine.compute(
+            portfolio_matrix_path=matrix_path,
+            output_dir=output_dir
+        )
+        
+        stats = stats_engine.analyze(result)
+        
+        assert stats.orders_generated == result.summary_statistics['orders_generated']
+        assert stats.total_events == result.summary_statistics['total_events']
+        assert stats.long_trades == result.summary_statistics['long_trades']
+    
+    print("  ✓ Statistics test passed")
+    return True
+
+
+def test_validator():
+    """Test 12: Validator."""
+    print("\n" + "=" * 60)
+    print("TEST 12: Validator")
+    print("=" * 60)
+    
+    data = create_test_data()
+    engine = ExecutionSimulationEngine()
+    stats_engine = ExecutionStatisticsEngine()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        output_dir = tmp_path / "output"
+        
+        matrix_path = tmp_path / "portfolio_matrix.parquet"
+        data['portfolio_matrix'].to_parquet(matrix_path, index=False)
+        
+        result = engine.compute(
+            portfolio_matrix_path=matrix_path,
+            output_dir=output_dir
+        )
+        
+        stats = stats_engine.analyze(result)
+        
+        passed = run_validation(result, stats)
+        assert passed
+    
+    print("  ✓ Validator test passed")
+    return True
+
+
+def test_pipeline():
+    """Test 13: Full pipeline."""
+    print("\n" + "=" * 60)
+    print("TEST 13: Full Pipeline")
+    print("=" * 60)
+    
+    data = create_test_data()
+    
+    # Use clean output structure (no outputs folder)
+    project_root = Path(__file__).resolve().parents[3]
+    output_dir = (
+        project_root
+        / "research_results"
+        / "module210_execution_simulation"
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    matrix_path = output_dir / "portfolio_matrix.parquet"
+    data['portfolio_matrix'].to_parquet(matrix_path, index=False)
+    
+    research = ExecutionSimulationResearch(
+        commission_rate=0.0004,
+        slippage_rate=0.0001,
+        latency_bars=1
+    )
+    
+    result = research.run_execution(
+        portfolio_matrix_path=matrix_path,
+        dataset_id="pipeline_test",
+        output_dir=output_dir
+    )
+    
+    assert result.status == "completed"
+    assert "executed_trade_log" in result.artifacts
+    assert "execution_events" in result.artifacts
+    assert "position_history" in result.artifacts
+    assert "execution_statistics" in result.artifacts
+    assert "execution_simulation_report" in result.artifacts
+    assert "trade_log_report" in result.artifacts
+    assert result.statistics.get("software_validation_passed") == True
+    
+    # Check outputs were saved
+    assert (output_dir / "executed_trade_log.parquet").exists()
+    assert (output_dir / "execution_events.csv").exists()
+    assert (output_dir / "position_history.csv").exists()
+    assert (output_dir / "execution_statistics.csv").exists()
+    
+    print(f"  Output saved to: {output_dir}")
+    print("  ✓ Full pipeline test passed")
+    return True
+
+
+def main():
+    """Run all tests."""
+    print("\n" + "=" * 70)
+    print("PROJECT ATLAS - MODULE 210 INTEGRATION TEST")
+    print("Execution Simulation")
+    print("=" * 70)
+    
+    results = {}
+    
+    results["load_portfolio"] = test_engine_load_portfolio()
+    results["generate_orders"] = test_engine_generate_orders()
+    results["execution_delay"] = test_engine_execution_delay()
+    results["slippage"] = test_engine_slippage()
+    results["commission"] = test_engine_commission()
+    results["long_trade"] = test_engine_long_trade()
+    results["short_trade"] = test_engine_short_trade()
+    results["trade_lifecycle"] = test_engine_trade_lifecycle()
+    results["statistics"] = test_engine_statistics()
+    results["full_engine"] = test_engine_compute()
+    results["statistics_engine"] = test_statistics()
+    results["validator"] = test_validator()
+    results["pipeline"] = test_pipeline()
+    
+    print("\n" + "=" * 70)
+    print("RESULTS")
+    print("=" * 70)
+    
+    for name, ok in results.items():
+        print(f"  {'✓' if ok else '✗'} {name}")
+    
+    passed = sum(results.values())
+    total = len(results)
+    
+    print(f"\n  {passed}/{total} tests passed")
+    
+    if passed == total:
+        print("\n✓ Module 210 VALIDATED")
+        return 0
+    else:
+        print("\n⚠ Some tests failed")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

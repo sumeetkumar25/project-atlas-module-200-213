@@ -1,0 +1,9 @@
+# atlas/modules/module210_execution_simulation/__init__.py
+"""
+Module 210
+Execution Simulation
+"""
+
+from .module import ExecutionSimulationResearch
+
+__all__ = ["ExecutionSimulationResearch"]

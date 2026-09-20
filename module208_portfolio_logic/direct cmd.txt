@@ -1,0 +1,1 @@
+python -m atlas.modules.module208_portfolio_logic.test_module

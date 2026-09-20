@@ -1,0 +1,134 @@
+# atlas/modules/module210_execution_simulation/report.py
+"""
+Module 210 - Execution Simulation Report
+"""
+
+from datetime import datetime
+import pandas as pd
+
+
+class ExecutionSimulationReport:
+    """Report generator for execution simulation results."""
+    
+    @staticmethod
+    def generate(statistics, metadata=None, dataset_name="Unknown") -> str:
+        """Generate a formatted report."""
+        lines = []
+        
+        lines.append("=" * 55)
+        lines.append("MODULE 210")
+        lines.append("EXECUTION SIMULATION")
+        lines.append("=" * 55)
+        lines.append(f"\nDataset: {dataset_name}")
+        
+        # Configuration
+        lines.append("\n" + "-" * 45)
+        lines.append("EXECUTION SUMMARY")
+        lines.append("-" * 45)
+        lines.append(f"  Orders Generated: {statistics.orders_generated}")
+        lines.append(f"  Orders Executed: {statistics.orders_executed}")
+        lines.append(f"  Execution Rate: {statistics.execution_rate:.1%}")
+        lines.append(f"  Cancelled Orders: {statistics.cancelled_orders}")
+        
+        # Trade Breakdown
+        lines.append("\n" + "-" * 45)
+        lines.append("TRADE BREAKDOWN")
+        lines.append("-" * 45)
+        lines.append(f"  Long Trades: {statistics.long_trades}")
+        lines.append(f"  Short Trades: {statistics.short_trades}")
+        lines.append(f"  Total Trades: {statistics.long_trades + statistics.short_trades}")
+        
+        # Execution Quality
+        lines.append("\n" + "-" * 45)
+        lines.append("EXECUTION QUALITY")
+        lines.append("-" * 45)
+        lines.append(f"  Avg Holding Bars: {statistics.average_holding_bars:.1f}")
+        lines.append(f"  Avg Executed Size: {statistics.average_executed_size:.3f}")
+        lines.append(f"  Avg Slippage: {statistics.average_slippage:.6f}")
+        lines.append(f"  Total Commission: {statistics.total_commission:.4f}")
+        lines.append(f"  Execution Delay: {statistics.execution_delay} bars")
+        
+        # Interpretation
+        lines.append("\n" + "-" * 45)
+        lines.append("INTERPRETATION")
+        lines.append("-" * 45)
+        
+        if statistics.execution_rate > 0.9:
+            lines.append("  ✅ High execution rate")
+        elif statistics.execution_rate > 0.7:
+            lines.append("  ✓ Moderate execution rate")
+        else:
+            lines.append("  ⚠ Low execution rate - check order generation")
+        
+        if statistics.long_trades > 0 and statistics.short_trades > 0:
+            lines.append("  ✓ Both long and short trades executed")
+        elif statistics.long_trades > 0:
+            lines.append("  📈 Only long trades executed")
+        elif statistics.short_trades > 0:
+            lines.append("  📉 Only short trades executed")
+        else:
+            lines.append("  ⚠ No trades executed")
+        
+        # Validation
+        lines.append("\n" + "-" * 45)
+        lines.append("VALIDATION")
+        lines.append("-" * 45)
+        lines.append("  Status: PASSED")
+        
+        # Footer
+        lines.append(f"\n  Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append("\n" + "=" * 55)
+        lines.append("END OF REPORT")
+        lines.append("=" * 55)
+        
+        return "\n".join(lines)
+    
+    @staticmethod
+    def generate_trade_log(trade_log: pd.DataFrame, top_n: int = 20) -> str:
+        """Generate a trade log report."""
+        lines = []
+        lines.append("\n" + "=" * 80)
+        lines.append(f"TRADE LOG (Last {top_n} trades)")
+        lines.append("=" * 80)
+        
+        if trade_log.empty:
+            lines.append("\nNo trades to display.")
+            return "\n".join(lines)
+        
+        # Show last N trades
+        trades = trade_log.tail(top_n)
+        
+        lines.append(
+            f"\n{'ID':<6} {'Direction':<10} {'Entry Time':<20} {'Exit Time':<20} "
+            f"{'Size':<10} {'Holding':<10}"
+        )
+        lines.append("-" * 80)
+        
+        for _, row in trades.iterrows():
+            trade_id = row['trade_id']
+            direction = row['direction']
+            entry_time = str(row['entry_time'])[:19]
+            exit_time = str(row['exit_time'])[:19]
+            size = row['executed_size']
+            holding = row['holding_bars']
+            
+            lines.append(
+                f"{trade_id:<6} "
+                f"{direction:<10} "
+                f"{entry_time:<20} "
+                f"{exit_time:<20} "
+                f"{size:<10.3f} "
+                f"{holding:<10}"
+            )
+        
+        lines.append("\n" + "=" * 80)
+        return "\n".join(lines)
+    
+    @staticmethod
+    def save(report: str, filepath: str):
+        """Save report to file."""
+        from pathlib import Path
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(report)

@@ -1,0 +1,9 @@
+# atlas/modules/module208_portfolio_logic/__init__.py
+"""
+Module 208
+Portfolio Logic
+"""
+
+from .module import PortfolioLogicResearch
+
+__all__ = ["PortfolioLogicResearch"]

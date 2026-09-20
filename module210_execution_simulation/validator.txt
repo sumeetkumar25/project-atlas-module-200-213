@@ -1,0 +1,146 @@
+# atlas/modules/module210_execution_simulation/validator.py
+"""
+Module 210 - Execution Simulation Validator
+"""
+
+import numpy as np
+import pandas as pd
+from .engine import ExecutionResult
+from .statistics import ExecutionStatistics
+
+
+class ExecutionSimulationValidator:
+    """Validator for execution simulation results."""
+    
+    def __init__(self, timestamp_column: str = "timestamp"):
+        self.timestamp_column = timestamp_column
+    
+    def validate(
+        self,
+        result: ExecutionResult,
+        statistics: ExecutionStatistics
+    ) -> bool:
+        """Validate results and statistics."""
+        issues = []
+        warnings = []
+        
+        # Check trade log
+        if result.executed_trade_log.empty:
+            warnings.append("Trade log is empty")
+        else:
+            # Check required columns
+            required_cols = ['trade_id', 'entry_time', 'exit_time', 'direction', 
+                           'entry_price', 'exit_price', 'executed_size']
+            missing = set(required_cols) - set(result.executed_trade_log.columns)
+            if missing:
+                issues.append(f"Missing columns in trade log: {missing}")
+            
+            # Check entry < exit
+            for _, row in result.executed_trade_log.iterrows():
+                if row['entry_time'] >= row['exit_time']:
+                    issues.append(f"Trade {row['trade_id']}: entry_time >= exit_time")
+            
+            # Check executed size > 0
+            if 'executed_size' in result.executed_trade_log.columns:
+                if (result.executed_trade_log['executed_size'] <= 0).any():
+                    issues.append("Some trades have non-positive executed size")
+            
+            # Check commission >= 0
+            if 'total_commission' in result.executed_trade_log.columns:
+                if (result.executed_trade_log['total_commission'] < 0).any():
+                    issues.append("Negative commission found")
+            
+            # Check slippage >= 0
+            if 'total_slippage' in result.executed_trade_log.columns:
+                if (result.executed_trade_log['total_slippage'] < 0).any():
+                    issues.append("Negative slippage found")
+            
+            # Check no duplicate trade IDs
+            if 'trade_id' in result.executed_trade_log.columns:
+                if result.executed_trade_log['trade_id'].duplicated().any():
+                    issues.append("Duplicate trade IDs found")
+            
+            # Check long trades have BUY→SELL (via direction and exit_reason)
+            if 'direction' in result.executed_trade_log.columns and 'exit_reason' in result.executed_trade_log.columns:
+                long_trades = result.executed_trade_log[result.executed_trade_log['direction'] == 'LONG']
+                short_trades = result.executed_trade_log[result.executed_trade_log['direction'] == 'SHORT']
+                
+                if not long_trades.empty:
+                    if not all(long_trades['exit_reason'] == 'SELL'):
+                        issues.append("Long trades should have exit_reason 'SELL'")
+                
+                if not short_trades.empty:
+                    if not all(short_trades['exit_reason'] == 'COVER'):
+                        issues.append("Short trades should have exit_reason 'COVER'")
+        
+        # Check execution events
+        if result.execution_events.empty:
+            warnings.append("Execution events is empty")
+        else:
+            # Check event types
+            if 'event_type' in result.execution_events.columns:
+                valid_types = ["BUY", "SELL", "SHORT", "COVER", "OPEN_LONG", "CLOSE_LONG", 
+                              "OPEN_SHORT", "CLOSE_SHORT", "FLIP", "NO_ACTION"]
+                invalid = set(result.execution_events['event_type'].unique()) - set(valid_types)
+                if invalid:
+                    issues.append(f"Invalid event types: {invalid}")
+        
+        # Check position history
+        if result.position_history.empty:
+            warnings.append("Position history is empty")
+        
+        # Check statistics
+        if statistics.orders_generated < 0:
+            issues.append(f"Orders generated cannot be negative: {statistics.orders_generated}")
+        
+        if statistics.execution_rate < 0 or statistics.execution_rate > 1:
+            issues.append(f"Execution rate outside [0,1]: {statistics.execution_rate}")
+        
+        if statistics.total_commission < 0:
+            issues.append(f"Total commission cannot be negative: {statistics.total_commission}")
+        
+        # Check statistics match result
+        if statistics.total_events != len(result.execution_events):
+            issues.append(
+                f"Total events mismatch: stats={statistics.total_events}, "
+                f"result={len(result.execution_events)}"
+            )
+        
+        # Warnings (non-fatal)
+        if statistics.execution_rate < 0.5:
+            warnings.append(f"Low execution rate: {statistics.execution_rate:.1%}")
+        
+        if statistics.total_commission > 100:
+            warnings.append(f"High total commission: {statistics.total_commission:.2f}")
+        
+        if warnings:
+            print("\n  WARNINGS:")
+            for warning in warnings:
+                print(f"    ⚠ {warning}")
+        
+        if issues:
+            raise ValueError(
+                f"Execution Simulation validation failed with {len(issues)} issue(s):\n" +
+                "\n".join(f"  - {issue}" for issue in issues)
+            )
+        
+        return True
+
+
+def run_validation(result, statistics):
+    """Run validation with user-friendly output."""
+    validator = ExecutionSimulationValidator()
+    
+    print("\n" + "=" * 60)
+    print("EXECUTION SIMULATION VALIDATION")
+    print("=" * 60)
+    
+    try:
+        validator.validate(result, statistics)
+        print("\n  ✓ All validation checks passed")
+        print("=" * 60)
+        return True
+    except ValueError as e:
+        print(e)
+        print("=" * 60)
+        return False

@@ -1,0 +1,61 @@
+# atlas/modules/module210_execution_simulation/statistics.py
+"""
+Module 210 - Execution Simulation Statistics
+"""
+
+from dataclasses import dataclass, asdict
+import pandas as pd
+from .engine import ExecutionResult
+
+
+@dataclass
+class ExecutionStatistics:
+    """High-level statistics from execution simulation."""
+    orders_generated: int
+    orders_executed: int
+    long_trades: int
+    short_trades: int
+    average_holding_bars: float
+    average_slippage: float
+    total_commission: float
+    execution_rate: float
+    cancelled_orders: int
+    execution_delay: int
+    average_executed_size: float
+    total_events: int
+
+
+class ExecutionStatisticsEngine:
+    """Engine for generating high-level statistics."""
+    
+    METADATA = {
+        "module": 210,
+        "name": "Execution Simulation",
+        "version": "1.0.0",
+        "description": "Transforms approved positions into executed trades under realistic exchange rules"
+    }
+    
+    def analyze(self, result: ExecutionResult) -> ExecutionStatistics:
+        """Analyze results and generate high-level statistics."""
+        return ExecutionStatistics(
+            orders_generated=result.summary_statistics['orders_generated'],
+            orders_executed=result.summary_statistics['orders_executed'],
+            long_trades=result.summary_statistics['long_trades'],
+            short_trades=result.summary_statistics['short_trades'],
+            average_holding_bars=result.summary_statistics['average_holding_bars'],
+            average_slippage=result.summary_statistics['average_slippage'],
+            total_commission=result.summary_statistics['total_commission'],
+            execution_rate=result.summary_statistics['execution_rate'],
+            cancelled_orders=result.summary_statistics['cancelled_orders'],
+            execution_delay=result.summary_statistics['execution_delay'],
+            average_executed_size=result.summary_statistics['average_executed_size'],
+            total_events=result.summary_statistics['total_events']
+        )
+    
+    def summary_dataframe(self, stats: ExecutionStatistics) -> pd.DataFrame:
+        """Convert statistics to DataFrame."""
+        return pd.DataFrame([asdict(stats)])
+    
+    def summary_dict(self, stats: ExecutionStatistics) -> dict:
+        """Convert statistics to dictionary."""
+        return asdict(stats)

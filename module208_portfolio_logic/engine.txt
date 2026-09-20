@@ -1,0 +1,434 @@
+"""
+Module 208 - Portfolio Logic Engine
+
+Converts signal and confidence into desired portfolio position.
+
+Steps:
+  1. Load signal and confidence
+  2. Compute desired position (LONG/SHORT/FLAT)
+  3. Compute position size based on confidence
+  4. Update portfolio state
+  5. Generate portfolio statistics
+
+Output: Portfolio positions, exposure, and state history.
+"""
+
+import numpy as np
+import pandas as pd
+from dataclasses import dataclass
+from typing import Optional, Dict, Any, List, Tuple
+from pathlib import Path
+import warnings
+warnings.filterwarnings('ignore')
+
+
+@dataclass
+class PortfolioLogicConfig:
+    """Configuration for portfolio logic."""
+    entry_threshold: float = 0.50
+    exit_threshold: float = 0.20
+    confidence_threshold: float = 0.60
+    max_position_size: float = 1.00
+    allow_position_flip: bool = True
+    lag_by_one_bar: bool = True  # Realistic: position taken on next bar
+
+
+@dataclass
+class PortfolioLogicResult:
+    """Results from portfolio logic analysis."""
+    portfolio_matrix: pd.DataFrame
+    portfolio_positions: pd.DataFrame
+    portfolio_state_history: pd.DataFrame
+    summary_statistics: Dict[str, Any]
+
+
+class PortfolioLogicEngine:
+    """Core engine for portfolio logic."""
+
+    # Valid portfolio states
+    STATES = ["FLAT", "LONG", "SHORT"]
+
+    def __init__(
+        self,
+        config: Optional[PortfolioLogicConfig] = None,
+        timestamp_column: str = "timestamp",
+        signal_column: str = "normalized_signal",
+        confidence_column: str = "confidence"
+    ):
+        """
+        Initialize the portfolio logic engine.
+        
+        Args:
+            config: PortfolioLogicConfig with threshold parameters
+            timestamp_column: Name of the timestamp column
+            signal_column: Name of the signal column
+            confidence_column: Name of the confidence column
+        """
+        self.config = config or PortfolioLogicConfig()
+        self.timestamp_column = timestamp_column
+        self.signal_column = signal_column
+        self.confidence_column = confidence_column
+
+    def load_signal_matrix(self, matrix_path: Path) -> pd.DataFrame:
+        """Load the signal matrix from Module 206."""
+        if not matrix_path.exists():
+            raise FileNotFoundError(f"Signal matrix not found: {matrix_path}")
+        
+        if matrix_path.suffix == '.parquet':
+            df = pd.read_parquet(matrix_path)
+        else:
+            df = pd.read_csv(matrix_path)
+            if self.timestamp_column in df.columns:
+                df[self.timestamp_column] = pd.to_datetime(df[self.timestamp_column])
+        
+        return df
+
+    def load_confidence_matrix(self, matrix_path: Path) -> pd.DataFrame:
+        """Load the confidence matrix from Module 207."""
+        if not matrix_path.exists():
+            raise FileNotFoundError(f"Confidence matrix not found: {matrix_path}")
+        
+        if matrix_path.suffix == '.parquet':
+            df = pd.read_parquet(matrix_path)
+        else:
+            df = pd.read_csv(matrix_path)
+            if self.timestamp_column in df.columns:
+                df[self.timestamp_column] = pd.to_datetime(df[self.timestamp_column])
+        
+        return df
+
+    def compute_desired_position(
+        self,
+        signal: pd.Series,
+        confidence: pd.Series
+    ) -> pd.Series:
+        """
+        Compute desired position based on signal and confidence.
+        
+        Returns:
+            Series with values: 1 (LONG), -1 (SHORT), 0 (FLAT)
+        """
+        positions = pd.Series(0, index=signal.index)
+        
+        # Entry conditions
+        long_entry = (signal > self.config.entry_threshold) & (confidence > self.config.confidence_threshold)
+        short_entry = (signal < -self.config.entry_threshold) & (confidence > self.config.confidence_threshold)
+        
+        # Exit conditions
+        long_exit = (signal < self.config.exit_threshold) & (signal > -self.config.exit_threshold)
+        short_exit = (signal > -self.config.exit_threshold) & (signal < self.config.exit_threshold)
+        
+        # Apply decisions
+        positions[long_entry] = 1
+        positions[short_entry] = -1
+        positions[long_exit] = 0
+        positions[short_exit] = 0
+        
+        return positions
+
+    def compute_position_size(
+        self,
+        confidence: pd.Series,
+        desired_position: pd.Series
+    ) -> pd.Series:
+        """
+        Compute position size based on confidence.
+        
+        Size = confidence * max_position_size (capped)
+        """
+        size = confidence * self.config.max_position_size
+        size = np.clip(size, 0, self.config.max_position_size)
+        
+        # Zero out size when no position
+        size[desired_position == 0] = 0.0
+        
+        return size
+
+    def update_portfolio_state(
+        self,
+        desired_position: pd.Series,
+        position_size: pd.Series
+    ) -> Tuple[pd.Series, pd.Series, pd.Series]:
+        """
+        Update portfolio state using finite-state machine.
+        
+        If lag_by_one_bar is True, positions are taken on the next bar
+        using lagged signal to avoid look-ahead bias.
+        
+        Returns:
+            (state, actual_position, reason)
+        """
+        n = len(desired_position)
+        
+        state = pd.Series("FLAT", index=desired_position.index, dtype='object')
+        actual_position = pd.Series(0.0, index=desired_position.index)
+        reason = pd.Series("", index=desired_position.index, dtype='object')
+        
+        current_state = "FLAT"
+        
+        # If lag is enabled, first bar is always FLAT
+        if self.config.lag_by_one_bar:
+            state.iloc[0] = "FLAT"
+            actual_position.iloc[0] = 0.0
+            reason.iloc[0] = "Initial state (lag enabled)"
+            
+            # Start processing from index 1
+            start_idx = 1
+        else:
+            start_idx = 0
+        
+        for i in range(start_idx, n):
+            # Use lagged signal for one-bar delay
+            if self.config.lag_by_one_bar:
+                # Signal from previous bar
+                des_pos = desired_position.iloc[i - 1]
+                size = position_size.iloc[i - 1]
+            else:
+                # Same-bar execution
+                des_pos = desired_position.iloc[i]
+                size = position_size.iloc[i]
+            
+            timestamp = desired_position.index[i]
+            
+            # State machine logic
+            if current_state == "FLAT":
+                if des_pos == 1 and size > 0:
+                    current_state = "LONG"
+                    actual_position.iloc[i] = size
+                    reason.iloc[i] = "Entry LONG (lagged)"
+                elif des_pos == -1 and size > 0:
+                    current_state = "SHORT"
+                    actual_position.iloc[i] = -size
+                    reason.iloc[i] = "Entry SHORT (lagged)"
+                else:
+                    actual_position.iloc[i] = 0
+                    reason.iloc[i] = "FLAT"
+            
+            elif current_state == "LONG":
+                if des_pos == -1 and self.config.allow_position_flip:
+                    current_state = "SHORT"
+                    actual_position.iloc[i] = -size
+                    reason.iloc[i] = "Flip to SHORT (lagged)"
+                elif des_pos == 0 or size == 0:
+                    current_state = "FLAT"
+                    actual_position.iloc[i] = 0
+                    reason.iloc[i] = "Exit LONG (lagged)"
+                else:
+                    actual_position.iloc[i] = size
+                    reason.iloc[i] = "Hold LONG"
+            
+            elif current_state == "SHORT":
+                if des_pos == 1 and self.config.allow_position_flip:
+                    current_state = "LONG"
+                    actual_position.iloc[i] = size
+                    reason.iloc[i] = "Flip to LONG (lagged)"
+                elif des_pos == 0 or size == 0:
+                    current_state = "FLAT"
+                    actual_position.iloc[i] = 0
+                    reason.iloc[i] = "Exit SHORT (lagged)"
+                else:
+                    actual_position.iloc[i] = -size
+                    reason.iloc[i] = "Hold SHORT"
+            
+            state.iloc[i] = current_state
+        
+        return state, actual_position, reason
+
+    def compute_statistics(
+        self,
+        state: pd.Series,
+        actual_position: pd.Series,
+        position_size: pd.Series,
+        reason: pd.Series
+    ) -> Dict[str, Any]:
+        """
+        Compute portfolio statistics.
+        """
+        # Basic statistics
+        total_rows = len(state)
+        
+        # State counts
+        long_count = np.sum(state == "LONG")
+        short_count = np.sum(state == "SHORT")
+        flat_count = np.sum(state == "FLAT")
+        
+        # Position statistics
+        position_values = actual_position[state != "FLAT"]
+        
+        # Exposure (absolute position)
+        exposure = np.abs(actual_position)
+        
+        # Position changes (where state changes)
+        state_changes = np.sum(state != state.shift(1))
+        
+        # Average holding time (in rows)
+        holding_times = []
+        current_state = None
+        current_start = 0
+        
+        for i, s in enumerate(state):
+            if s != current_state:
+                if current_state is not None and current_state != "FLAT":
+                    holding_times.append(i - current_start)
+                current_state = s
+                current_start = i
+        
+        avg_holding_time = np.mean(holding_times) if holding_times else 0
+        
+        stats = {
+            'total_rows': total_rows,
+            'long_count': int(long_count),
+            'short_count': int(short_count),
+            'flat_count': int(flat_count),
+            'long_pct': long_count / total_rows * 100,
+            'short_pct': short_count / total_rows * 100,
+            'flat_pct': flat_count / total_rows * 100,
+            'mean_position_size': float(position_values.abs().mean()) if len(position_values) > 0 else 0,
+            'max_position_size': float(position_values.abs().max()) if len(position_values) > 0 else 0,
+            'min_position_size': float(position_values.abs().min()) if len(position_values) > 0 else 0,
+            'mean_exposure': float(exposure.mean()),
+            'max_exposure': float(exposure.max()),
+            'min_exposure': float(exposure.min()),
+            'position_changes': int(state_changes),
+            'avg_holding_time': float(avg_holding_time),
+            'entry_threshold': self.config.entry_threshold,
+            'exit_threshold': self.config.exit_threshold,
+            'confidence_threshold': self.config.confidence_threshold,
+            'max_position_size': self.config.max_position_size,
+            'allow_position_flip': self.config.allow_position_flip,
+            'lag_by_one_bar': self.config.lag_by_one_bar
+        }
+        
+        return stats
+
+    def save_outputs(
+        self,
+        portfolio_matrix: pd.DataFrame,
+        positions_df: pd.DataFrame,
+        state_history: pd.DataFrame,
+        stats: Dict[str, Any],
+        output_dir: Path
+    ) -> None:
+        """Save all outputs."""
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Portfolio matrix
+        matrix_path = output_dir / "portfolio_matrix.parquet"
+        portfolio_matrix.to_parquet(matrix_path, index=False)
+        print(f"  Saved portfolio matrix to {matrix_path}")
+        
+        # Portfolio positions
+        positions_path = output_dir / "portfolio_positions.csv"
+        positions_df.to_csv(positions_path, index=False)
+        print(f"  Saved portfolio positions to {positions_path}")
+        
+        # State history
+        history_path = output_dir / "portfolio_state_history.csv"
+        state_history.to_csv(history_path, index=False)
+        print(f"  Saved portfolio state history to {history_path}")
+        
+        # Statistics
+        stats_df = pd.DataFrame([stats])
+        stats_path = output_dir / "portfolio_statistics.csv"
+        stats_df.to_csv(stats_path, index=False)
+        print(f"  Saved portfolio statistics to {stats_path}")
+
+    def compute(
+        self,
+        signal_matrix_path: Path,
+        confidence_matrix_path: Path,
+        output_dir: Optional[Path] = None
+    ) -> PortfolioLogicResult:
+        """
+        Main computation method.
+        """
+        print("\n  Computing Portfolio Logic...")
+        print(f"  Entry Threshold: {self.config.entry_threshold}")
+        print(f"  Exit Threshold: {self.config.exit_threshold}")
+        print(f"  Confidence Threshold: {self.config.confidence_threshold}")
+        print(f"  Lag by One Bar: {self.config.lag_by_one_bar}")
+        
+        if output_dir is None:
+            output_dir = Path("data/feature_store/portfolio")
+        
+        # Load signal matrix
+        print(f"  Loading signal matrix from: {signal_matrix_path}")
+        signal_df = self.load_signal_matrix(signal_matrix_path)
+        print(f"  Shape: {signal_df.shape}")
+        
+        # Load confidence matrix
+        print(f"  Loading confidence matrix from: {confidence_matrix_path}")
+        confidence_df = self.load_confidence_matrix(confidence_matrix_path)
+        print(f"  Shape: {confidence_df.shape}")
+        
+        # Extract columns
+        if self.signal_column not in signal_df.columns:
+            raise ValueError(f"Signal column '{self.signal_column}' not found")
+        if self.confidence_column not in confidence_df.columns:
+            raise ValueError(f"Confidence column '{self.confidence_column}' not found")
+        
+        signal = signal_df[self.signal_column]
+        confidence = confidence_df[self.confidence_column]
+        
+        # Compute desired position
+        print("  Computing desired positions...")
+        desired_position = self.compute_desired_position(signal, confidence)
+        
+        # Compute position size
+        print("  Computing position sizes...")
+        position_size = self.compute_position_size(confidence, desired_position)
+        
+        # Update portfolio state
+        print("  Updating portfolio state...")
+        state, actual_position, reason = self.update_portfolio_state(
+            desired_position, position_size
+        )
+        
+        # Compute statistics
+        print("  Computing portfolio statistics...")
+        stats = self.compute_statistics(state, actual_position, position_size, reason)
+        
+        # Build portfolio matrix
+        portfolio_matrix = pd.DataFrame({
+            self.timestamp_column: signal_df[self.timestamp_column],
+            'signal': signal.values,
+            'confidence': confidence.values,
+            'desired_position': desired_position.values,
+            'position_size': position_size.values,
+            'actual_position': actual_position.values,
+            'exposure': np.abs(actual_position.values),
+            'decision_reason': reason.values,
+            'portfolio_state': state.values
+        })
+        
+        # Build positions DataFrame
+        positions_df = portfolio_matrix[[
+            self.timestamp_column, 'signal', 'confidence',
+            'actual_position', 'exposure', 'portfolio_state'
+        ]].copy()
+        
+        # Build state history DataFrame
+        state_history = portfolio_matrix[[
+            self.timestamp_column, 'portfolio_state', 'decision_reason'
+        ]].copy()
+        
+        # Save outputs
+        print("\n  Saving outputs...")
+        self.save_outputs(
+            portfolio_matrix, positions_df, state_history, stats, output_dir
+        )
+        
+        print(f"\n  Portfolio Summary:")
+        print(f"    Total Rows: {stats['total_rows']:,}")
+        print(f"    LONG: {stats['long_pct']:.1f}%")
+        print(f"    SHORT: {stats['short_pct']:.1f}%")
+        print(f"    FLAT: {stats['flat_pct']:.1f}%")
+        print(f"    Mean Position Size: {stats['mean_position_size']:.3f}")
+        print(f"    Position Changes: {stats['position_changes']}")
+        
+        return PortfolioLogicResult(
+            portfolio_matrix=portfolio_matrix,
+            portfolio_positions=positions_df,
+            portfolio_state_history=state_history,
+            summary_statistics=stats
+        )

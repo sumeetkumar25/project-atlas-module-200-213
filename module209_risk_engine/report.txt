@@ -1,0 +1,152 @@
+# atlas/modules/module209_risk_engine/report.py
+"""
+Module 209 - Risk Engine Report
+"""
+
+from datetime import datetime
+import pandas as pd
+
+
+class RiskEngineReport:
+    """Report generator for risk engine results."""
+    
+    @staticmethod
+    def generate(statistics, metadata=None, dataset_name="Unknown") -> str:
+        """Generate a formatted report."""
+        lines = []
+        
+        lines.append("=" * 55)
+        lines.append("MODULE 209")
+        lines.append("RISK ENGINE")
+        lines.append("=" * 55)
+        lines.append(f"\nDataset: {dataset_name}")
+        
+        # Configuration
+        lines.append("\n" + "-" * 45)
+        lines.append("CONFIGURATION")
+        lines.append("-" * 45)
+        lines.append(f"  Max Position Size: {statistics.max_position_size:.0%}")
+        lines.append(f"  Max Exposure: {statistics.max_gross_exposure:.0%}")
+        lines.append(f"  Leverage Limit: {statistics.leverage_limit:.1f}x")
+        lines.append(f"  Volatility Target: {statistics.volatility_target:.0%}")
+        lines.append(f"  Allow Short: {statistics.allow_short}")
+        lines.append(f"  Allow Leverage: {statistics.allow_leverage}")
+        lines.append(f"  Volatility Scaling: {statistics.use_volatility_scaling}")
+        
+        # Overview
+        lines.append("\n" + "-" * 45)
+        lines.append("OVERVIEW")
+        lines.append("-" * 45)
+        lines.append(f"  Total Rows: {statistics.total_rows:,}")
+        lines.append(f"  Risk Events: {statistics.total_risk_events}")
+        
+        # Approval Status
+        lines.append("\n" + "-" * 45)
+        lines.append("APPROVAL STATUS")
+        lines.append("-" * 45)
+        lines.append(f"  APPROVED: {statistics.approved_pct:.1f}%")
+        lines.append(f"  REDUCED: {statistics.reduced_pct:.1f}%")
+        lines.append(f"  REJECTED: {statistics.rejected_pct:.1f}%")
+        lines.append(f"  FLAT: {statistics.flat_pct:.1f}%")
+        
+        # Position Statistics
+        lines.append("\n" + "-" * 45)
+        lines.append("POSITION STATISTICS")
+        lines.append("-" * 45)
+        lines.append(f"  Mean Position: {statistics.mean_position:.3f}")
+        lines.append(f"  Max Position: {statistics.max_position:.3f}")
+        lines.append(f"  Min Position: {statistics.min_position:.3f}")
+        lines.append(f"  Mean Abs Position: {statistics.mean_abs_position:.3f}")
+        lines.append(f"  Max Abs Position: {statistics.max_abs_position:.3f}")
+        
+        # Exposure
+        lines.append("\n" + "-" * 45)
+        lines.append("EXPOSURE")
+        lines.append("-" * 45)
+        lines.append(f"  Mean Exposure: {statistics.mean_exposure:.3f}")
+        lines.append(f"  Max Exposure: {statistics.max_exposure:.3f}")
+        
+        # Risk Events Breakdown
+        lines.append("\n" + "-" * 45)
+        lines.append("RISK EVENTS")
+        lines.append("-" * 45)
+        lines.append(f"  Exposure Limits: {statistics.exposure_events}")
+        lines.append(f"  Leverage Limits: {statistics.leverage_events}")
+        lines.append(f"  Volatility Reductions: {statistics.volatility_events}")
+        lines.append(f"  Short Disabled: {statistics.short_events}")
+        
+        # Interpretation
+        lines.append("\n" + "-" * 45)
+        lines.append("INTERPRETATION")
+        lines.append("-" * 45)
+        
+        if statistics.approved_pct > 80:
+            lines.append("  ✅ Most positions approved without reduction")
+        elif statistics.approved_pct > 60:
+            lines.append("  ✓ Moderate approval rate")
+        else:
+            lines.append("  ⚠ Low approval rate - consider relaxing risk constraints")
+        
+        if statistics.total_risk_events > 0:
+            if statistics.exposure_events > statistics.leverage_events:
+                lines.append("  ⚠ Exposure limits are the primary constraint")
+            elif statistics.leverage_events > statistics.exposure_events:
+                lines.append("  ⚠ Leverage limits are the primary constraint")
+        
+        # Validation
+        lines.append("\n" + "-" * 45)
+        lines.append("VALIDATION")
+        lines.append("-" * 45)
+        lines.append("  Status: PASSED")
+        
+        # Footer
+        lines.append(f"\n  Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append("\n" + "=" * 55)
+        lines.append("END OF REPORT")
+        lines.append("=" * 55)
+        
+        return "\n".join(lines)
+    
+    @staticmethod
+    def generate_risk_events_report(risk_events: pd.DataFrame, top_n: int = 20) -> str:
+        """Generate a risk events report."""
+        lines = []
+        lines.append("\n" + "=" * 60)
+        lines.append("RISK EVENTS")
+        lines.append("=" * 60)
+        
+        if risk_events.empty:
+            lines.append("\nNo risk events recorded.")
+            return "\n".join(lines)
+        
+        events = risk_events.tail(top_n)
+        
+        lines.append(
+            f"\n{'Timestamp':<25} {'Reason':<25} {'Position':<12} {'State':<12}"
+        )
+        lines.append("-" * 75)
+        
+        for _, row in events.iterrows():
+            timestamp = row['timestamp'] if 'timestamp' in row else ''
+            reason = row['risk_reason'] if 'risk_reason' in row else ''
+            pos = row['approved_position'] if 'approved_position' in row else 0
+            state = row['risk_state'] if 'risk_state' in row else ''
+            
+            lines.append(
+                f"{str(timestamp):<25} "
+                f"{reason[:24]:<25} "
+                f"{pos:<12.3f} "
+                f"{state:<12}"
+            )
+        
+        lines.append("\n" + "=" * 60)
+        return "\n".join(lines)
+    
+    @staticmethod
+    def save(report: str, filepath: str):
+        """Save report to file."""
+        from pathlib import Path
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(report)

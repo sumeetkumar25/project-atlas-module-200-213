@@ -1,0 +1,552 @@
+"""
+Module 208 - Integration Test
+
+Tests portfolio logic engine, statistics, validator, report, and pipeline.
+"""
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
+
+import numpy as np
+import pandas as pd
+import tempfile
+
+from atlas.modules.module208_portfolio_logic.engine import PortfolioLogicEngine, PortfolioLogicConfig
+from atlas.modules.module208_portfolio_logic.statistics import PortfolioLogicStatisticsEngine
+from atlas.modules.module208_portfolio_logic.validator import run_validation
+from atlas.modules.module208_portfolio_logic.module import PortfolioLogicResearch
+
+
+def create_test_data(n=100, seed=42):
+    """Create synthetic test data for portfolio logic."""
+    np.random.seed(seed)
+    
+    timestamps = pd.date_range('2020-01-01', periods=n, freq='1h')
+    
+    # Signal with known patterns
+    signal = np.random.randn(n) * 0.3
+    signal[10:30] = 0.7 + np.random.randn(20) * 0.1  # Strong positive
+    signal[50:70] = -0.7 + np.random.randn(20) * 0.1  # Strong negative
+    signal[80:95] = 0.6 + np.random.randn(15) * 0.1  # Moderate positive
+    
+    # Confidence
+    confidence = np.random.uniform(0.4, 0.9, n)
+    confidence[10:30] = 0.85 + np.random.randn(20) * 0.05
+    confidence[50:70] = 0.80 + np.random.randn(20) * 0.05
+    confidence[80:95] = 0.70 + np.random.randn(15) * 0.05
+    
+    # Signal matrix
+    signal_df = pd.DataFrame({
+        'timestamp': timestamps,
+        'normalized_signal': signal
+    })
+    
+    # Confidence matrix
+    confidence_df = pd.DataFrame({
+        'timestamp': timestamps,
+        'confidence': np.clip(confidence, 0.4, 1.0)
+    })
+    
+    return {
+        'signal_matrix': signal_df,
+        'confidence_matrix': confidence_df
+    }
+
+
+def test_engine_load_signal():
+    """Test 1: Load signal matrix."""
+    print("\n" + "=" * 60)
+    print("TEST 1: Load Signal Matrix")
+    print("=" * 60)
+    
+    data = create_test_data()
+    engine = PortfolioLogicEngine()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        matrix_path = tmp_path / "signal_matrix.parquet"
+        data['signal_matrix'].to_parquet(matrix_path, index=False)
+        
+        loaded_df = engine.load_signal_matrix(matrix_path)
+        
+        assert not loaded_df.empty
+        assert 'timestamp' in loaded_df.columns
+        assert 'normalized_signal' in loaded_df.columns
+    
+    print("  ✓ Load signal matrix test passed")
+    return True
+
+
+def test_engine_load_confidence():
+    """Test 2: Load confidence matrix."""
+    print("\n" + "=" * 60)
+    print("TEST 2: Load Confidence Matrix")
+    print("=" * 60)
+    
+    data = create_test_data()
+    engine = PortfolioLogicEngine()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        matrix_path = tmp_path / "confidence_matrix.parquet"
+        data['confidence_matrix'].to_parquet(matrix_path, index=False)
+        
+        loaded_df = engine.load_confidence_matrix(matrix_path)
+        
+        assert not loaded_df.empty
+        assert 'timestamp' in loaded_df.columns
+        assert 'confidence' in loaded_df.columns
+    
+    print("  ✓ Load confidence matrix test passed")
+    return True
+
+
+def test_engine_desired_position():
+    """Test 3: Desired position computation."""
+    print("\n" + "=" * 60)
+    print("TEST 3: Desired Position")
+    print("=" * 60)
+    
+    config = PortfolioLogicConfig(
+        entry_threshold=0.5,
+        exit_threshold=0.2,
+        confidence_threshold=0.6
+    )
+    engine = PortfolioLogicEngine(config=config)
+    
+    # Test scenarios
+    signal = pd.Series([0.8, 0.8, 0.3, -0.8, -0.8, -0.3])
+    confidence = pd.Series([0.7, 0.5, 0.7, 0.7, 0.5, 0.7])
+    
+    positions = engine.compute_desired_position(signal, confidence)
+    
+    # Strong signal with high confidence -> LONG
+    assert positions.iloc[0] == 1
+    
+    # Strong signal with low confidence -> FLAT
+    assert positions.iloc[1] == 0
+    
+    # Weak signal -> FLAT
+    assert positions.iloc[2] == 0
+    
+    # Strong negative with high confidence -> SHORT
+    assert positions.iloc[3] == -1
+    
+    # Strong negative with low confidence -> FLAT
+    assert positions.iloc[4] == 0
+    
+    # Weak negative -> FLAT
+    assert positions.iloc[5] == 0
+    
+    print("  ✓ Desired position test passed")
+    return True
+
+
+def test_engine_position_size():
+    """Test 4: Position sizing."""
+    print("\n" + "=" * 60)
+    print("TEST 4: Position Sizing")
+    print("=" * 60)
+    
+    config = PortfolioLogicConfig(max_position_size=1.0)
+    engine = PortfolioLogicEngine(config=config)
+    
+    confidence = pd.Series([0.2, 0.5, 0.8, 0.0])
+    desired_position = pd.Series([1, 1, 1, 0])
+    
+    size = engine.compute_position_size(confidence, desired_position)
+    
+    assert size.iloc[0] == 0.2
+    assert size.iloc[1] == 0.5
+    assert size.iloc[2] == 0.8
+    assert size.iloc[3] == 0.0
+    
+    print("  ✓ Position sizing test passed")
+    return True
+
+
+def test_engine_state_machine():
+    """Test 5: Portfolio state machine."""
+    print("\n" + "=" * 60)
+    print("TEST 5: Portfolio State Machine")
+    print("=" * 60)
+    
+    config = PortfolioLogicConfig(
+        allow_position_flip=True,
+        lag_by_one_bar=True
+    )
+    engine = PortfolioLogicEngine(config=config)
+    
+    desired_position = pd.Series([1, 1, 0, -1, -1, 1])
+    position_size = pd.Series([0.5, 0.5, 0, 0.5, 0.5, 0.5])
+    
+    state, actual_pos, reason = engine.update_portfolio_state(
+        desired_position,
+        position_size
+    )
+    
+    # Debug output
+    print("\nDesired :", desired_position.tolist())
+    print("State   :", state.tolist())
+    print("Position:", actual_pos.tolist())
+    print("Reason  :", reason.tolist())
+    
+    # Expected: FLAT -> LONG -> LONG -> FLAT -> SHORT -> SHORT
+    expected_states = [
+        "FLAT",
+        "LONG",
+        "LONG",
+        "FLAT",
+        "SHORT",
+        "SHORT",
+    ]
+    
+    for i, exp in enumerate(expected_states):
+        assert state.iloc[i] == exp, f"State {i}: expected {exp}, got {state.iloc[i]}"
+    
+    # Expected positions
+    expected_positions = [
+        0.0,
+        0.5,
+        0.5,
+        0.0,
+        -0.5,
+        -0.5,
+    ]
+    
+    for i, exp in enumerate(expected_positions):
+        assert actual_pos.iloc[i] == exp, f"Position {i}: expected {exp}, got {actual_pos.iloc[i]}"
+    
+    # Expected reasons
+    expected_reasons = [
+        "Initial state (lag enabled)",
+        "Entry LONG (lagged)",
+        "Hold LONG",
+        "Exit LONG (lagged)",
+        "Entry SHORT (lagged)",
+        "Hold SHORT",
+    ]
+    
+    for i, exp in enumerate(expected_reasons):
+        assert reason.iloc[i] == exp, f"Reason {i}: expected '{exp}', got '{reason.iloc[i]}'"
+    
+    print("  ✓ State machine test passed")
+    return True
+
+
+def test_engine_statistics():
+    """Test 6: Portfolio statistics."""
+    print("\n" + "=" * 60)
+    print("TEST 6: Portfolio Statistics")
+    print("=" * 60)
+    
+    engine = PortfolioLogicEngine()
+    
+    state = pd.Series(["LONG", "LONG", "FLAT", "SHORT", "SHORT"])
+    actual_position = pd.Series([0.5, 0.5, 0, -0.5, -0.5])
+    position_size = pd.Series([0.5, 0.5, 0, 0.5, 0.5])
+    reason = pd.Series(["Hold", "Hold", "Exit", "Hold", "Hold"])
+    
+    stats = engine.compute_statistics(state, actual_position, position_size, reason)
+    
+    assert stats['long_count'] == 2
+    assert stats['short_count'] == 2
+    assert stats['flat_count'] == 1
+    assert stats['long_pct'] == 40.0
+    assert stats['short_pct'] == 40.0
+    assert stats['flat_pct'] == 20.0
+    
+    print("  ✓ Statistics test passed")
+    return True
+
+
+def test_engine_compute():
+    """Test 7: Full engine computation."""
+    print("\n" + "=" * 60)
+    print("TEST 7: Full Engine Computation")
+    print("=" * 60)
+    
+    data = create_test_data()
+    engine = PortfolioLogicEngine()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        output_dir = tmp_path / "output"
+        
+        signal_path = tmp_path / "signal_matrix.parquet"
+        confidence_path = tmp_path / "confidence_matrix.parquet"
+        
+        data['signal_matrix'].to_parquet(signal_path, index=False)
+        data['confidence_matrix'].to_parquet(confidence_path, index=False)
+        
+        result = engine.compute(
+            signal_matrix_path=signal_path,
+            confidence_matrix_path=confidence_path,
+            output_dir=output_dir
+        )
+        
+        assert not result.portfolio_matrix.empty
+        assert not result.portfolio_positions.empty
+        assert not result.portfolio_state_history.empty
+        assert result.summary_statistics['total_rows'] > 0
+        
+        # Check outputs were saved
+        assert (output_dir / "portfolio_matrix.parquet").exists()
+        assert (output_dir / "portfolio_positions.csv").exists()
+        assert (output_dir / "portfolio_state_history.csv").exists()
+        assert (output_dir / "portfolio_statistics.csv").exists()
+    
+    print("  ✓ Full engine test passed")
+    return True
+
+
+def test_statistics():
+    """Test 8: Statistics engine."""
+    print("\n" + "=" * 60)
+    print("TEST 8: Statistics Engine")
+    print("=" * 60)
+    
+    data = create_test_data()
+    engine = PortfolioLogicEngine()
+    stats_engine = PortfolioLogicStatisticsEngine()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        output_dir = tmp_path / "output"
+        
+        signal_path = tmp_path / "signal_matrix.parquet"
+        confidence_path = tmp_path / "confidence_matrix.parquet"
+        
+        data['signal_matrix'].to_parquet(signal_path, index=False)
+        data['confidence_matrix'].to_parquet(confidence_path, index=False)
+        
+        result = engine.compute(
+            signal_matrix_path=signal_path,
+            confidence_matrix_path=confidence_path,
+            output_dir=output_dir
+        )
+        
+        stats = stats_engine.analyze(result)
+        
+        assert stats.total_rows == result.summary_statistics['total_rows']
+        assert stats.long_pct == result.summary_statistics['long_pct']
+        assert stats.short_pct == result.summary_statistics['short_pct']
+        assert stats.flat_pct == result.summary_statistics['flat_pct']
+        assert stats.entry_threshold == engine.config.entry_threshold
+    
+    print("  ✓ Statistics test passed")
+    return True
+
+
+def test_validator():
+    """Test 9: Validator."""
+    print("\n" + "=" * 60)
+    print("TEST 9: Validator")
+    print("=" * 60)
+    
+    data = create_test_data()
+    engine = PortfolioLogicEngine()
+    stats_engine = PortfolioLogicStatisticsEngine()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        output_dir = tmp_path / "output"
+        
+        signal_path = tmp_path / "signal_matrix.parquet"
+        confidence_path = tmp_path / "confidence_matrix.parquet"
+        
+        data['signal_matrix'].to_parquet(signal_path, index=False)
+        data['confidence_matrix'].to_parquet(confidence_path, index=False)
+        
+        result = engine.compute(
+            signal_matrix_path=signal_path,
+            confidence_matrix_path=confidence_path,
+            output_dir=output_dir
+        )
+        
+        stats = stats_engine.analyze(result)
+        
+        passed = run_validation(result, stats)
+        assert passed
+    
+    print("  ✓ Validator test passed")
+    return True
+
+
+def test_pipeline():
+    """Test 10: Full pipeline."""
+    print("\n" + "=" * 60)
+    print("TEST 10: Full Pipeline")
+    print("=" * 60)
+    
+    data = create_test_data()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        output_dir = tmp_path / "output"
+        
+        signal_path = tmp_path / "signal_matrix.parquet"
+        confidence_path = tmp_path / "confidence_matrix.parquet"
+        
+        data['signal_matrix'].to_parquet(signal_path, index=False)
+        data['confidence_matrix'].to_parquet(confidence_path, index=False)
+        
+        research = PortfolioLogicResearch(
+            entry_threshold=0.50,
+            exit_threshold=0.20,
+            confidence_threshold=0.60
+        )
+        
+        result = research.run_portfolio(
+            signal_matrix_path=signal_path,
+            confidence_matrix_path=confidence_path,
+            dataset_id="pipeline_test",
+            output_dir=output_dir
+        )
+        
+        assert result.status == "completed"
+        assert "portfolio_matrix" in result.artifacts
+        assert "portfolio_positions" in result.artifacts
+        assert "portfolio_state_history" in result.artifacts
+        assert "portfolio_statistics" in result.artifacts
+        assert "portfolio_logic_report" in result.artifacts
+        assert "state_history_report" in result.artifacts
+        assert result.statistics.get("software_validation_passed") == True
+        
+        # Check outputs were saved
+        assert (output_dir / "portfolio_matrix.parquet").exists()
+        assert (output_dir / "portfolio_positions.csv").exists()
+        assert (output_dir / "portfolio_state_history.csv").exists()
+        assert (output_dir / "portfolio_statistics.csv").exists()
+    
+    print("  ✓ Full pipeline test passed")
+    return True
+
+
+def test_config_customization():
+    """Test 11: Configuration customization."""
+    print("\n" + "=" * 60)
+    print("TEST 11: Configuration Customization")
+    print("=" * 60)
+    
+    # Custom configuration
+    config = PortfolioLogicConfig(
+        entry_threshold=0.60,
+        exit_threshold=0.30,
+        confidence_threshold=0.70,
+        max_position_size=0.80,
+        allow_position_flip=False
+    )
+    
+    engine = PortfolioLogicEngine(config=config)
+    
+    assert engine.config.entry_threshold == 0.60
+    assert engine.config.exit_threshold == 0.30
+    assert engine.config.confidence_threshold == 0.70
+    assert engine.config.max_position_size == 0.80
+    assert engine.config.allow_position_flip == False
+    
+    # Test with custom config
+    signal = pd.Series([0.65, 0.55])
+    confidence = pd.Series([0.75, 0.75])
+    
+    positions = engine.compute_desired_position(signal, confidence)
+    assert positions.iloc[0] == 1  # 0.65 > 0.60
+    assert positions.iloc[1] == 0  # 0.55 < 0.60
+    
+    print("  ✓ Configuration customization test passed")
+    return True
+
+
+def test_lag_by_one_bar():
+    """Test 12: Lag by one bar comparison."""
+    print("\n" + "=" * 60)
+    print("TEST 12: Lag by One Bar Comparison")
+    print("=" * 60)
+    
+    # Test with lag disabled (immediate entry)
+    config_no_lag = PortfolioLogicConfig(
+        allow_position_flip=True,
+        lag_by_one_bar=False
+    )
+    engine_no_lag = PortfolioLogicEngine(config=config_no_lag)
+    
+    desired_position = pd.Series([1, 1, 0, -1, -1, 1])
+    position_size = pd.Series([0.5, 0.5, 0, 0.5, 0.5, 0.5])
+    
+    state_no_lag, _, _ = engine_no_lag.update_portfolio_state(
+        desired_position, position_size
+    )
+    
+    # Test with lag enabled
+    config_lag = PortfolioLogicConfig(
+        allow_position_flip=True,
+        lag_by_one_bar=True
+    )
+    engine_lag = PortfolioLogicEngine(config=config_lag)
+    
+    state_lag, _, _ = engine_lag.update_portfolio_state(
+        desired_position, position_size
+    )
+    
+    # Debug output
+    print("\nNo Lag State  :", state_no_lag.tolist())
+    print("Lag State     :", state_lag.tolist())
+    
+    # First bar should be different
+    assert state_no_lag.iloc[0] == "LONG"
+    assert state_lag.iloc[0] == "FLAT"
+    
+    # Lag should shift state sequence by one
+    assert state_lag.iloc[1] == state_no_lag.iloc[0]
+    
+    print("  ✓ Lag by one bar comparison test passed")
+    return True
+
+
+def main():
+    """Run all tests."""
+    print("\n" + "=" * 70)
+    print("PROJECT ATLAS - MODULE 208 INTEGRATION TEST")
+    print("Portfolio Logic")
+    print("=" * 70)
+    
+    results = {}
+    
+    results["load_signal"] = test_engine_load_signal()
+    results["load_confidence"] = test_engine_load_confidence()
+    results["desired_position"] = test_engine_desired_position()
+    results["position_size"] = test_engine_position_size()
+    results["state_machine"] = test_engine_state_machine()
+    results["statistics"] = test_engine_statistics()
+    results["full_engine"] = test_engine_compute()
+    results["statistics_engine"] = test_statistics()
+    results["validator"] = test_validator()
+    results["pipeline"] = test_pipeline()
+    results["config_customization"] = test_config_customization()
+    results["lag_comparison"] = test_lag_by_one_bar()
+    
+    print("\n" + "=" * 70)
+    print("RESULTS")
+    print("=" * 70)
+    
+    for name, ok in results.items():
+        print(f"  {'✓' if ok else '✗'} {name}")
+    
+    passed = sum(results.values())
+    total = len(results)
+    
+    print(f"\n  {passed}/{total} tests passed")
+    
+    if passed == total:
+        print("\n✓ Module 208 VALIDATED")
+        return 0
+    else:
+        print("\n⚠ Some tests failed")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

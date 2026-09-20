@@ -1,0 +1,128 @@
+# atlas/modules/module208_portfolio_logic/validator.py
+"""
+Module 208 - Portfolio Logic Validator
+"""
+
+import numpy as np
+import pandas as pd
+from .engine import PortfolioLogicResult
+from .statistics import PortfolioLogicStatistics
+
+
+class PortfolioLogicValidator:
+    """Validator for portfolio logic results."""
+    
+    def __init__(self, timestamp_column: str = "timestamp"):
+        self.timestamp_column = timestamp_column
+    
+    def validate(
+        self,
+        result: PortfolioLogicResult,
+        statistics: PortfolioLogicStatistics
+    ) -> bool:
+        """Validate results and statistics."""
+        issues = []
+        warnings = []
+        
+        # Check portfolio matrix
+        if result.portfolio_matrix.empty:
+            issues.append("Portfolio matrix is empty")
+        else:
+            if self.timestamp_column not in result.portfolio_matrix.columns:
+                issues.append("Missing timestamp column")
+            
+            # Check no duplicate timestamps
+            dup_count = result.portfolio_matrix[self.timestamp_column].duplicated().sum()
+            if dup_count > 0:
+                warnings.append(f"Found {dup_count} duplicate timestamps")
+        
+        # Check portfolio state
+        valid_states = {"FLAT", "LONG", "SHORT"}
+        if 'portfolio_state' in result.portfolio_matrix.columns:
+            invalid_states = set(result.portfolio_matrix['portfolio_state'].unique()) - valid_states
+            if invalid_states:
+                issues.append(f"Invalid portfolio states: {invalid_states}")
+        
+        # Check position size in [0, 1]
+        if 'position_size' in result.portfolio_matrix.columns:
+            if not np.all((0 <= result.portfolio_matrix['position_size']) & 
+                         (result.portfolio_matrix['position_size'] <= 1)):
+                issues.append("Position size outside [0, 1] range")
+        
+        # Check exposure in [0, 1]
+        if 'exposure' in result.portfolio_matrix.columns:
+            if not np.all((0 <= result.portfolio_matrix['exposure']) & 
+                         (result.portfolio_matrix['exposure'] <= 1)):
+                issues.append("Exposure outside [0, 1] range")
+        
+        # Check actual position matches state
+        if 'actual_position' in result.portfolio_matrix.columns and 'portfolio_state' in result.portfolio_matrix.columns:
+            for _, row in result.portfolio_matrix.iterrows():
+                state = row['portfolio_state']
+                pos = row['actual_position']
+                
+                if state == "LONG" and pos <= 0:
+                    issues.append(f"LONG state with non-positive position: {pos}")
+                elif state == "SHORT" and pos >= 0:
+                    issues.append(f"SHORT state with non-negative position: {pos}")
+                elif state == "FLAT" and pos != 0:
+                    issues.append(f"FLAT state with non-zero position: {pos}")
+        
+        # Check statistics match result
+        if statistics.total_rows != len(result.portfolio_matrix):
+            issues.append(
+                f"Total rows mismatch: stats={statistics.total_rows}, "
+                f"result={len(result.portfolio_matrix)}"
+            )
+        
+        # Check percentages sum to ~100
+        pct_sum = statistics.long_pct + statistics.short_pct + statistics.flat_pct
+        if abs(pct_sum - 100) > 1:
+            issues.append(f"Percentages do not sum to 100: {pct_sum:.1f}%")
+        
+        # Check position changes
+        if statistics.position_changes < 0:
+            issues.append(f"Position changes cannot be negative: {statistics.position_changes}")
+        
+        # Check thresholds
+        if statistics.entry_threshold <= statistics.exit_threshold:
+            warnings.append(f"Entry threshold ({statistics.entry_threshold}) <= exit threshold ({statistics.exit_threshold})")
+        
+        # Warnings (non-fatal)
+        if statistics.long_pct < 5 and statistics.short_pct < 5:
+            warnings.append("Very low long/short exposure")
+        
+        if statistics.mean_position_size < 0.1:
+            warnings.append("Very low average position size")
+        
+        if warnings:
+            print("\n  WARNINGS:")
+            for warning in warnings:
+                print(f"    ⚠ {warning}")
+        
+        if issues:
+            raise ValueError(
+                f"Portfolio Logic validation failed with {len(issues)} issue(s):\n" +
+                "\n".join(f"  - {issue}" for issue in issues)
+            )
+        
+        return True
+
+
+def run_validation(result, statistics):
+    """Run validation with user-friendly output."""
+    validator = PortfolioLogicValidator()
+    
+    print("\n" + "=" * 60)
+    print("PORTFOLIO LOGIC VALIDATION")
+    print("=" * 60)
+    
+    try:
+        validator.validate(result, statistics)
+        print("\n  ✓ All validation checks passed")
+        print("=" * 60)
+        return True
+    except ValueError as e:
+        print(e)
+        print("=" * 60)
+        return False

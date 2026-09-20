@@ -1,0 +1,507 @@
+"""
+Module 209 - Integration Test
+
+Tests risk engine, statistics, validator, report, and pipeline.
+"""
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
+
+import numpy as np
+import pandas as pd
+import tempfile
+
+from atlas.modules.module209_risk_engine.engine import RiskEngine, RiskConfig
+from atlas.modules.module209_risk_engine.statistics import RiskEngineStatisticsEngine
+from atlas.modules.module209_risk_engine.validator import run_validation
+from atlas.modules.module209_risk_engine.module import RiskEngineResearch
+
+
+def create_test_data(n=100, seed=42):
+    """Create synthetic test data for risk engine."""
+    np.random.seed(seed)
+    
+    timestamps = pd.date_range('2020-01-01', periods=n, freq='1h')
+    
+    # Create portfolio data
+    signal = np.random.randn(n) * 0.3
+    confidence = np.random.uniform(0.4, 0.9, n)
+    desired_position = np.random.choice([-1, 0, 1], n, p=[0.2, 0.6, 0.2])
+    position_size = np.random.uniform(0.2, 0.8, n)
+    actual_position = desired_position * position_size
+    
+    # Price for volatility
+    close = 100 + np.cumsum(np.random.randn(n) * 0.5)
+    
+    portfolio_df = pd.DataFrame({
+        'timestamp': timestamps,
+        'signal': signal,
+        'confidence': confidence,
+        'desired_position': desired_position,
+        'position_size': position_size,
+        'actual_position': actual_position,
+        'exposure': np.abs(actual_position),
+        'decision_reason': ['FLAT'] * n,
+        'portfolio_state': ['FLAT'] * n,
+        'close': close
+    })
+    
+    return {
+        'portfolio_matrix': portfolio_df
+    }
+
+
+def test_engine_load_portfolio():
+    """Test 1: Load portfolio matrix."""
+    print("\n" + "=" * 60)
+    print("TEST 1: Load Portfolio Matrix")
+    print("=" * 60)
+    
+    data = create_test_data()
+    engine = RiskEngine()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        matrix_path = tmp_path / "portfolio_matrix.parquet"
+        data['portfolio_matrix'].to_parquet(matrix_path, index=False)
+        
+        loaded_df = engine.load_portfolio_matrix(matrix_path)
+        
+        assert not loaded_df.empty
+        assert 'timestamp' in loaded_df.columns
+        assert 'desired_position' in loaded_df.columns
+    
+    print("  ✓ Load portfolio matrix test passed")
+    return True
+
+
+def test_engine_volatility_scaling():
+    """Test 2: Volatility scaling."""
+    print("\n" + "=" * 60)
+    print("TEST 2: Volatility Scaling")
+    print("=" * 60)
+    
+    config = RiskConfig(
+        volatility_target=0.20,
+        use_volatility_scaling=True,
+        volatility_window=10
+    )
+    engine = RiskEngine(config=config)
+    
+    portfolio_df = create_test_data()['portfolio_matrix']
+    
+    multiplier, rolling_vol = engine.compute_volatility_scaling(portfolio_df)
+    
+    assert len(multiplier) == len(portfolio_df)
+    assert np.all(multiplier >= 0)
+    assert not multiplier.isna().all()
+    
+    print("  ✓ Volatility scaling test passed")
+    return True
+
+
+def test_engine_position_limit():
+    """Test 3: Position limit."""
+    print("\n" + "=" * 60)
+    print("TEST 3: Position Limit")
+    print("=" * 60)
+    
+    config = RiskConfig(max_position_size=0.5)
+    engine = RiskEngine(config=config)
+    
+    desired = pd.Series([0.8, -0.8, 0.3, -0.3])
+    vol_mult = pd.Series([1.0, 1.0, 1.0, 1.0])
+    
+    limited = engine.compute_position_limit(desired, vol_mult)
+    
+    assert np.isclose(limited.iloc[0], 0.5)
+    assert np.isclose(limited.iloc[1], -0.5)
+    assert np.isclose(limited.iloc[2], 0.3)
+    assert np.isclose(limited.iloc[3], -0.3)
+    
+    print("  ✓ Position limit test passed")
+    return True
+
+
+def test_engine_exposure_limit():
+    """Test 4: Exposure limit."""
+    print("\n" + "=" * 60)
+    print("TEST 4: Exposure Limit")
+    print("=" * 60)
+    
+    engine = RiskEngine()
+    
+    position = pd.Series([0.8, -0.8, 0.3, -0.3])
+    
+    limited, exceeded = engine.compute_exposure_limit(position, 0.5)
+    
+    assert np.isclose(limited.iloc[0], 0.5)
+    assert np.isclose(limited.iloc[1], -0.5)
+    assert np.isclose(limited.iloc[2], 0.3)
+    assert np.isclose(limited.iloc[3], -0.3)
+    
+    print("  ✓ Exposure limit test passed")
+    return True
+
+
+def test_engine_leverage_limit():
+    """Test 5: Leverage limit."""
+    print("\n" + "=" * 60)
+    print("TEST 5: Leverage Limit")
+    print("=" * 60)
+    
+    engine = RiskEngine()
+    
+    position = pd.Series([2.0, -2.0, 0.5, -0.5])
+    
+    limited, exceeded = engine.compute_leverage_limit(position, 1.0)
+    
+    assert np.isclose(limited.iloc[0], 1.0)
+    assert np.isclose(limited.iloc[1], -1.0)
+    assert np.isclose(limited.iloc[2], 0.5)
+    assert np.isclose(limited.iloc[3], -0.5)
+    
+    print("  ✓ Leverage limit test passed")
+    return True
+
+
+def test_engine_approve_position():
+    """Test 6: Risk approval."""
+    print("\n" + "=" * 60)
+    print("TEST 6: Risk Approval")
+    print("=" * 60)
+    
+    config = RiskConfig(
+        max_position_size=0.5,
+        max_gross_exposure=1.0,
+        leverage_limit=1.0,
+        allow_short=True
+    )
+    engine = RiskEngine(config=config)
+    
+    desired = pd.Series([0.8, -0.8, 0.3, 0.0])
+    size = pd.Series([0.8, 0.8, 0.3, 0.0])
+    vol_mult = pd.Series([1.0, 1.0, 1.0, 1.0])
+    pos_limit = pd.Series([0.5, -0.5, 0.3, 0.0])
+    exp_limit = pd.Series([0.5, -0.5, 0.3, 0.0])
+    lev_limit = pd.Series([0.5, -0.5, 0.3, 0.0])
+    
+    approved_pos, approved_size, reason, state = engine.approve_position(
+        desired, size, vol_mult, pos_limit, exp_limit, lev_limit
+    )
+    
+    assert np.isclose(approved_pos.iloc[0], 0.5)
+    assert np.isclose(approved_pos.iloc[1], -0.5)
+    assert np.isclose(approved_pos.iloc[2], 0.3)
+    assert np.isclose(approved_pos.iloc[3], 0.0)
+    
+    print("  ✓ Risk approval test passed")
+    return True
+
+
+def test_engine_statistics():
+    """Test 7: Statistics."""
+    print("\n" + "=" * 60)
+    print("TEST 7: Statistics")
+    print("=" * 60)
+    
+    engine = RiskEngine()
+    
+    # Create a 100-row portfolio DataFrame
+    portfolio_df = create_test_data()['portfolio_matrix']
+    
+    # Create 4-row test data for approval statistics
+    approved_pos = pd.Series([0.5, -0.5, 0.3, 0.0])
+    risk_state = pd.Series(["APPROVED", "REDUCED", "REJECTED", "FLAT"])
+    risk_reason = pd.Series(["APPROVED", "REDUCED", "REJECTED", "FLAT"])
+    
+    stats = engine.compute_statistics(portfolio_df, approved_pos, risk_state, risk_reason)
+    
+    # Since portfolio_df has 100 rows, each state appears once -> 1%
+    assert stats['total_rows'] == 100
+    assert stats['approved_count'] == 1
+    assert stats['reduced_count'] == 1
+    assert stats['rejected_count'] == 1
+    assert stats['flat_count'] == 1
+    assert stats['approved_pct'] == 1.0
+    assert stats['reduced_pct'] == 1.0
+    assert stats['rejected_pct'] == 1.0
+    assert stats['flat_pct'] == 1.0
+    
+    print("  ✓ Statistics test passed")
+    return True
+
+
+def test_engine_compute():
+    """Test 8: Full engine computation."""
+    print("\n" + "=" * 60)
+    print("TEST 8: Full Engine Computation")
+    print("=" * 60)
+    
+    data = create_test_data()
+    engine = RiskEngine()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        output_dir = tmp_path / "output"
+        
+        matrix_path = tmp_path / "portfolio_matrix.parquet"
+        data['portfolio_matrix'].to_parquet(matrix_path, index=False)
+        
+        result = engine.compute(
+            portfolio_matrix_path=matrix_path,
+            output_dir=output_dir
+        )
+        
+        assert not result.risk_adjusted_portfolio.empty
+        assert result.summary_statistics['total_rows'] > 0
+        
+        # Check outputs were saved
+        assert (output_dir / "risk_adjusted_portfolio.parquet").exists()
+        assert (output_dir / "approved_positions.csv").exists()
+        assert (output_dir / "risk_events.csv").exists()
+        assert (output_dir / "risk_statistics.csv").exists()
+    
+    print("  ✓ Full engine test passed")
+    return True
+
+
+def test_statistics():
+    """Test 9: Statistics engine."""
+    print("\n" + "=" * 60)
+    print("TEST 9: Statistics Engine")
+    print("=" * 60)
+    
+    data = create_test_data()
+    engine = RiskEngine()
+    stats_engine = RiskEngineStatisticsEngine()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        output_dir = tmp_path / "output"
+        
+        matrix_path = tmp_path / "portfolio_matrix.parquet"
+        data['portfolio_matrix'].to_parquet(matrix_path, index=False)
+        
+        result = engine.compute(
+            portfolio_matrix_path=matrix_path,
+            output_dir=output_dir
+        )
+        
+        stats = stats_engine.analyze(result)
+        
+        assert stats.total_rows == result.summary_statistics['total_rows']
+        assert stats.approved_pct == result.summary_statistics['approved_pct']
+        assert stats.total_risk_events == result.summary_statistics['total_risk_events']
+    
+    print("  ✓ Statistics test passed")
+    return True
+
+
+def test_validator():
+    """Test 10: Validator."""
+    print("\n" + "=" * 60)
+    print("TEST 10: Validator")
+    print("=" * 60)
+    
+    data = create_test_data()
+    engine = RiskEngine()
+    stats_engine = RiskEngineStatisticsEngine()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        output_dir = tmp_path / "output"
+        
+        matrix_path = tmp_path / "portfolio_matrix.parquet"
+        data['portfolio_matrix'].to_parquet(matrix_path, index=False)
+        
+        result = engine.compute(
+            portfolio_matrix_path=matrix_path,
+            output_dir=output_dir
+        )
+        
+        stats = stats_engine.analyze(result)
+        
+        passed = run_validation(result, stats)
+        assert passed
+    
+    print("  ✓ Validator test passed")
+    return True
+
+
+def test_pipeline():
+    """Test 11: Full pipeline."""
+    print("\n" + "=" * 60)
+    print("TEST 11: Full Pipeline")
+    print("=" * 60)
+    
+    data = create_test_data()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        output_dir = tmp_path / "output"
+        
+        matrix_path = tmp_path / "portfolio_matrix.parquet"
+        data['portfolio_matrix'].to_parquet(matrix_path, index=False)
+        
+        research = RiskEngineResearch(
+            max_position_size=0.5,
+            max_gross_exposure=1.0,
+            leverage_limit=1.0
+        )
+        
+        result = research.run_risk_engine(
+            portfolio_matrix_path=matrix_path,
+            dataset_id="pipeline_test",
+            output_dir=output_dir
+        )
+        
+        assert result.status == "completed"
+        assert "risk_adjusted_portfolio" in result.artifacts
+        assert "approved_positions" in result.artifacts
+        assert "risk_events" in result.artifacts
+        assert "risk_statistics" in result.artifacts
+        assert "risk_engine_report" in result.artifacts
+        assert "risk_events_report" in result.artifacts
+        assert result.statistics.get("software_validation_passed") == True
+        
+        # Check outputs were saved
+        assert (output_dir / "risk_adjusted_portfolio.parquet").exists()
+        assert (output_dir / "approved_positions.csv").exists()
+        assert (output_dir / "risk_events.csv").exists()
+        assert (output_dir / "risk_statistics.csv").exists()
+    
+    print("  ✓ Full pipeline test passed")
+    return True
+
+
+def test_config_customization():
+    """Test 12: Configuration customization."""
+    print("\n" + "=" * 60)
+    print("TEST 12: Configuration Customization")
+    print("=" * 60)
+    
+    config = RiskConfig(
+        max_position_size=0.3,
+        max_gross_exposure=0.5,
+        leverage_limit=0.5,
+        volatility_target=0.15,
+        use_volatility_scaling=False,
+        allow_short=False,
+        allow_leverage=False
+    )
+    
+    engine = RiskEngine(config=config)
+    
+    assert engine.config.max_position_size == 0.3
+    assert engine.config.max_gross_exposure == 0.5
+    assert engine.config.leverage_limit == 0.5
+    assert engine.config.volatility_target == 0.15
+    assert engine.config.use_volatility_scaling == False
+    assert engine.config.allow_short == False
+    
+    print("  ✓ Configuration customization test passed")
+    return True
+
+
+def test_risk_reduction_comparison():
+    """Test 13: Risk reduction comparison."""
+    print("\n" + "=" * 60)
+    print("TEST 13: Risk Reduction Comparison")
+    print("=" * 60)
+    
+    data = create_test_data()
+    
+    # With risk limits
+    engine_with_risk = RiskEngine(
+        config=RiskConfig(
+            max_position_size=0.5,
+            max_gross_exposure=0.8,
+            leverage_limit=1.0
+        )
+    )
+    
+    # Without risk limits
+    engine_without_risk = RiskEngine(
+        config=RiskConfig(
+            max_position_size=1.0,
+            max_gross_exposure=1.0,
+            leverage_limit=1.0
+        )
+    )
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        matrix_path = tmp_path / "portfolio_matrix.parquet"
+        data['portfolio_matrix'].to_parquet(matrix_path, index=False)
+        
+        result_with = engine_with_risk.compute(
+            portfolio_matrix_path=matrix_path,
+            output_dir=tmp_path / "with_risk"
+        )
+        
+        result_without = engine_without_risk.compute(
+            portfolio_matrix_path=matrix_path,
+            output_dir=tmp_path / "without_risk"
+        )
+        
+        # With risk should have lower max position
+        max_with = result_with.risk_adjusted_portfolio['approved_position'].abs().max()
+        max_without = result_without.risk_adjusted_portfolio['approved_position'].abs().max()
+        
+        assert max_with <= max_without
+        
+        print(f"  Max position with risk: {max_with:.3f}")
+        print(f"  Max position without risk: {max_without:.3f}")
+    
+    print("  ✓ Risk reduction comparison test passed")
+    return True
+
+
+def main():
+    """Run all tests."""
+    print("\n" + "=" * 70)
+    print("PROJECT ATLAS - MODULE 209 INTEGRATION TEST")
+    print("Risk Engine")
+    print("=" * 70)
+    
+    results = {}
+    
+    results["load_portfolio"] = test_engine_load_portfolio()
+    results["volatility_scaling"] = test_engine_volatility_scaling()
+    results["position_limit"] = test_engine_position_limit()
+    results["exposure_limit"] = test_engine_exposure_limit()
+    results["leverage_limit"] = test_engine_leverage_limit()
+    results["risk_approval"] = test_engine_approve_position()
+    results["statistics"] = test_engine_statistics()
+    results["full_engine"] = test_engine_compute()
+    results["statistics_engine"] = test_statistics()
+    results["validator"] = test_validator()
+    results["pipeline"] = test_pipeline()
+    results["config_customization"] = test_config_customization()
+    results["risk_reduction"] = test_risk_reduction_comparison()
+    
+    print("\n" + "=" * 70)
+    print("RESULTS")
+    print("=" * 70)
+    
+    for name, ok in results.items():
+        print(f"  {'✓' if ok else '✗'} {name}")
+    
+    passed = sum(results.values())
+    total = len(results)
+    
+    print(f"\n  {passed}/{total} tests passed")
+    
+    if passed == total:
+        print("\n✓ Module 209 VALIDATED")
+        return 0
+    else:
+        print("\n⚠ Some tests failed")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

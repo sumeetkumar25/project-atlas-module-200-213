@@ -1,0 +1,261 @@
+"""
+Module 210
+Execution Simulation
+
+Transforms approved positions into executed trades under realistic exchange rules.
+
+Pipeline: load portfolio → generate orders → apply delay → apply slippage →
+          apply commission → execute orders → build trade log → statistics →
+          validation → report → export
+"""
+
+from typing import Optional, Dict, Any
+import pandas as pd
+from pathlib import Path
+
+from atlas.core.base_research_module import BaseResearchModule
+from atlas.framework.registry import AtlasRegistry
+
+from .engine import ExecutionSimulationEngine, ExecutionConfig
+from .statistics import ExecutionStatisticsEngine
+from .validator import run_validation
+from .report import ExecutionSimulationReport
+from .exporter import ExecutionSimulationExporter
+
+
+class ExecutionSimulationResearch(BaseResearchModule):
+    """Main research module for execution simulation."""
+    
+    MODULE_OUTPUT = "module210"
+    METADATA = ExecutionStatisticsEngine.METADATA
+    
+    def __init__(
+        self,
+        registry: Optional[AtlasRegistry] = None,
+        commission_rate: float = 0.0004,
+        slippage_rate: float = 0.0001,
+        latency_bars: int = 1,
+        partial_fills: bool = False,
+        unlimited_liquidity: bool = True,
+        max_position_size: float = 1.0,
+        timestamp_column: str = "timestamp",
+        price_column: str = "close",
+        open_column: str = "open",
+        high_column: str = "high",
+        low_column: str = "low"
+    ):
+        """
+        Initialize the execution simulation module.
+        
+        Args:
+            registry: Optional Atlas registry
+            commission_rate: Commission rate (e.g., 0.0004 = 0.04%)
+            slippage_rate: Slippage rate (e.g., 0.0001 = 0.01%)
+            latency_bars: Number of bars delay for execution
+            partial_fills: Whether partial fills are allowed
+            unlimited_liquidity: Whether liquidity is unlimited
+            max_position_size: Maximum position size
+            timestamp_column: Name of the timestamp column
+            price_column: Name of the price column
+            open_column: Name of the open column
+            high_column: Name of the high column
+            low_column: Name of the low column
+        """
+        super().__init__(
+            module_name="Execution Simulation",
+            module_version=self.METADATA["version"],
+        )
+        
+        self.registry = registry or AtlasRegistry()
+        
+        self.config = ExecutionConfig(
+            commission_rate=commission_rate,
+            slippage_rate=slippage_rate,
+            latency_bars=latency_bars,
+            partial_fills=partial_fills,
+            unlimited_liquidity=unlimited_liquidity,
+            max_position_size=max_position_size
+        )
+        
+        self.engine = ExecutionSimulationEngine(
+            config=self.config,
+            timestamp_column=timestamp_column,
+            price_column=price_column,
+            open_column=open_column,
+            high_column=high_column,
+            low_column=low_column
+        )
+        self.stats_engine = ExecutionStatisticsEngine()
+        self.result_data = None
+        self.statistics = None
+        self.trade_log_report = None
+        self._output_dir = None
+        self._paths = None
+
+    def _register_pipeline_steps(self):
+        """Register pipeline steps."""
+        self.pipeline_steps = [
+            ("execution_simulation", self._simulate_execution),
+            ("statistics", self._compute_statistics),
+            ("validate", self._validate),
+            ("export", self._export_results),
+        ]
+    
+    def _prepare_data(self) -> Dict[str, Any]:
+        """Prepare data."""
+        if self._paths is None:
+            raise ValueError("File paths not provided. Use run_execution() method.")
+        return self._paths
+    
+    def _simulate_execution(self) -> Dict[str, Any]:
+        """Step 1: Simulate execution."""
+        self.logger.info("Step 1: Simulating execution")
+        
+        prepared = self._prepare_data()
+        
+        self.result_data = self.engine.compute(
+            portfolio_matrix_path=prepared["portfolio_matrix"],
+            output_dir=self._output_dir
+        )
+        
+        self.logger.metric(
+            "Trades Executed",
+            str(len(self.result_data.executed_trade_log))
+        )
+        self.logger.metric(
+            "Long Trades",
+            str(self.result_data.summary_statistics["long_trades"])
+        )
+        self.logger.metric(
+            "Short Trades",
+            str(self.result_data.summary_statistics["short_trades"])
+        )
+        self.logger.metric(
+            "Execution Rate",
+            f"{self.result_data.summary_statistics['execution_rate']:.1%}"
+        )
+        self.logger.metric(
+            "Total Commission",
+            f"{self.result_data.summary_statistics['total_commission']:.4f}"
+        )
+        self.logger.success("Execution simulation complete")
+        
+        # Generate trade log report
+        self.trade_log_report = ExecutionSimulationReport.generate_trade_log(
+            self.result_data.executed_trade_log,
+            top_n=20
+        )
+        
+        return {
+            "trades_executed": len(self.result_data.executed_trade_log),
+            "long_trades": self.result_data.summary_statistics["long_trades"],
+            "short_trades": self.result_data.summary_statistics["short_trades"],
+            "execution_rate": self.result_data.summary_statistics["execution_rate"],
+            "total_commission": self.result_data.summary_statistics["total_commission"]
+        }
+    
+    def _compute_statistics(self) -> Dict[str, Any]:
+        """Step 2: Computing statistics."""
+        self.logger.info("Step 2: Computing statistics")
+        self.statistics = self.stats_engine.analyze(self.result_data)
+        
+        self.logger.metric(
+            "Avg Holding Bars",
+            f"{self.statistics.average_holding_bars:.1f}"
+        )
+        self.logger.metric(
+            "Avg Executed Size",
+            f"{self.statistics.average_executed_size:.3f}"
+        )
+        self.logger.success("Statistics computed")
+        
+        return self.stats_engine.summary_dict(self.statistics)
+    
+    def _validate(self) -> Dict[str, Any]:
+        """Step 3: Validation."""
+        self.logger.info("Step 3: Validation")
+        passed = run_validation(self.result_data, self.statistics)
+        self.logger.success("Validation complete")
+        return {"software_validation_passed": passed}
+    
+    def _export_results(self) -> Dict[str, Any]:
+        """Step 4: Export."""
+        self.logger.info("Step 4: Export")
+        
+        # Register DataFrames as artifacts
+        self.result.artifacts["executed_trade_log"] = self.result_data.executed_trade_log
+        self.result.artifacts["execution_events"] = self.result_data.execution_events
+        self.result.artifacts["position_history"] = self.result_data.position_history
+        
+        # Store summary
+        stats_df = pd.DataFrame([self.result_data.summary_statistics])
+        self.result.artifacts["execution_statistics"] = stats_df
+        
+        # Generate and register reports
+        main_report = ExecutionSimulationReport.generate(
+            self.statistics,
+            metadata=self.METADATA,
+            dataset_name=self.result.dataset_identifier,
+        )
+        self.result.artifacts["execution_simulation_report"] = main_report
+        self.result.artifacts["trade_log_report"] = self.trade_log_report
+        
+        self.logger.metric("Artifacts", str(len(self.result.artifacts)))
+        self.logger.success("Export complete")
+        
+        return {
+            "export_status": "complete",
+            "artifact_count": len(self.result.artifacts),
+            "trades_executed": len(self.result_data.executed_trade_log),
+            "total_commission": self.result_data.summary_statistics["total_commission"]
+        }
+    
+    def compute(self) -> Dict[str, Any]:
+        """Run the full computation pipeline."""
+        self.logger.section("Execution Simulation Pipeline")
+        results = self.execute_pipeline()
+        self.result.status = "completed"
+        self.logger.success("Module 210 complete")
+        return results
+    
+    def run(self, filepath: str, output_dir=None):
+        """Run module on file."""
+        self._output_dir = Path(output_dir) if output_dir else None
+        return super().run(filepath, output_dir)
+    
+    def run_dataframe(self, df, dataset_id="in_memory", output_dir=None):
+        """Run module on a single DataFrame."""
+        self._output_dir = Path(output_dir) if output_dir else None
+        return super().run_dataframe(df, dataset_id, output_dir)
+    
+    def run_execution(
+        self,
+        portfolio_matrix_path: Path,
+        dataset_id: str = "execution_simulation",
+        output_dir: Optional[Path] = None
+    ) -> Any:
+        """
+        Run the execution simulation.
+        
+        Args:
+            portfolio_matrix_path: Path to risk_adjusted_portfolio.parquet from Module 209
+            dataset_id: Identifier for the dataset
+            output_dir: Output directory for results
+        """
+        self._paths = {
+            "portfolio_matrix": portfolio_matrix_path
+        }
+        self._output_dir = Path(output_dir) if output_dir else Path("data/feature_store/execution")
+        
+        # Create a dummy DataFrame to satisfy BaseResearchModule
+        dummy = pd.DataFrame(
+            {
+                "timestamp": [pd.Timestamp("2000-01-01")]
+            }
+        )
+        
+        return super().run_dataframe(
+            dummy,
+            dataset_id=dataset_id,
+            output_dir=self._output_dir
+        )

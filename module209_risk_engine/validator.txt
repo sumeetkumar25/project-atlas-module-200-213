@@ -1,0 +1,132 @@
+# atlas/modules/module209_risk_engine/validator.py
+"""
+Module 209 - Risk Engine Validator
+"""
+
+import numpy as np
+import pandas as pd
+from .engine import RiskEngineResult
+from .statistics import RiskEngineStatistics
+
+
+class RiskEngineValidator:
+    """Validator for risk engine results."""
+    
+    def __init__(self, timestamp_column: str = "timestamp"):
+        self.timestamp_column = timestamp_column
+    
+    def validate(
+        self,
+        result: RiskEngineResult,
+        statistics: RiskEngineStatistics
+    ) -> bool:
+        """Validate results and statistics."""
+        issues = []
+        warnings = []
+        
+        # Check risk adjusted portfolio
+        if result.risk_adjusted_portfolio.empty:
+            issues.append("Risk adjusted portfolio is empty")
+        else:
+            if self.timestamp_column not in result.risk_adjusted_portfolio.columns:
+                issues.append("Missing timestamp column")
+            
+            # Check no duplicate timestamps
+            dup_count = result.risk_adjusted_portfolio[self.timestamp_column].duplicated().sum()
+            if dup_count > 0:
+                warnings.append(f"Found {dup_count} duplicate timestamps")
+        
+        # Check approved positions
+        if 'approved_position' in result.risk_adjusted_portfolio.columns:
+            # Check approved position <= max_position_size
+            max_pos = result.risk_adjusted_portfolio['approved_position'].abs().max()
+            if max_pos > statistics.max_position_size + 0.001:
+                issues.append(
+                    f"Max approved position ({max_pos:.3f}) exceeds max_position_size "
+                    f"({statistics.max_position_size})"
+                )
+        
+        # Check gross exposure
+        if 'approved_position' in result.risk_adjusted_portfolio.columns:
+            max_exposure = result.risk_adjusted_portfolio['approved_position'].abs().max()
+            if max_exposure > statistics.max_gross_exposure + 0.001:
+                issues.append(
+                    f"Max exposure ({max_exposure:.3f}) exceeds max_gross_exposure "
+                    f"({statistics.max_gross_exposure})"
+                )
+        
+        # Check approved_size >= 0
+        if 'approved_size' in result.risk_adjusted_portfolio.columns:
+            if (result.risk_adjusted_portfolio['approved_size'] < 0).any():
+                issues.append("Negative approved_size found")
+        
+        # Check volatility multiplier > 0
+        if 'volatility_multiplier' in result.risk_adjusted_portfolio.columns:
+            if (result.risk_adjusted_portfolio['volatility_multiplier'] <= 0).any():
+                issues.append("Non-positive volatility multiplier found")
+        
+        # Check risk_state valid
+        if 'risk_state' in result.risk_adjusted_portfolio.columns:
+            valid_states = ["APPROVED", "REDUCED", "REJECTED", "FLAT"]
+            invalid_states = set(result.risk_adjusted_portfolio['risk_state'].unique()) - set(valid_states)
+            if invalid_states:
+                issues.append(f"Invalid risk states: {invalid_states}")
+        
+        # Check statistics match result
+        if statistics.total_rows != len(result.risk_adjusted_portfolio):
+            issues.append(
+                f"Total rows mismatch: stats={statistics.total_rows}, "
+                f"result={len(result.risk_adjusted_portfolio)}"
+            )
+        
+        # Check percentages sum to ~100
+        pct_sum = statistics.approved_pct + statistics.reduced_pct + statistics.rejected_pct + statistics.flat_pct
+        if abs(pct_sum - 100) > 1:
+            issues.append(f"Percentages do not sum to 100: {pct_sum:.1f}%")
+        
+        # Check risk events
+        total_events = (statistics.exposure_events + statistics.leverage_events + 
+                       statistics.volatility_events + statistics.short_events)
+        if total_events != statistics.total_risk_events:
+            issues.append(
+                f"Risk events mismatch: {total_events} vs {statistics.total_risk_events}"
+            )
+        
+        # Warnings (non-fatal)
+        if statistics.rejected_pct > 20:
+            warnings.append(f"High rejection rate: {statistics.rejected_pct:.1f}%")
+        
+        if statistics.total_risk_events > statistics.total_rows * 0.5:
+            warnings.append(f"High risk event rate: {statistics.total_risk_events / statistics.total_rows:.1%}")
+        
+        if warnings:
+            print("\n  WARNINGS:")
+            for warning in warnings:
+                print(f"    ⚠ {warning}")
+        
+        if issues:
+            raise ValueError(
+                f"Risk Engine validation failed with {len(issues)} issue(s):\n" +
+                "\n".join(f"  - {issue}" for issue in issues)
+            )
+        
+        return True
+
+
+def run_validation(result, statistics):
+    """Run validation with user-friendly output."""
+    validator = RiskEngineValidator()
+    
+    print("\n" + "=" * 60)
+    print("RISK ENGINE VALIDATION")
+    print("=" * 60)
+    
+    try:
+        validator.validate(result, statistics)
+        print("\n  ✓ All validation checks passed")
+        print("=" * 60)
+        return True
+    except ValueError as e:
+        print(e)
+        print("=" * 60)
+        return False

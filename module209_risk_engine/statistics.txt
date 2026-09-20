@@ -1,0 +1,85 @@
+# atlas/modules/module209_risk_engine/statistics.py
+"""
+Module 209 - Risk Engine Statistics
+"""
+
+from dataclasses import dataclass, asdict
+import pandas as pd
+from .engine import RiskEngineResult
+
+
+@dataclass
+class RiskEngineStatistics:
+    """High-level statistics from risk engine analysis."""
+    total_rows: int
+    approved_pct: float
+    reduced_pct: float
+    rejected_pct: float
+    flat_pct: float
+    mean_position: float
+    max_position: float
+    min_position: float
+    mean_abs_position: float
+    max_abs_position: float
+    mean_exposure: float
+    max_exposure: float
+    exposure_events: int
+    leverage_events: int
+    volatility_events: int
+    short_events: int
+    total_risk_events: int
+    max_position_size: float
+    max_gross_exposure: float
+    leverage_limit: float
+    volatility_target: float
+    allow_short: bool
+    allow_leverage: bool
+    use_volatility_scaling: bool
+
+
+class RiskEngineStatisticsEngine:
+    """Engine for generating high-level statistics."""
+    
+    METADATA = {
+        "module": 209,
+        "name": "Risk Engine",
+        "version": "1.0.0",
+        "description": "Decides whether the desired position is allowed and applies risk constraints"
+    }
+    
+    def analyze(self, result: RiskEngineResult) -> RiskEngineStatistics:
+        """Analyze results and generate high-level statistics."""
+        return RiskEngineStatistics(
+            total_rows=result.summary_statistics['total_rows'],
+            approved_pct=result.summary_statistics['approved_pct'],
+            reduced_pct=result.summary_statistics['reduced_pct'],
+            rejected_pct=result.summary_statistics['rejected_pct'],
+            flat_pct=result.summary_statistics['flat_pct'],
+            mean_position=result.summary_statistics['mean_position'],
+            max_position=result.summary_statistics['max_position'],
+            min_position=result.summary_statistics['min_position'],
+            mean_abs_position=result.summary_statistics['mean_abs_position'],
+            max_abs_position=result.summary_statistics['max_abs_position'],
+            mean_exposure=result.summary_statistics['mean_exposure'],
+            max_exposure=result.summary_statistics['max_exposure'],
+            exposure_events=result.summary_statistics['exposure_events'],
+            leverage_events=result.summary_statistics['leverage_events'],
+            volatility_events=result.summary_statistics['volatility_events'],
+            short_events=result.summary_statistics['short_events'],
+            total_risk_events=result.summary_statistics['total_risk_events'],
+            max_position_size=result.summary_statistics['max_position_size'],
+            max_gross_exposure=result.summary_statistics['max_gross_exposure'],
+            leverage_limit=result.summary_statistics['leverage_limit'],
+            volatility_target=result.summary_statistics['volatility_target'],
+            allow_short=result.summary_statistics['allow_short'],
+            allow_leverage=result.summary_statistics['allow_leverage'],
+            use_volatility_scaling=result.summary_statistics['use_volatility_scaling']
+        )
+    
+    def summary_dataframe(self, stats: RiskEngineStatistics) -> pd.DataFrame:
+        """Convert statistics to DataFrame."""
+        return pd.DataFrame([asdict(stats)])
+    
+    def summary_dict(self, stats: RiskEngineStatistics) -> dict:
+        """Convert statistics to dictionary."""
+        return asdict(stats)

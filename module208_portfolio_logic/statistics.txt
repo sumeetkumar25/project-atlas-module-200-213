@@ -1,0 +1,71 @@
+# atlas/modules/module208_portfolio_logic/statistics.py
+"""
+Module 208 - Portfolio Logic Statistics
+"""
+
+from dataclasses import dataclass, asdict
+import pandas as pd
+from .engine import PortfolioLogicResult
+
+
+@dataclass
+class PortfolioLogicStatistics:
+    """High-level statistics from portfolio logic analysis."""
+    total_rows: int
+    long_pct: float
+    short_pct: float
+    flat_pct: float
+    mean_position_size: float
+    max_position_size: float
+    min_position_size: float
+    mean_exposure: float
+    max_exposure: float
+    min_exposure: float
+    position_changes: int
+    avg_holding_time: float
+    entry_threshold: float
+    exit_threshold: float
+    confidence_threshold: float
+    max_position_size_limit: float
+    allow_position_flip: bool
+
+
+class PortfolioLogicStatisticsEngine:
+    """Engine for generating high-level statistics."""
+    
+    METADATA = {
+        "module": 208,
+        "name": "Portfolio Logic",
+        "version": "1.0.0",
+        "description": "Converts signal and confidence into desired portfolio position"
+    }
+    
+    def analyze(self, result: PortfolioLogicResult) -> PortfolioLogicStatistics:
+        """Analyze results and generate high-level statistics."""
+        return PortfolioLogicStatistics(
+            total_rows=result.summary_statistics['total_rows'],
+            long_pct=result.summary_statistics['long_pct'],
+            short_pct=result.summary_statistics['short_pct'],
+            flat_pct=result.summary_statistics['flat_pct'],
+            mean_position_size=result.summary_statistics['mean_position_size'],
+            max_position_size=result.summary_statistics['max_position_size'],
+            min_position_size=result.summary_statistics['min_position_size'],
+            mean_exposure=result.summary_statistics['mean_exposure'],
+            max_exposure=result.summary_statistics['max_exposure'],
+            min_exposure=result.summary_statistics['min_exposure'],
+            position_changes=result.summary_statistics['position_changes'],
+            avg_holding_time=result.summary_statistics['avg_holding_time'],
+            entry_threshold=result.summary_statistics['entry_threshold'],
+            exit_threshold=result.summary_statistics['exit_threshold'],
+            confidence_threshold=result.summary_statistics['confidence_threshold'],
+            max_position_size_limit=result.summary_statistics['max_position_size'],
+            allow_position_flip=result.summary_statistics['allow_position_flip']
+        )
+    
+    def summary_dataframe(self, stats: PortfolioLogicStatistics) -> pd.DataFrame:
+        """Convert statistics to DataFrame."""
+        return pd.DataFrame([asdict(stats)])
+    
+    def summary_dict(self, stats: PortfolioLogicStatistics) -> dict:
+        """Convert statistics to dictionary."""
+        return asdict(stats)

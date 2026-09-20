@@ -1,0 +1,9 @@
+# atlas/modules/module209_risk_engine/__init__.py
+"""
+Module 209
+Risk Engine
+"""
+
+from .module import RiskEngineResearch
+
+__all__ = ["RiskEngineResearch"]

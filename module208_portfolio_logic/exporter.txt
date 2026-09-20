@@ -1,0 +1,39 @@
+# atlas/modules/module208_portfolio_logic/exporter.py
+"""
+Module 208 - Portfolio Logic Exporter
+"""
+
+import pandas as pd
+from pathlib import Path
+
+
+class PortfolioLogicExporter:
+    """Exporter for portfolio logic results."""
+    
+    @staticmethod
+    def export_portfolio_matrix(df: pd.DataFrame, filepath: str):
+        """Export portfolio matrix to Parquet."""
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_parquet(path, index=False)
+    
+    @staticmethod
+    def export_portfolio_positions(df: pd.DataFrame, filepath: str):
+        """Export portfolio positions to CSV."""
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(path, index=False)
+    
+    @staticmethod
+    def export_portfolio_state_history(df: pd.DataFrame, filepath: str):
+        """Export portfolio state history to CSV."""
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(path, index=False)
+    
+    @staticmethod
+    def export_portfolio_statistics(df: pd.DataFrame, filepath: str):
+        """Export portfolio statistics to CSV."""
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(path, index=False)
