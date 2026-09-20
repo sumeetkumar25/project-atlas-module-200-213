@@ -1,0 +1,445 @@
+# atlas/modules/module207_signal_confidence/engine.py
+"""
+Module 207 - Signal Confidence Engine
+
+Measures how reliable the signal is at any given time.
+
+Confidence Factors:
+  1. Signal Strength: Stronger signals deserve higher confidence
+  2. Feature Agreement: Features pointing in same direction increases confidence
+  3. Contribution Concentration: Balanced contributions preferred
+  4. Signal Stability: Stable signals deserve higher confidence
+  5. Direction Consistency: Consistent direction increases confidence
+
+Output: Confidence scores for each signal timestamp.
+"""
+
+import numpy as np
+import pandas as pd
+from dataclasses import dataclass
+from typing import Optional, Dict, Any, List, Tuple
+from pathlib import Path
+import warnings
+warnings.filterwarnings('ignore')
+
+
+@dataclass
+class SignalConfidenceResult:
+    """Results from signal confidence analysis."""
+    confidence_matrix: pd.DataFrame
+    signal_confidence: pd.Series
+    confidence_statistics: Dict[str, Any]
+    confidence_distribution: pd.DataFrame
+
+
+class SignalConfidenceEngine:
+    """Core engine for signal confidence analysis."""
+
+    # Confidence weights
+    CONFIDENCE_WEIGHTS = {
+        "strength": 0.25,
+        "agreement": 0.25,
+        "stability": 0.20,
+        "contribution_balance": 0.15,
+        "direction_consistency": 0.15
+    }
+
+    # Default window for rolling statistics
+    ROLLING_WINDOW = 100
+
+    def __init__(
+        self,
+        rolling_window: int = 100,
+        timestamp_column: str = "timestamp",
+        signal_column: str = "normalized_signal"
+    ):
+        """
+        Initialize the signal confidence engine.
+        
+        Args:
+            rolling_window: Window for rolling statistics
+            timestamp_column: Name of the timestamp column
+            signal_column: Name of the signal column
+        """
+        self.rolling_window = rolling_window
+        self.timestamp_column = timestamp_column
+        self.signal_column = signal_column
+
+    def load_signal_matrix(self, matrix_path: Path) -> pd.DataFrame:
+        """Load the signal matrix from Module 206."""
+        if not matrix_path.exists():
+            raise FileNotFoundError(f"Signal matrix not found: {matrix_path}")
+        
+        if matrix_path.suffix == '.parquet':
+            df = pd.read_parquet(matrix_path)
+        else:
+            df = pd.read_csv(matrix_path)
+            if self.timestamp_column in df.columns:
+                df[self.timestamp_column] = pd.to_datetime(df[self.timestamp_column])
+        
+        return df
+
+    def load_signal_components(self, filepath: Path) -> pd.DataFrame:
+        """Load signal components from Module 206."""
+        if not filepath.exists():
+            raise FileNotFoundError(f"Signal components not found: {filepath}")
+        
+        return pd.read_csv(filepath)
+
+    def compute_strength_score(self, signal: pd.Series) -> pd.Series:
+        """
+        Compute signal strength score.
+        
+        |Signal| → 0-1 mapping:
+        - |s| < 0.1 → 0.0
+        - |s| > 0.9 → 1.0
+        - Linear mapping in between
+        """
+        abs_signal = np.abs(signal)
+        
+        # Map |s| from [0, 0.9] to [0, 1]
+        strength = np.clip(abs_signal / 0.9, 0.0, 1.0)
+        return pd.Series(strength, index=signal.index)
+
+    def compute_agreement_score(self, components: pd.DataFrame) -> pd.Series:
+        """
+        Compute feature agreement score.
+        
+        Measures how many features agree on the direction.
+        """
+        # Get feature columns (exclude timestamp)
+        feature_cols = [c for c in components.columns if c != 'index' and c != self.timestamp_column]
+        
+        if not feature_cols:
+            return pd.Series(0.5, index=components.index)
+        
+        # Direction of each component
+        directions = np.sign(components[feature_cols].values)
+        
+        # Agreement = proportion of features with same sign as majority
+        majority_direction = np.sign(np.sum(directions, axis=1))
+        agreement = np.mean(directions == majority_direction[:, None], axis=1)
+        
+        return pd.Series(agreement, index=components.index)
+
+    def compute_contribution_balance(self, components: pd.DataFrame) -> pd.Series:
+        """
+        Compute contribution balance using Herfindahl-Hirschman Index (HHI).
+        
+        Lower HHI = more balanced = higher confidence.
+        """
+        feature_cols = [c for c in components.columns if c != 'index' and c != self.timestamp_column]
+        
+        if not feature_cols:
+            return pd.Series(0.5, index=components.index)
+        
+        # Calculate absolute contributions
+        abs_contrib = np.abs(components[feature_cols].values)
+        
+        # Handle case where all contributions are zero
+        row_sums = abs_contrib.sum(axis=1, keepdims=True)
+        row_sums = np.where(row_sums == 0, 1.0, row_sums)
+        
+        # Normalize to proportions
+        proportions = abs_contrib / row_sums
+        
+        # HHI = sum of squared proportions
+        hhi = np.sum(proportions ** 2, axis=1)
+        
+        # Convert HHI to balance score (HHI ranges from 1/n to 1)
+        # Lower HHI = more balanced = higher score
+        max_hhi = 1.0
+        min_hhi = 1.0 / len(feature_cols)
+        
+        if max_hhi - min_hhi > 0:
+            balance = 1 - (hhi - min_hhi) / (max_hhi - min_hhi)
+        else:
+            balance = 0.5
+        
+        return pd.Series(balance, index=components.index)
+
+    def compute_stability_score(self, signal: pd.Series) -> pd.Series:
+        """
+        Compute signal stability score.
+        
+        Measures rolling std - lower std = more stable.
+        """
+        # Rolling standard deviation
+        rolling_std = signal.rolling(window=self.rolling_window, min_periods=10).std()
+        
+        # Normalize to [0, 1]
+        # Use 0.5 as reference std for mapping
+        stability = np.clip(1 - (rolling_std / 0.5), 0.0, 1.0)
+        stability = stability.fillna(0.5)
+        
+        return pd.Series(stability, index=signal.index)
+
+    def compute_direction_consistency(self, signal: pd.Series) -> pd.Series:
+        """
+        Compute direction consistency score.
+        
+        Measures whether recent signals have consistent direction.
+        """
+        # Rolling sign consistency
+        sign = np.sign(signal)
+        
+        # Proportion of recent signals with same sign
+        def consistency_rolling(arr: np.ndarray, window: int) -> np.ndarray:
+            result = np.zeros_like(arr, dtype=float)
+            
+            for i in range(len(arr)):
+                if i < window:
+                    # Use available data
+                    start = max(0, i - window)
+                    window_data = arr[start:i+1]
+                else:
+                    window_data = arr[i-window+1:i+1]
+                
+                if len(window_data) > 1:
+                    # Proportion matching the current sign
+                    current_sign = window_data[-1]
+                    matching = np.sum(window_data == current_sign)
+                    result[i] = matching / len(window_data)
+                else:
+                    result[i] = 0.5
+            
+            return result
+        
+        consistency = pd.Series(
+            consistency_rolling(sign.values, self.rolling_window),
+            index=signal.index
+        )
+        
+        return consistency
+
+    def compute_confidence(
+        self,
+        signal: pd.Series,
+        components: pd.DataFrame,
+        strength: pd.Series,
+        agreement: pd.Series,
+        balance: pd.Series,
+        stability: pd.Series,
+        consistency: pd.Series
+    ) -> pd.Series:
+        """
+        Compute final confidence score.
+        """
+        confidence = (
+            self.CONFIDENCE_WEIGHTS["strength"] * strength +
+            self.CONFIDENCE_WEIGHTS["agreement"] * agreement +
+            self.CONFIDENCE_WEIGHTS["stability"] * stability +
+            self.CONFIDENCE_WEIGHTS["contribution_balance"] * balance +
+            self.CONFIDENCE_WEIGHTS["direction_consistency"] * consistency
+        )
+        
+        return pd.Series(np.clip(confidence, 0.0, 1.0), index=signal.index)
+
+    def compute_statistics(
+        self,
+        signal: pd.Series,
+        confidence: pd.Series
+    ) -> Dict[str, Any]:
+        """
+        Compute confidence statistics.
+        """
+        clean_conf = confidence.dropna()
+        
+        if len(clean_conf) == 0:
+            return {
+                'mean_confidence': 0.0,
+                'median_confidence': 0.0,
+                'min_confidence': 0.0,
+                'max_confidence': 0.0,
+                'std_confidence': 0.0,
+                'p95_confidence': 0.0,
+                'high_confidence_pct': 0.0,
+                'low_confidence_pct': 0.0,
+                'positive_signal_mean_conf': 0.0,
+                'negative_signal_mean_conf': 0.0,
+                'total_rows': len(signal)
+            }
+        
+        # Deciles
+        deciles = np.percentile(clean_conf, np.arange(10, 100, 10))
+        
+        # High confidence (>0.7) and low confidence (<0.3)
+        high_conf = np.sum(clean_conf > 0.7) / len(clean_conf) * 100
+        low_conf = np.sum(clean_conf < 0.3) / len(clean_conf) * 100
+        
+        # Confidence by signal direction
+        signal_sign = np.sign(signal)
+        positive_mask = signal_sign > 0
+        negative_mask = signal_sign < 0
+        
+        pos_conf = clean_conf[positive_mask].mean() if np.sum(positive_mask) > 0 else 0
+        neg_conf = clean_conf[negative_mask].mean() if np.sum(negative_mask) > 0 else 0
+        
+        stats = {
+            'mean_confidence': float(clean_conf.mean()),
+            'median_confidence': float(clean_conf.median()),
+            'min_confidence': float(clean_conf.min()),
+            'max_confidence': float(clean_conf.max()),
+            'std_confidence': float(clean_conf.std()),
+            'p95_confidence': float(np.percentile(clean_conf, 95)),
+            'deciles': deciles.tolist(),
+            'high_confidence_pct': float(high_conf),
+            'low_confidence_pct': float(low_conf),
+            'positive_signal_mean_conf': float(pos_conf),
+            'negative_signal_mean_conf': float(neg_conf),
+            'total_rows': len(signal)
+        }
+        
+        return stats
+
+    def build_confidence_distribution(
+        self,
+        confidence: pd.Series,
+        n_bins: int = 20
+    ) -> pd.DataFrame:
+        """
+        Build confidence distribution histogram.
+        """
+        clean_conf = confidence.dropna()
+        
+        if len(clean_conf) == 0:
+            return pd.DataFrame()
+        
+        hist, bin_edges = np.histogram(clean_conf, bins=n_bins, range=(0, 1))
+        
+        return pd.DataFrame({
+            'bin_lower': bin_edges[:-1],
+            'bin_upper': bin_edges[1:],
+            'count': hist,
+            'percentage': hist / len(clean_conf) * 100
+        })
+
+    def save_outputs(
+        self,
+        signal: pd.Series,
+        confidence: pd.Series,
+        confidence_matrix: pd.DataFrame,
+        stats: Dict[str, Any],
+        distribution: pd.DataFrame,
+        output_dir: Path
+    ) -> None:
+        """Save all outputs."""
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Confidence matrix
+        matrix_path = output_dir / "confidence_matrix.parquet"
+        confidence_matrix.to_parquet(matrix_path, index=False)
+        print(f"  Saved confidence matrix to {matrix_path}")
+        
+        # Signal confidence
+        conf_df = pd.DataFrame({
+            'timestamp': signal.index,
+            self.signal_column: signal.values,
+            'confidence': confidence.values
+        })
+        if self.timestamp_column in conf_df.columns:
+            conf_df = conf_df.rename(columns={'timestamp': self.timestamp_column})
+        conf_path = output_dir / "signal_confidence.csv"
+        conf_df.to_csv(conf_path, index=False)
+        print(f"  Saved signal confidence to {conf_path}")
+        
+        # Confidence statistics
+        stats_df = pd.DataFrame([stats])
+        stats_path = output_dir / "confidence_statistics.csv"
+        stats_df.to_csv(stats_path, index=False)
+        print(f"  Saved confidence statistics to {stats_path}")
+        
+        # Confidence distribution
+        dist_path = output_dir / "confidence_distribution.csv"
+        distribution.to_csv(dist_path, index=False)
+        print(f"  Saved confidence distribution to {dist_path}")
+
+    def compute(
+        self,
+        signal_matrix_path: Path,
+        signal_components_path: Path,
+        output_dir: Optional[Path] = None
+    ) -> SignalConfidenceResult:
+        """
+        Main computation method.
+        """
+        print("\n  Computing Signal Confidence...")
+        
+        if output_dir is None:
+            output_dir = Path("data/feature_store/confidence")
+        
+        # Load signal matrix
+        print(f"  Loading signal matrix from: {signal_matrix_path}")
+        signal_df = self.load_signal_matrix(signal_matrix_path)
+        print(f"  Shape: {signal_df.shape}")
+        
+        # Load signal components
+        print(f"  Loading signal components from: {signal_components_path}")
+        components_df = self.load_signal_components(signal_components_path)
+        print(f"  Shape: {components_df.shape}")
+        
+        # Extract signal
+        if self.signal_column not in signal_df.columns:
+            raise ValueError(f"Signal column '{self.signal_column}' not found")
+        
+        signal = signal_df[self.signal_column]
+        
+        # Compute confidence factors
+        print("  Computing signal strength...")
+        strength = self.compute_strength_score(signal)
+        
+        print("  Computing feature agreement...")
+        agreement = self.compute_agreement_score(components_df)
+        
+        print("  Computing contribution balance...")
+        balance = self.compute_contribution_balance(components_df)
+        
+        print("  Computing signal stability...")
+        stability = self.compute_stability_score(signal)
+        
+        print("  Computing direction consistency...")
+        consistency = self.compute_direction_consistency(signal)
+        
+        # Compute confidence
+        print("  Computing final confidence...")
+        confidence = self.compute_confidence(
+            signal, components_df,
+            strength, agreement, balance, stability, consistency
+        )
+        
+        # Compute statistics
+        print("  Computing confidence statistics...")
+        stats = self.compute_statistics(signal, confidence)
+        
+        # Build distribution
+        print("  Building confidence distribution...")
+        distribution = self.build_confidence_distribution(confidence)
+        
+        # Build confidence matrix
+        confidence_matrix = pd.DataFrame({
+            self.timestamp_column: signal_df[self.timestamp_column],
+            self.signal_column: signal.values,
+            'confidence': confidence.values
+        })
+        
+        # Save outputs
+        print("\n  Saving outputs...")
+        self.save_outputs(
+            signal, confidence, confidence_matrix,
+            stats, distribution, output_dir
+        )
+        
+        print(f"\n  Confidence Summary:")
+        print(f"    Mean Confidence: {stats['mean_confidence']:.3f}")
+        print(f"    Median Confidence: {stats['median_confidence']:.3f}")
+        print(f"    High Confidence: {stats['high_confidence_pct']:.1f}%")
+        print(f"    Low Confidence: {stats['low_confidence_pct']:.1f}%")
+        print(f"    Positive Signal Mean Conf: {stats['positive_signal_mean_conf']:.3f}")
+        print(f"    Negative Signal Mean Conf: {stats['negative_signal_mean_conf']:.3f}")
+        
+        return SignalConfidenceResult(
+            confidence_matrix=confidence_matrix,
+            signal_confidence=confidence,
+            confidence_statistics=stats,
+            confidence_distribution=distribution
+        )

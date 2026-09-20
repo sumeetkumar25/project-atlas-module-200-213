@@ -1,0 +1,136 @@
+"""
+Module 205 - Feature Selection Validator
+"""
+
+import numpy as np
+import pandas as pd
+from .engine import FeatureSelectionResult
+from .statistics import FeatureSelectionStatistics
+
+
+class FeatureSelectionValidator:
+    """Validator for feature selection results."""
+    
+    def validate(
+        self,
+        result: FeatureSelectionResult,
+        statistics: FeatureSelectionStatistics
+    ) -> bool:
+        """Validate results and statistics."""
+        issues = []
+        warnings = []
+        
+        # Check feature scores
+        if result.feature_scores.empty:
+            issues.append("Feature scores table is empty")
+        else:
+            required_cols = ['feature', 'final_score']
+            missing = set(required_cols) - set(result.feature_scores.columns)
+            if missing:
+                issues.append(f"Missing columns in feature scores: {missing}")
+            
+            # Check scores are in [0, 1]
+            if 'final_score' in result.feature_scores.columns:
+                if not np.all((0 <= result.feature_scores['final_score']) & 
+                            (result.feature_scores['final_score'] <= 1)):
+                    issues.append("Final scores outside [0, 1] range")
+            
+            # Check no duplicate features
+            if result.feature_scores['feature'].duplicated().any():
+                issues.append("Duplicate features found in scores")
+        
+        # Check feature ranking
+        if result.feature_ranking.empty:
+            issues.append("Feature ranking is empty")
+        else:
+            # Check ranking is sorted descending (ignore first NaN from diff)
+            scores = result.feature_ranking["final_score"].to_numpy()
+            if not np.all(scores[:-1] >= scores[1:]):
+                issues.append("Ranking is not sorted by score")
+            
+            # Check ranks are sequential
+            if 'rank' in result.feature_ranking.columns:
+                if not np.all(result.feature_ranking['rank'] == range(1, len(result.feature_ranking) + 1)):
+                    issues.append("Ranks are not sequential")
+        
+        # Check selected and rejected lists
+        all_features = set(result.selected_features) | set(result.rejected_features)
+        if len(all_features) != result.summary_statistics['total_features']:
+            issues.append(
+                f"Feature count mismatch: {len(all_features)} vs {result.summary_statistics['total_features']}"
+            )
+        
+        # Check no overlap
+        overlap = set(result.selected_features) & set(result.rejected_features)
+        if overlap:
+            issues.append(f"Features appear in both selected and rejected: {overlap}")
+        
+        # Check selected features exist in scores
+        for feature in result.selected_features:
+            if feature not in result.feature_scores['feature'].values:
+                issues.append(f"Selected feature '{feature}' not in scores table")
+        
+        # Check statistics match result
+        if statistics.total_features != result.summary_statistics['total_features']:
+            issues.append(
+                f"Total features mismatch: stats={statistics.total_features}, "
+                f"result={result.summary_statistics['total_features']}"
+            )
+        
+        if statistics.selected_count != len(result.selected_features):
+            issues.append(
+                f"Selected count mismatch: stats={statistics.selected_count}, "
+                f"result={len(result.selected_features)}"
+            )
+        
+        if statistics.rejected_count != len(result.rejected_features):
+            issues.append(
+                f"Rejected count mismatch: stats={statistics.rejected_count}, "
+                f"result={len(result.rejected_features)}"
+            )
+        
+        # Check best/worst statistics are consistent
+        if statistics.best_score < statistics.worst_score:
+            issues.append(f"Best score {statistics.best_score} is less than worst score {statistics.worst_score}")
+        
+        if statistics.best_score < statistics.average_score:
+            issues.append(f"Best score {statistics.best_score} is less than average {statistics.average_score}")
+        
+        # Warnings (non-fatal)
+        if statistics.selected_percentage < 30:
+            warnings.append(f"Low selection percentage: {statistics.selected_percentage:.1f}%")
+        
+        if statistics.average_score < 0.5:
+            warnings.append(f"Low average score: {statistics.average_score:.3f}")
+        
+        if warnings:
+            print("\n  WARNINGS:")
+            for warning in warnings:
+                print(f"    ⚠ {warning}")
+        
+        if issues:
+            raise ValueError(
+                f"Feature Selection validation failed with {len(issues)} issue(s):\n" +
+                "\n".join(f"  - {issue}" for issue in issues)
+            )
+        
+        return True
+
+
+def run_validation(result, statistics):
+    """Run validation with user-friendly output."""
+    validator = FeatureSelectionValidator()
+    
+    print("\n" + "=" * 60)
+    print("FEATURE SELECTION VALIDATION")
+    print("=" * 60)
+    
+    try:
+        validator.validate(result, statistics)
+        print("\n  ✓ All validation checks passed")
+        print("=" * 60)
+        return True
+    except ValueError as e:
+        print(e)
+        print("=" * 60)
+        return False

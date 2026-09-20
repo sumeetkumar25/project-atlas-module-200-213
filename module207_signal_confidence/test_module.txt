@@ -1,0 +1,434 @@
+# atlas/modules/module207_signal_confidence/test_module.py
+"""
+Module 207 - Integration Test
+
+Tests signal confidence engine, statistics, validator, report, and pipeline.
+"""
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
+
+import numpy as np
+import pandas as pd
+import tempfile
+
+from atlas.modules.module207_signal_confidence.engine import SignalConfidenceEngine
+from atlas.modules.module207_signal_confidence.statistics import SignalConfidenceStatisticsEngine
+from atlas.modules.module207_signal_confidence.validator import run_validation
+from atlas.modules.module207_signal_confidence.module import SignalConfidenceResearch
+
+
+def create_test_data(n=100, seed=42):
+    """Create synthetic test data for signal confidence."""
+    np.random.seed(seed)
+    
+    timestamps = pd.date_range('2020-01-01', periods=n, freq='1h')
+    
+    # Create signal with varying characteristics
+    signal = np.random.randn(n) * 0.5
+    
+    # Add some strong signals
+    signal[10:20] = 0.8 + np.random.randn(10) * 0.1
+    signal[30:40] = -0.7 + np.random.randn(10) * 0.1
+    signal[50:60] = 0.9 + np.random.randn(10) * 0.05
+    
+    # Signal matrix
+    signal_df = pd.DataFrame({
+        'timestamp': timestamps,
+        'normalized_signal': signal
+    })
+    
+    # Signal components (3 features)
+    components_df = pd.DataFrame({
+        'timestamp': timestamps,
+        'feature1': signal * 0.5 + np.random.randn(n) * 0.1,
+        'feature2': signal * 0.3 + np.random.randn(n) * 0.15,
+        'feature3': signal * 0.2 + np.random.randn(n) * 0.1
+    })
+    
+    return {
+        'signal_matrix': signal_df,
+        'signal_components': components_df
+    }
+
+
+def test_engine_load_signal():
+    """Test 1: Load signal matrix."""
+    print("\n" + "=" * 60)
+    print("TEST 1: Load Signal Matrix")
+    print("=" * 60)
+    
+    data = create_test_data()
+    engine = SignalConfidenceEngine()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        matrix_path = tmp_path / "signal_matrix.parquet"
+        data['signal_matrix'].to_parquet(matrix_path, index=False)
+        
+        loaded_df = engine.load_signal_matrix(matrix_path)
+        
+        assert not loaded_df.empty
+        assert 'timestamp' in loaded_df.columns
+        assert 'normalized_signal' in loaded_df.columns
+    
+    print("  ✓ Load signal matrix test passed")
+    return True
+
+
+def test_engine_strength_score():
+    """Test 2: Signal strength score."""
+    print("\n" + "=" * 60)
+    print("TEST 2: Signal Strength Score")
+    print("=" * 60)
+    
+    engine = SignalConfidenceEngine()
+    
+    signal = pd.Series([0.0, 0.5, 1.0, -0.5, -1.0])
+    strength = engine.compute_strength_score(signal)
+    
+    assert strength.iloc[0] == 0.0
+    assert 0 < strength.iloc[1] < 1
+    assert strength.iloc[2] == 1.0
+    assert 0 < strength.iloc[3] < 1
+    assert strength.iloc[4] == 1.0
+    
+    print("  ✓ Strength score test passed")
+    return True
+
+
+def test_engine_agreement_score():
+    """Test 3: Feature agreement score."""
+    print("\n" + "=" * 60)
+    print("TEST 3: Feature Agreement Score")
+    print("=" * 60)
+    
+    engine = SignalConfidenceEngine()
+    
+    # All features agree
+    components = pd.DataFrame({
+        'f1': [1, 1, 1],
+        'f2': [1, 1, 0],
+        'f3': [1, 0, 0]
+    })
+    
+    agreement = engine.compute_agreement_score(components)
+    
+    assert agreement.iloc[0] == 1.0  # All agree
+    assert agreement.iloc[2] < 0.5  # Mixed
+    
+    print("  ✓ Agreement score test passed")
+    return True
+
+
+def test_engine_contribution_balance():
+    """Test 4: Contribution balance."""
+    print("\n" + "=" * 60)
+    print("TEST 4: Contribution Balance")
+    print("=" * 60)
+    
+    engine = SignalConfidenceEngine()
+    
+    # Balanced contributions
+    components = pd.DataFrame({
+        'f1': [1, 1, 1],
+        'f2': [1, 1, 1],
+        'f3': [1, 1, 1]
+    })
+    
+    balance = engine.compute_contribution_balance(components)
+    assert balance.iloc[0] > 0.8
+    
+    # Unbalanced contributions
+    components = pd.DataFrame({
+        'f1': [10, 10, 10],
+        'f2': [0.1, 0.1, 0.1],
+        'f3': [0.1, 0.1, 0.1]
+    })
+    
+    balance = engine.compute_contribution_balance(components)
+    assert balance.iloc[0] < 0.5
+    
+    print("  ✓ Contribution balance test passed")
+    return True
+
+
+def test_engine_stability_score():
+    """Test 5: Signal stability score."""
+    print("\n" + "=" * 60)
+    print("TEST 5: Signal Stability Score")
+    print("=" * 60)
+    
+    engine = SignalConfidenceEngine(rolling_window=10)
+    
+    # Stable signal
+    stable = pd.Series(np.ones(100) * 0.5 + np.random.randn(100) * 0.05)
+    stable_score = engine.compute_stability_score(stable).mean()
+    
+    # Unstable signal
+    unstable = pd.Series(np.random.randn(100) * 0.5)
+    unstable_score = engine.compute_stability_score(unstable).mean()
+    
+    assert stable_score > unstable_score
+    
+    print("  ✓ Stability score test passed")
+    return True
+
+
+def test_engine_direction_consistency():
+    """Test 6: Direction consistency score."""
+    print("\n" + "=" * 60)
+    print("TEST 6: Direction Consistency")
+    print("=" * 60)
+    
+    engine = SignalConfidenceEngine(rolling_window=5)
+    
+    # Consistent direction
+    consistent = pd.Series([0.5, 0.6, 0.7, 0.8, 0.9, 0.8, 0.7, 0.6])
+    consistent_score = engine.compute_direction_consistency(consistent)
+    
+    # Inconsistent direction
+    inconsistent = pd.Series([0.5, -0.6, 0.7, -0.8, 0.9, -0.8, 0.7, -0.6])
+    inconsistent_score = engine.compute_direction_consistency(inconsistent)
+    
+    assert consistent_score.mean() > inconsistent_score.mean()
+    
+    print("  ✓ Direction consistency test passed")
+    return True
+
+
+def test_engine_confidence():
+    """Test 7: Confidence calculation."""
+    print("\n" + "=" * 60)
+    print("TEST 7: Confidence Calculation")
+    print("=" * 60)
+    
+    engine = SignalConfidenceEngine()
+    
+    # High confidence scenario
+    signal = pd.Series([0.9] * 10)
+    components = pd.DataFrame({
+        'f1': [1] * 10,
+        'f2': [1] * 10,
+        'f3': [1] * 10
+    })
+    
+    strength = engine.compute_strength_score(signal)
+    agreement = engine.compute_agreement_score(components)
+    balance = engine.compute_contribution_balance(components)
+    stability = engine.compute_stability_score(signal)
+    consistency = engine.compute_direction_consistency(signal)
+    
+    confidence = engine.compute_confidence(
+        signal, components, strength, agreement, balance, stability, consistency
+    )
+    
+    # Should be high confidence
+    assert confidence.mean() > 0.7
+    
+    print("  ✓ Confidence calculation test passed")
+    return True
+
+
+def test_engine_compute():
+    """Test 8: Full engine computation."""
+    print("\n" + "=" * 60)
+    print("TEST 8: Full Engine Computation")
+    print("=" * 60)
+    
+    data = create_test_data()
+    engine = SignalConfidenceEngine(rolling_window=20)
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        output_dir = tmp_path / "output"
+        
+        matrix_path = tmp_path / "signal_matrix.parquet"
+        components_path = tmp_path / "signal_components.csv"
+        
+        data['signal_matrix'].to_parquet(matrix_path, index=False)
+        data['signal_components'].to_csv(components_path, index=False)
+        
+        result = engine.compute(
+            signal_matrix_path=matrix_path,
+            signal_components_path=components_path,
+            output_dir=output_dir
+        )
+        
+        assert not result.confidence_matrix.empty
+        assert not result.signal_confidence.empty
+        assert not result.confidence_distribution.empty
+        assert result.confidence_statistics['total_rows'] > 0
+        
+        # Check outputs were saved
+        assert (output_dir / "confidence_matrix.parquet").exists()
+        assert (output_dir / "signal_confidence.csv").exists()
+        assert (output_dir / "confidence_statistics.csv").exists()
+        assert (output_dir / "confidence_distribution.csv").exists()
+    
+    print("  ✓ Full engine test passed")
+    return True
+
+
+def test_statistics():
+    """Test 9: Statistics engine."""
+    print("\n" + "=" * 60)
+    print("TEST 9: Statistics Engine")
+    print("=" * 60)
+    
+    data = create_test_data()
+    engine = SignalConfidenceEngine(rolling_window=20)
+    stats_engine = SignalConfidenceStatisticsEngine()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        output_dir = tmp_path / "output"
+        
+        matrix_path = tmp_path / "signal_matrix.parquet"
+        components_path = tmp_path / "signal_components.csv"
+        
+        data['signal_matrix'].to_parquet(matrix_path, index=False)
+        data['signal_components'].to_csv(components_path, index=False)
+        
+        result = engine.compute(
+            signal_matrix_path=matrix_path,
+            signal_components_path=components_path,
+            output_dir=output_dir
+        )
+        
+        stats = stats_engine.analyze(result)
+        
+        assert stats.mean_confidence == result.confidence_statistics['mean_confidence']
+        assert stats.total_rows == result.confidence_statistics['total_rows']
+        assert stats.high_confidence_pct == result.confidence_statistics['high_confidence_pct']
+    
+    print("  ✓ Statistics test passed")
+    return True
+
+
+def test_validator():
+    """Test 10: Validator."""
+    print("\n" + "=" * 60)
+    print("TEST 10: Validator")
+    print("=" * 60)
+    
+    data = create_test_data()
+    engine = SignalConfidenceEngine(rolling_window=20)
+    stats_engine = SignalConfidenceStatisticsEngine()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        output_dir = tmp_path / "output"
+        
+        matrix_path = tmp_path / "signal_matrix.parquet"
+        components_path = tmp_path / "signal_components.csv"
+        
+        data['signal_matrix'].to_parquet(matrix_path, index=False)
+        data['signal_components'].to_csv(components_path, index=False)
+        
+        result = engine.compute(
+            signal_matrix_path=matrix_path,
+            signal_components_path=components_path,
+            output_dir=output_dir
+        )
+        
+        stats = stats_engine.analyze(result)
+        
+        passed = run_validation(result, stats)
+        assert passed
+    
+    print("  ✓ Validator test passed")
+    return True
+
+
+def test_pipeline():
+    """Test 11: Full pipeline."""
+    print("\n" + "=" * 60)
+    print("TEST 11: Full Pipeline")
+    print("=" * 60)
+    
+    data = create_test_data()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        output_dir = tmp_path / "output"
+        
+        matrix_path = tmp_path / "signal_matrix.parquet"
+        components_path = tmp_path / "signal_components.csv"
+        
+        data['signal_matrix'].to_parquet(matrix_path, index=False)
+        data['signal_components'].to_csv(components_path, index=False)
+        
+        research = SignalConfidenceResearch(rolling_window=20)
+        
+        result = research.run_confidence(
+            signal_matrix_path=matrix_path,
+            signal_components_path=components_path,
+            dataset_id="pipeline_test",
+            output_dir=output_dir
+        )
+        
+        assert result.status == "completed"
+        assert "confidence_matrix" in result.artifacts
+        assert "signal_confidence" in result.artifacts
+        assert "confidence_statistics" in result.artifacts
+        assert "confidence_distribution" in result.artifacts
+        assert "signal_confidence_report" in result.artifacts
+        assert "distribution_report" in result.artifacts
+        assert result.statistics.get("software_validation_passed") == True
+        
+        # Check outputs were saved
+        assert (output_dir / "confidence_matrix.parquet").exists()
+        assert (output_dir / "signal_confidence.csv").exists()
+        assert (output_dir / "confidence_statistics.csv").exists()
+        assert (output_dir / "confidence_distribution.csv").exists()
+    
+    print("  ✓ Full pipeline test passed")
+    return True
+
+
+def main():
+    """Run all tests."""
+    print("\n" + "=" * 70)
+    print("PROJECT ATLAS - MODULE 207 INTEGRATION TEST")
+    print("Signal Confidence")
+    print("=" * 70)
+    
+    results = {}
+    
+    results["load_signal"] = test_engine_load_signal()
+    results["strength_score"] = test_engine_strength_score()
+    results["agreement_score"] = test_engine_agreement_score()
+    results["contribution_balance"] = test_engine_contribution_balance()
+    results["stability_score"] = test_engine_stability_score()
+    results["direction_consistency"] = test_engine_direction_consistency()
+    results["confidence"] = test_engine_confidence()
+    results["full_engine"] = test_engine_compute()
+    results["statistics"] = test_statistics()
+    results["validator"] = test_validator()
+    results["pipeline"] = test_pipeline()
+    
+    print("\n" + "=" * 70)
+    print("RESULTS")
+    print("=" * 70)
+    
+    for name, ok in results.items():
+        print(f"  {'✓' if ok else '✗'} {name}")
+    
+    passed = sum(results.values())
+    total = len(results)
+    
+    print(f"\n  {passed}/{total} tests passed")
+    
+    if passed == total:
+        print("\n✓ Module 207 VALIDATED")
+        return 0
+    else:
+        print("\n⚠ Some tests failed")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

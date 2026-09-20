@@ -1,0 +1,67 @@
+# atlas/modules/module205_feature_selection/statistics.py
+"""
+Module 205 - Feature Selection Statistics
+"""
+
+from dataclasses import dataclass, asdict
+import pandas as pd
+from .engine import FeatureSelectionResult
+
+
+@dataclass
+class FeatureSelectionStatistics:
+    """High-level statistics from feature selection."""
+    total_features: int
+    selected_count: int
+    rejected_count: int
+    selected_percentage: float
+    rejected_percentage: float
+    average_score: float
+    median_score: float
+    min_score: float
+    max_score: float
+    best_feature: str
+    worst_feature: str
+    best_score: float
+    worst_score: float
+    selection_threshold: float
+    stability_threshold: float
+
+
+class FeatureSelectionStatisticsEngine:
+    """Engine for generating high-level statistics."""
+    
+    METADATA = {
+        "module": 205,
+        "name": "Feature Selection & Ranking",
+        "version": "1.0.0",
+        "description": "Produces the final feature set for all future models"
+    }
+    
+    def analyze(self, result: FeatureSelectionResult) -> FeatureSelectionStatistics:
+        """Analyze results and generate high-level statistics."""
+        return FeatureSelectionStatistics(
+            total_features=result.summary_statistics['total_features'],
+            selected_count=result.summary_statistics['selected_count'],
+            rejected_count=result.summary_statistics['rejected_count'],
+            selected_percentage=result.summary_statistics['selected_percentage'],
+            rejected_percentage=result.summary_statistics['rejected_percentage'],
+            average_score=result.summary_statistics['average_score'],
+            median_score=result.summary_statistics['median_score'],
+            min_score=result.summary_statistics['min_score'],
+            max_score=result.summary_statistics['max_score'],
+            best_feature=result.summary_statistics['best_feature'],
+            worst_feature=result.summary_statistics['worst_feature'],
+            best_score=result.summary_statistics['best_score'],
+            worst_score=result.summary_statistics['worst_score'],
+            selection_threshold=result.summary_statistics['selection_threshold'],
+            stability_threshold=result.summary_statistics['stability_threshold']
+        )
+    
+    def summary_dataframe(self, stats: FeatureSelectionStatistics) -> pd.DataFrame:
+        """Convert statistics to DataFrame."""
+        return pd.DataFrame([asdict(stats)])
+    
+    def summary_dict(self, stats: FeatureSelectionStatistics) -> dict:
+        """Convert statistics to dictionary."""
+        return asdict(stats)

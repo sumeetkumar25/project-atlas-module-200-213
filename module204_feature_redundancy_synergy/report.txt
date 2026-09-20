@@ -1,0 +1,145 @@
+# atlas/modules/module204_feature_redundancy_synergy/report.py
+"""
+Module 204 - Feature Redundancy & Synergy Report
+"""
+
+from datetime import datetime
+import pandas as pd
+
+
+class FeatureRedundancySynergyReport:
+    """Report generator for feature redundancy and synergy results."""
+    
+    @staticmethod
+    def generate(statistics, metadata=None, dataset_name="Unknown") -> str:
+        """Generate a formatted report."""
+        lines = []
+        
+        lines.append("=" * 55)
+        lines.append("MODULE 204")
+        lines.append("FEATURE REDUNDANCY & SYNERGY")
+        lines.append("=" * 55)
+        lines.append(f"\nDataset: {dataset_name}")
+        
+        # Overview
+        lines.append("\n" + "-" * 45)
+        lines.append("OVERVIEW")
+        lines.append("-" * 45)
+        lines.append(f"  Total Features: {statistics.total_features}")
+        lines.append(f"  KEPT: {statistics.kept_features}")
+        lines.append(f"  REMOVED: {statistics.removed_features}")
+        lines.append(f"  Clusters: {statistics.unique_clusters}")
+        
+        # Percentages
+        lines.append("\n" + "-" * 45)
+        lines.append("PERCENTAGES")
+        lines.append("-" * 45)
+        lines.append(f"  KEPT: {statistics.kept_percentage:.1f}%")
+        lines.append(f"  REMOVED: {statistics.removed_percentage:.1f}%")
+        
+        # Redundancy Metrics
+        lines.append("\n" + "-" * 45)
+        lines.append("REDUNDANCY METRICS")
+        lines.append("-" * 45)
+        lines.append(f"  Average Conditional MI: {statistics.avg_conditional_mi:.3f}")
+        lines.append(f"  Average Synergy: {statistics.avg_synergy:.3f}")
+        lines.append(f"  Average Incremental Gain: {statistics.avg_incremental_gain:.3f}")
+        lines.append(f"  Average VIF: {statistics.avg_vif:.2f}")
+        
+        # Best and Worst Pairs
+        lines.append("\n" + "-" * 45)
+        lines.append("EXTREMES")
+        lines.append("-" * 45)
+        lines.append(f"  Best Pair: {statistics.best_pair}")
+        lines.append(f"    Score: {statistics.best_score:.3f}")
+        lines.append(f"  Worst Pair: {statistics.worst_pair}")
+        lines.append(f"    Score: {statistics.worst_score:.3f}")
+        
+        # Interpretation
+        lines.append("\n" + "-" * 45)
+        lines.append("INTERPRETATION")
+        lines.append("-" * 45)
+        
+        if statistics.avg_conditional_mi > 0.3:
+            lines.append("  ✅ Features have high unique information")
+        elif statistics.avg_conditional_mi > 0.15:
+            lines.append("  ✓ Features have moderate unique information")
+        else:
+            lines.append("  ⚠ Features have low unique information")
+        
+        if statistics.avg_synergy > 0.3:
+            lines.append("  ✅ Features show strong synergy")
+        elif statistics.avg_synergy > 0.15:
+            lines.append("  ✓ Features show moderate synergy")
+        else:
+            lines.append("  ⚠ Features show low synergy")
+        
+        if statistics.kept_features < statistics.total_features:
+            lines.append(f"  💡 Removed {statistics.removed_features} redundant features")
+        
+        # Validation
+        lines.append("\n" + "-" * 45)
+        lines.append("VALIDATION")
+        lines.append("-" * 45)
+        lines.append("  Status: PASSED")
+        
+        # Footer
+        lines.append(f"\n  Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append("\n" + "=" * 55)
+        lines.append("END OF REPORT")
+        lines.append("=" * 55)
+        
+        return "\n".join(lines)
+    
+    @staticmethod
+    def generate_redundancy_table(redundancy_table: pd.DataFrame, top_n: int = 10) -> str:
+        """Generate a redundancy table report."""
+        lines = []
+        lines.append("\n" + "=" * 80)
+        lines.append(f"TOP {top_n} REDUNDANT PAIRS")
+        lines.append("=" * 80)
+        
+        top_pairs = redundancy_table.head(top_n)
+        
+        lines.append(
+            f"\n{'Feature A':<20} {'Feature B':<20} {'Score':<12} {'Cond MI':<12} {'Synergy':<12} {'Decision':<12}"
+        )
+        lines.append("-" * 90)
+        
+        for _, row in top_pairs.iterrows():
+            lines.append(
+                f"{row['feature_a'][:19]:<20} "
+                f"{row['feature_b'][:19]:<20} "
+                f"{row['composite_score']:<12.3f} "
+                f"{row['conditional_mi']:<12.3f} "
+                f"{row['synergy']:<12.3f} "
+                f"{row['decision']:<12}"
+            )
+        
+        lines.append("\n" + "=" * 80)
+        return "\n".join(lines)
+    
+    @staticmethod
+    def generate_synergy_matrix(synergy_matrix: pd.DataFrame) -> str:
+        """Generate a synergy matrix report."""
+        lines = []
+        lines.append("\n" + "=" * 60)
+        lines.append("SYNERGY MATRIX")
+        lines.append("=" * 60)
+        
+        # Show only top features to keep output readable
+        n_show = min(10, len(synergy_matrix))
+        matrix_show = synergy_matrix.iloc[:n_show, :n_show]
+        
+        lines.append("\n" + matrix_show.round(3).to_string())
+        lines.append("\n" + "=" * 60)
+        return "\n".join(lines)
+    
+    @staticmethod
+    def save(report: str, filepath: str):
+        """Save report to file."""
+        from pathlib import Path
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(report)

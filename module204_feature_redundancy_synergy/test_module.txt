@@ -1,0 +1,400 @@
+# atlas/modules/module204_feature_redundancy_synergy/test_module.py
+"""
+Module 204 - Integration Test
+
+Tests feature redundancy and synergy engine, statistics, validator, report, and pipeline.
+"""
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
+
+import numpy as np
+import pandas as pd
+import tempfile
+
+from atlas.modules.module204_feature_redundancy_synergy.engine import FeatureRedundancySynergyEngine
+from atlas.modules.module204_feature_redundancy_synergy.statistics import FeatureRedundancySynergyStatisticsEngine
+from atlas.modules.module204_feature_redundancy_synergy.validator import run_validation
+from atlas.modules.module204_feature_redundancy_synergy.module import FeatureRedundancySynergyResearch
+
+
+def create_test_matrix(n=300, n_features=8, seed=42):
+    """Create a synthetic feature matrix for testing."""
+    np.random.seed(seed)
+    
+    timestamps = pd.date_range('2020-01-01', periods=n, freq='1h')
+    
+    df = pd.DataFrame({'timestamp': timestamps})
+    
+    # Add close price for target
+    close = pd.Series(
+        100 + np.cumsum(np.random.randn(n) * 0.5),
+        index=df.index
+    )
+    df['close'] = close
+    
+    # Create features with known redundancy and synergy
+    # Feature 1: Strong predictive
+    df['feature1'] = np.random.randn(n) * 10 + 50
+    
+    # Feature 2: Redundant with feature1 (correlated)
+    df['feature2'] = df['feature1'] * 0.9 + np.random.randn(n) * 1
+    
+    # Feature 3: Synergistic with feature1
+    df['feature3'] = np.random.randn(n) * 5 + 50
+    
+    # Feature 4: Independent
+    df['feature4'] = np.random.randn(n) * 8 + 50
+    
+    # Feature 5: Redundant with feature4
+    df['feature5'] = df['feature4'] * 0.85 + np.random.randn(n) * 1
+    
+    # Feature 6: Synergistic with feature4
+    df['feature6'] = np.random.randn(n) * 5 + 50
+    
+    # Feature 7: Noise
+    df['feature7'] = np.random.randn(n) * 10
+    
+    # Feature 8: Another independent
+    df['feature8'] = np.random.randn(n) * 8 + 50
+    
+    # Target with interactions
+    target = (
+        0.2 * df['feature1'] + 
+        0.1 * df['feature3'] * df['feature1'] / 100 +
+        0.2 * df['feature4'] +
+        0.1 * df['feature6'] * df['feature4'] / 100 +
+        np.random.randn(n) * 2
+    )
+    df['future_breakout'] = (target > target.mean()).astype(int)
+    
+    return df
+
+
+def test_engine_load():
+    """Test 1: Load predictive matrix."""
+    print("\n" + "=" * 60)
+    print("TEST 1: Load Predictive Matrix")
+    print("=" * 60)
+    
+    df = create_test_matrix()
+    engine = FeatureRedundancySynergyEngine()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        matrix_path = tmp_path / "predictive_feature_matrix.parquet"
+        df.to_parquet(matrix_path, index=False)
+        
+        loaded_df = engine.load_predictive_matrix(matrix_path)
+        
+        assert not loaded_df.empty
+        assert 'timestamp' in loaded_df.columns
+        assert len(loaded_df) == len(df)
+    
+    print("  ✓ Load test passed")
+    return True
+
+
+def test_engine_partial_correlation():
+    """Test 2: Partial correlation."""
+    print("\n" + "=" * 60)
+    print("TEST 2: Partial Correlation")
+    print("=" * 60)
+    
+    df = create_test_matrix()
+    engine = FeatureRedundancySynergyEngine()
+    
+    features = engine.get_feature_columns(df)
+    cond_features = [f for f in features if f not in ['feature1', 'feature2']]
+    
+    pc = engine.compute_partial_correlation(df, 'feature1', 'feature2', cond_features)
+    assert 0 <= pc <= 1
+    
+    print("  ✓ Partial correlation test passed")
+    return True
+
+
+def test_engine_conditional_mi():
+    """Test 3: Conditional Mutual Information."""
+    print("\n" + "=" * 60)
+    print("TEST 3: Conditional Mutual Information")
+    print("=" * 60)
+    
+    df = create_test_matrix()
+    engine = FeatureRedundancySynergyEngine()
+    
+    features = engine.get_feature_columns(df)
+    cond_features = [f for f in features if f not in ['feature1', 'feature2']]
+    
+    cmi = engine.compute_conditional_mutual_information(df, 'feature1', 'feature2', cond_features)
+    assert 0 <= cmi <= 1
+    
+    print("  ✓ Conditional MI test passed")
+    return True
+
+
+def test_engine_incremental_gain():
+    """Test 4: Incremental predictive gain."""
+    print("\n" + "=" * 60)
+    print("TEST 4: Incremental Gain")
+    print("=" * 60)
+    
+    df = create_test_matrix()
+    engine = FeatureRedundancySynergyEngine()
+    
+    target = engine.compute_target(df)
+    gain = engine.compute_incremental_gain(df, 'feature2', ['feature1'], target)
+    assert 0 <= gain <= 1
+    
+    print("  ✓ Incremental gain test passed")
+    return True
+
+
+def test_engine_synergy_score():
+    """Test 5: Synergy score."""
+    print("\n" + "=" * 60)
+    print("TEST 5: Synergy Score")
+    print("=" * 60)
+    
+    df = create_test_matrix()
+    engine = FeatureRedundancySynergyEngine()
+    
+    target = engine.compute_target(df)
+    synergy = engine.compute_synergy_score(df, 'feature1', 'feature3', target)
+    assert 0 <= synergy <= 1
+    
+    print("  ✓ Synergy score test passed")
+    return True
+
+
+def test_engine_clustering():
+    """Test 6: Feature clustering."""
+    print("\n" + "=" * 60)
+    print("TEST 6: Feature Clustering")
+    print("=" * 60)
+    
+    df = create_test_matrix()
+    engine = FeatureRedundancySynergyEngine()
+    
+    features = engine.get_feature_columns(df)
+    n = len(features)
+    redundancy_matrix = np.eye(n)
+    
+    # Create synthetic redundancy
+    for i in range(n):
+        for j in range(i+1, n):
+            if i < 2 and j < 2:
+                redundancy_matrix[i, j] = 0.8
+                redundancy_matrix[j, i] = 0.8
+            elif i > 3 and j > 3 and i < 6 and j < 6:
+                redundancy_matrix[i, j] = 0.7
+                redundancy_matrix[j, i] = 0.7
+            else:
+                redundancy_matrix[i, j] = 0.1
+                redundancy_matrix[j, i] = 0.1
+    
+    redundancy_df = pd.DataFrame(redundancy_matrix, index=features, columns=features)
+    clusters = engine.cluster_features(df, features, redundancy_df)
+    
+    assert not clusters.empty
+    assert 'feature' in clusters.columns
+    assert 'cluster' in clusters.columns
+    
+    print("  ✓ Clustering test passed")
+    return True
+
+
+def test_engine_compute():
+    """Test 7: Full engine computation."""
+    print("\n" + "=" * 60)
+    print("TEST 7: Full Engine Computation")
+    print("=" * 60)
+    
+    df = create_test_matrix()
+    engine = FeatureRedundancySynergyEngine()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        matrix_path = tmp_path / "predictive_feature_matrix.parquet"
+        output_dir = tmp_path / "output"
+        df.to_parquet(matrix_path, index=False)
+        
+        result = engine.compute(
+            matrix_path=matrix_path,
+            output_dir=output_dir
+        )
+        
+        assert not result.optimal_matrix.empty
+        assert not result.redundancy_table.empty
+        assert not result.synergy_matrix.empty
+        assert not result.conditional_info.empty
+        assert not result.feature_clusters.empty
+        assert len(result.kept_features) > 0
+        assert result.summary_statistics['total_features'] > 0
+        
+        # Check outputs were saved
+        assert (output_dir / "optimal_feature_matrix.parquet").exists()
+        assert (output_dir / "feature_redundancy.csv").exists()
+        assert (output_dir / "synergy_matrix.csv").exists()
+        assert (output_dir / "conditional_information.csv").exists()
+        assert (output_dir / "feature_clusters.csv").exists()
+        assert (output_dir / "removed_redundant_features.csv").exists()
+        assert (output_dir / "module204_statistics.csv").exists()
+    
+    print("  ✓ Full engine test passed")
+    return True
+
+
+def test_statistics():
+    """Test 8: Statistics engine."""
+    print("\n" + "=" * 60)
+    print("TEST 8: Statistics Engine")
+    print("=" * 60)
+    
+    df = create_test_matrix()
+    engine = FeatureRedundancySynergyEngine()
+    stats_engine = FeatureRedundancySynergyStatisticsEngine()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        matrix_path = tmp_path / "predictive_feature_matrix.parquet"
+        output_dir = tmp_path / "output"
+        df.to_parquet(matrix_path, index=False)
+        
+        result = engine.compute(
+            matrix_path=matrix_path,
+            output_dir=output_dir
+        )
+        
+        stats = stats_engine.analyze(result)
+        
+        assert stats.total_features == result.summary_statistics['total_features']
+        assert stats.kept_features == len(result.kept_features)
+        assert stats.removed_features == len(result.removed_features)
+    
+    print("  ✓ Statistics test passed")
+    return True
+
+
+def test_validator():
+    """Test 9: Validator."""
+    print("\n" + "=" * 60)
+    print("TEST 9: Validator")
+    print("=" * 60)
+    
+    df = create_test_matrix()
+    engine = FeatureRedundancySynergyEngine()
+    stats_engine = FeatureRedundancySynergyStatisticsEngine()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        matrix_path = tmp_path / "predictive_feature_matrix.parquet"
+        output_dir = tmp_path / "output"
+        df.to_parquet(matrix_path, index=False)
+        
+        result = engine.compute(
+            matrix_path=matrix_path,
+            output_dir=output_dir
+        )
+        
+        stats = stats_engine.analyze(result)
+        
+        passed = run_validation(result, stats)
+        assert passed
+    
+    print("  ✓ Validator test passed")
+    return True
+
+
+def test_pipeline():
+    """Test 10: Full pipeline."""
+    print("\n" + "=" * 60)
+    print("TEST 10: Full Pipeline")
+    print("=" * 60)
+    
+    df = create_test_matrix()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        matrix_path = tmp_path / "predictive_feature_matrix.parquet"
+        output_dir = tmp_path / "output"
+        df.to_parquet(matrix_path, index=False)
+        
+        research = FeatureRedundancySynergyResearch()
+        
+        result = research.run_redundancy_synergy(
+            matrix_path=matrix_path,
+            dataset_id="pipeline_test",
+            output_dir=output_dir
+        )
+        
+        assert result.status == "completed"
+        assert "optimal_matrix" in result.artifacts
+        assert "redundancy_table" in result.artifacts
+        assert "synergy_matrix" in result.artifacts
+        assert "conditional_info" in result.artifacts
+        assert "feature_clusters" in result.artifacts
+        assert "removed_features" in result.artifacts
+        assert "module204_statistics" in result.artifacts
+        assert "feature_redundancy_synergy_report" in result.artifacts
+        assert "redundancy_report" in result.artifacts
+        assert "synergy_report" in result.artifacts
+        assert result.statistics.get("software_validation_passed") == True
+        
+        # Check outputs were saved
+        assert (output_dir / "optimal_feature_matrix.parquet").exists()
+        assert (output_dir / "feature_redundancy.csv").exists()
+        assert (output_dir / "synergy_matrix.csv").exists()
+        assert (output_dir / "conditional_information.csv").exists()
+        assert (output_dir / "feature_clusters.csv").exists()
+        assert (output_dir / "removed_redundant_features.csv").exists()
+        assert (output_dir / "module204_statistics.csv").exists()
+    
+    print("  ✓ Full pipeline test passed")
+    return True
+
+
+def main():
+    """Run all tests."""
+    print("\n" + "=" * 70)
+    print("PROJECT ATLAS - MODULE 204 INTEGRATION TEST")
+    print("Feature Redundancy & Synergy")
+    print("=" * 70)
+    
+    results = {}
+    
+    results["load"] = test_engine_load()
+    results["partial_correlation"] = test_engine_partial_correlation()
+    results["conditional_mi"] = test_engine_conditional_mi()
+    results["incremental_gain"] = test_engine_incremental_gain()
+    results["synergy_score"] = test_engine_synergy_score()
+    results["clustering"] = test_engine_clustering()
+    results["full_engine"] = test_engine_compute()
+    results["statistics"] = test_statistics()
+    results["validator"] = test_validator()
+    results["pipeline"] = test_pipeline()
+    
+    print("\n" + "=" * 70)
+    print("RESULTS")
+    print("=" * 70)
+    
+    for name, ok in results.items():
+        print(f"  {'✓' if ok else '✗'} {name}")
+    
+    passed = sum(results.values())
+    total = len(results)
+    
+    print(f"\n  {passed}/{total} tests passed")
+    
+    if passed == total:
+        print("\n✓ Module 204 VALIDATED")
+        return 0
+    else:
+        print("\n⚠ Some tests failed")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

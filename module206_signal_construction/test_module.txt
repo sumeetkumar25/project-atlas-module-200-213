@@ -1,0 +1,460 @@
+"""
+Module 206 - Integration Test
+
+Tests signal construction engine, statistics, validator, report, and pipeline.
+"""
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
+
+import numpy as np
+import pandas as pd
+import tempfile
+
+from atlas.modules.module206_signal_construction.engine import (
+    SignalConstructionEngine,
+    ScoreWeightingStrategy,
+    RankWeightingStrategy
+)
+from atlas.modules.module206_signal_construction.statistics import SignalConstructionStatisticsEngine
+from atlas.modules.module206_signal_construction.validator import run_validation
+from atlas.modules.module206_signal_construction.module import SignalConstructionResearch
+
+
+def create_test_data(n=100, seed=42):
+    """Create synthetic test data for signal construction."""
+    np.random.seed(seed)
+    
+    timestamps = pd.date_range('2020-01-01', periods=n, freq='1h')
+    
+    # Predictive matrix
+    predictive_df = pd.DataFrame({
+        'timestamp': timestamps,
+        'close': 100 + np.cumsum(np.random.randn(n) * 0.5),
+        'feature1': np.random.randn(n) * 10 + 50,
+        'feature2': np.random.randn(n) * 5 + 50,
+        'feature3': np.random.randn(n) * 8 + 50,
+        'feature4': np.random.randn(n) * 3 + 50,
+        'feature5': np.random.randn(n) * 6 + 50
+    })
+    
+    # Selected features
+    selected_df = pd.DataFrame({
+        'selected_features': ['feature1', 'feature2', 'feature3', 'feature4']
+    })
+    
+    # Feature scores
+    scores_df = pd.DataFrame({
+        'feature': ['feature1', 'feature2', 'feature3', 'feature4', 'feature5'],
+        'final_score': [0.9, 0.8, 0.7, 0.6, 0.5]
+    })
+    
+    return {
+        'predictive_matrix': predictive_df,
+        'selected_features': selected_df,
+        'feature_scores': scores_df
+    }
+
+
+def test_engine_load_selected():
+    """Test 1: Load selected features."""
+    print("\n" + "=" * 60)
+    print("TEST 1: Load Selected Features")
+    print("=" * 60)
+    
+    data = create_test_data()
+    engine = SignalConstructionEngine()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        selected_path = tmp_path / "selected_features.csv"
+        data['selected_features'].to_csv(selected_path, index=False)
+        
+        features = engine.load_selected_features(selected_path)
+        
+        assert len(features) > 0
+        assert 'feature1' in features
+    
+    print("  ✓ Load selected features test passed")
+    return True
+
+
+def test_engine_load_predictive():
+    """Test 2: Load predictive matrix."""
+    print("\n" + "=" * 60)
+    print("TEST 2: Load Predictive Matrix")
+    print("=" * 60)
+    
+    data = create_test_data()
+    engine = SignalConstructionEngine()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        matrix_path = tmp_path / "predictive_feature_matrix.parquet"
+        data['predictive_matrix'].to_parquet(matrix_path, index=False)
+        
+        loaded_df = engine.load_predictive_matrix(matrix_path)
+        
+        assert not loaded_df.empty
+        assert 'timestamp' in loaded_df.columns
+    
+    print("  ✓ Load predictive matrix test passed")
+    return True
+
+
+def test_engine_weighting_score():
+    """Test 3: Score weighting strategy."""
+    print("\n" + "=" * 60)
+    print("TEST 3: Score Weighting")
+    print("=" * 60)
+    
+    data = create_test_data()
+    engine = SignalConstructionEngine()
+    
+    features = ['feature1', 'feature2', 'feature3']
+    weights = engine.compute_weights(data['feature_scores'], features)
+    
+    assert len(weights) == len(features)
+    assert abs(weights.sum() - 1.0) < 0.01
+    assert weights['feature1'] > weights['feature2']
+    
+    print("  ✓ Score weighting test passed")
+    return True
+
+
+def test_engine_weighting_rank():
+    """Test 4: Rank weighting strategy."""
+    print("\n" + "=" * 60)
+    print("TEST 4: Rank Weighting")
+    print("=" * 60)
+    
+    data = create_test_data()
+    strategy = RankWeightingStrategy()
+    engine = SignalConstructionEngine(weighting_strategy=strategy)
+    
+    features = ['feature1', 'feature2', 'feature3']
+    weights = engine.compute_weights(data['feature_scores'], features)
+    
+    assert len(weights) == len(features)
+    assert abs(weights.sum() - 1.0) < 0.01
+    
+    print("  ✓ Rank weighting test passed")
+    return True
+
+
+def test_engine_normalize_features():
+    """Test 5: Feature normalization (no look-ahead bias)."""
+    print("\n" + "=" * 60)
+    print("TEST 5: Feature Normalization")
+    print("=" * 60)
+    
+    data = create_test_data()
+    
+    engine = SignalConstructionEngine(
+        normalization_method="rolling",
+        normalization_window=20
+    )
+    
+    features = ["feature1", "feature2"]
+    
+    normalized_df = engine.normalize_features(
+        data["predictive_matrix"],
+        features
+    )
+    
+    for feature in features:
+        # After warmup there should be valid values
+        valid = normalized_df[feature].dropna()
+        
+        assert len(valid) > 0
+        
+        # Variance should exist
+        assert valid.std() > 0
+        
+        # No infinities
+        assert np.isfinite(valid).all()
+        
+        # NaNs are expected because rolling window has not filled yet
+        # This verifies no look-ahead bias
+        assert normalized_df[feature].isna().sum() > 0
+    
+    print("  ✓ Feature normalization test passed")
+    return True
+
+
+def test_engine_construct_signal():
+    """Test 6: Signal construction."""
+    print("\n" + "=" * 60)
+    print("TEST 6: Signal Construction")
+    print("=" * 60)
+    
+    data = create_test_data()
+    engine = SignalConstructionEngine()
+    
+    features = ['feature1', 'feature2', 'feature3']
+    normalized_df = engine.normalize_features(data['predictive_matrix'], features)
+    weights = engine.compute_weights(data['feature_scores'], features)
+    
+    # Updated to handle tuple return
+    signal, available = engine.construct_signal(
+        normalized_df,
+        weights,
+        features
+    )
+    
+    assert len(signal) == len(data['predictive_matrix'])
+    assert not signal.isna().any()
+    assert len(available) == len(features)
+    
+    print("  ✓ Signal construction test passed")
+    return True
+
+
+def test_engine_normalize_signal():
+    """Test 7: Signal normalization."""
+    print("\n" + "=" * 60)
+    print("TEST 7: Signal Normalization")
+    print("=" * 60)
+    
+    engine = SignalConstructionEngine()
+    
+    # Create signal with outliers
+    signal = pd.Series(np.random.randn(100) * 2)
+    signal.iloc[0] = 10
+    
+    normalized = engine.normalize_signal(signal)
+    
+    assert len(normalized) == len(signal)
+    assert np.all((-1 <= normalized) & (normalized <= 1))
+    
+    print("  ✓ Signal normalization test passed")
+    return True
+
+
+def test_engine_compute():
+    """Test 8: Full engine computation."""
+    print("\n" + "=" * 60)
+    print("TEST 8: Full Engine Computation")
+    print("=" * 60)
+    
+    data = create_test_data()
+    engine = SignalConstructionEngine(
+        normalization_method="rolling",
+        normalization_window=20
+    )
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        output_dir = tmp_path / "output"
+        
+        selected_path = tmp_path / "selected_features.csv"
+        scores_path = tmp_path / "feature_scores.csv"
+        matrix_path = tmp_path / "predictive_feature_matrix.parquet"
+        
+        data['selected_features'].to_csv(selected_path, index=False)
+        data['feature_scores'].to_csv(scores_path, index=False)
+        data['predictive_matrix'].to_parquet(matrix_path, index=False)
+        
+        result = engine.compute(
+            selected_features_path=selected_path,
+            feature_scores_path=scores_path,
+            predictive_matrix_path=matrix_path,
+            output_dir=output_dir
+        )
+        
+        assert not result.signal_matrix.empty
+        assert not result.raw_signal.empty
+        assert not result.normalized_signal.empty
+        assert not result.signal_components.empty
+        assert not result.contribution_percentages.empty
+        assert result.summary_statistics['total_features'] > 0
+        
+        # Check outputs were saved
+        assert (output_dir / "signal_matrix.parquet").exists()
+        assert (output_dir / "raw_signal.csv").exists()
+        assert (output_dir / "normalized_signal.csv").exists()
+        assert (output_dir / "signal_components.csv").exists()
+        assert (output_dir / "contribution_percentages.csv").exists()
+        assert (output_dir / "signal_statistics.csv").exists()
+    
+    print("  ✓ Full engine test passed")
+    return True
+
+
+def test_statistics():
+    """Test 9: Statistics engine."""
+    print("\n" + "=" * 60)
+    print("TEST 9: Statistics Engine")
+    print("=" * 60)
+    
+    data = create_test_data()
+    engine = SignalConstructionEngine()
+    stats_engine = SignalConstructionStatisticsEngine()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        output_dir = tmp_path / "output"
+        
+        selected_path = tmp_path / "selected_features.csv"
+        scores_path = tmp_path / "feature_scores.csv"
+        matrix_path = tmp_path / "predictive_feature_matrix.parquet"
+        
+        data['selected_features'].to_csv(selected_path, index=False)
+        data['feature_scores'].to_csv(scores_path, index=False)
+        data['predictive_matrix'].to_parquet(matrix_path, index=False)
+        
+        result = engine.compute(
+            selected_features_path=selected_path,
+            feature_scores_path=scores_path,
+            predictive_matrix_path=matrix_path,
+            output_dir=output_dir
+        )
+        
+        stats = stats_engine.analyze(result)
+        
+        assert stats.total_features == result.summary_statistics['total_features']
+        assert stats.total_rows == result.summary_statistics['total_rows']
+        assert stats.signal_mean == result.summary_statistics['signal_mean']
+    
+    print("  ✓ Statistics test passed")
+    return True
+
+
+def test_validator():
+    """Test 10: Validator."""
+    print("\n" + "=" * 60)
+    print("TEST 10: Validator")
+    print("=" * 60)
+    
+    data = create_test_data()
+    engine = SignalConstructionEngine()
+    stats_engine = SignalConstructionStatisticsEngine()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        output_dir = tmp_path / "output"
+        
+        selected_path = tmp_path / "selected_features.csv"
+        scores_path = tmp_path / "feature_scores.csv"
+        matrix_path = tmp_path / "predictive_feature_matrix.parquet"
+        
+        data['selected_features'].to_csv(selected_path, index=False)
+        data['feature_scores'].to_csv(scores_path, index=False)
+        data['predictive_matrix'].to_parquet(matrix_path, index=False)
+        
+        result = engine.compute(
+            selected_features_path=selected_path,
+            feature_scores_path=scores_path,
+            predictive_matrix_path=matrix_path,
+            output_dir=output_dir
+        )
+        
+        stats = stats_engine.analyze(result)
+        
+        passed = run_validation(result, stats)
+        assert passed
+    
+    print("  ✓ Validator test passed")
+    return True
+
+
+def test_pipeline():
+    """Test 11: Full pipeline."""
+    print("\n" + "=" * 60)
+    print("TEST 11: Full Pipeline")
+    print("=" * 60)
+    
+    data = create_test_data()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        output_dir = tmp_path / "output"
+        
+        selected_path = tmp_path / "selected_features.csv"
+        scores_path = tmp_path / "feature_scores.csv"
+        matrix_path = tmp_path / "predictive_feature_matrix.parquet"
+        
+        data['selected_features'].to_csv(selected_path, index=False)
+        data['feature_scores'].to_csv(scores_path, index=False)
+        data['predictive_matrix'].to_parquet(matrix_path, index=False)
+        
+        research = SignalConstructionResearch(
+            normalization_method="rolling",
+            signal_scaling="tanh"
+        )
+        
+        result = research.run_signal_construction(
+            selected_features_path=selected_path,
+            feature_scores_path=scores_path,
+            predictive_matrix_path=matrix_path,
+            dataset_id="pipeline_test",
+            output_dir=output_dir
+        )
+        
+        assert result.status == "completed"
+        assert "signal_matrix" in result.artifacts
+        assert "signal_components" in result.artifacts
+        assert "raw_signal" in result.artifacts
+        assert "normalized_signal" in result.artifacts
+        assert "signal_statistics" in result.artifacts
+        assert "signal_construction_report" in result.artifacts
+        assert "component_report" in result.artifacts
+        assert result.statistics.get("software_validation_passed") == True
+        
+        # Check outputs were saved
+        assert (output_dir / "signal_matrix.parquet").exists()
+        assert (output_dir / "raw_signal.csv").exists()
+        assert (output_dir / "normalized_signal.csv").exists()
+        assert (output_dir / "signal_components.csv").exists()
+        assert (output_dir / "contribution_percentages.csv").exists()
+        assert (output_dir / "signal_statistics.csv").exists()
+    
+    print("  ✓ Full pipeline test passed")
+    return True
+
+
+def main():
+    """Run all tests."""
+    print("\n" + "=" * 70)
+    print("PROJECT ATLAS - MODULE 206 INTEGRATION TEST")
+    print("Signal Construction")
+    print("=" * 70)
+    
+    results = {}
+    
+    results["load_selected"] = test_engine_load_selected()
+    results["load_predictive"] = test_engine_load_predictive()
+    results["score_weighting"] = test_engine_weighting_score()
+    results["rank_weighting"] = test_engine_weighting_rank()
+    results["normalize_features"] = test_engine_normalize_features()
+    results["construct_signal"] = test_engine_construct_signal()
+    results["normalize_signal"] = test_engine_normalize_signal()
+    results["full_engine"] = test_engine_compute()
+    results["statistics"] = test_statistics()
+    results["validator"] = test_validator()
+    results["pipeline"] = test_pipeline()
+    
+    print("\n" + "=" * 70)
+    print("RESULTS")
+    print("=" * 70)
+    
+    for name, ok in results.items():
+        print(f"  {'✓' if ok else '✗'} {name}")
+    
+    passed = sum(results.values())
+    total = len(results)
+    
+    print(f"\n  {passed}/{total} tests passed")
+    
+    if passed == total:
+        print("\n✓ Module 206 VALIDATED")
+        return 0
+    else:
+        print("\n⚠ Some tests failed")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

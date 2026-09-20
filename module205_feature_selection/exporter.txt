@@ -1,0 +1,41 @@
+# atlas/modules/module205_feature_selection/exporter.py
+"""
+Module 205 - Feature Selection Exporter
+"""
+
+import pandas as pd
+from pathlib import Path
+
+
+class FeatureSelectionExporter:
+    """Exporter for feature selection results."""
+    
+    @staticmethod
+    def export_selected_features(features: list, filepath: str):
+        """Export selected features to CSV."""
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df = pd.DataFrame({'selected_features': features})
+        df.to_csv(path, index=False)
+    
+    @staticmethod
+    def export_feature_scores(df: pd.DataFrame, filepath: str):
+        """Export feature scores to CSV."""
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(path, index=False)
+    
+    @staticmethod
+    def export_feature_ranking(df: pd.DataFrame, filepath: str):
+        """Export feature ranking to CSV."""
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(path, index=False)
+    
+    @staticmethod
+    def export_statistics(stats: dict, filepath: str):
+        """Export statistics to CSV."""
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df = pd.DataFrame([stats])
+        df.to_csv(path, index=False)

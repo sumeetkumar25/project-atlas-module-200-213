@@ -1,0 +1,124 @@
+# atlas/modules/module207_signal_confidence/validator.py
+"""
+Module 207 - Signal Confidence Validator
+"""
+
+import numpy as np
+import pandas as pd
+from .engine import SignalConfidenceResult
+from .statistics import SignalConfidenceStatistics
+
+
+class SignalConfidenceValidator:
+    """Validator for signal confidence results."""
+    
+    def __init__(self, timestamp_column: str = "timestamp"):
+        self.timestamp_column = timestamp_column
+    
+    def validate(
+        self,
+        result: SignalConfidenceResult,
+        statistics: SignalConfidenceStatistics
+    ) -> bool:
+        """Validate results and statistics."""
+        issues = []
+        warnings = []
+        
+        # Check confidence matrix
+        if result.confidence_matrix.empty:
+            issues.append("Confidence matrix is empty")
+        else:
+            if self.timestamp_column not in result.confidence_matrix.columns:
+                issues.append("Missing timestamp column")
+            
+            # Check no duplicate timestamps
+            dup_count = result.confidence_matrix[self.timestamp_column].duplicated().sum()
+            if dup_count > 0:
+                warnings.append(f"Found {dup_count} duplicate timestamps")
+        
+        # Check signal confidence
+        if result.signal_confidence.empty:
+            issues.append("Signal confidence is empty")
+        else:
+            # Check no NaN
+            if result.signal_confidence.isna().any():
+                issues.append("NaN values found in confidence")
+            
+            # Check confidence in [0, 1]
+            if not np.all((0 <= result.signal_confidence) & 
+                         (result.signal_confidence <= 1)):
+                issues.append("Confidence values outside [0, 1] range")
+        
+        # Check confidence distribution
+        if result.confidence_distribution.empty:
+            issues.append("Confidence distribution is empty")
+        else:
+            # Check percentages sum to ~100
+            if 'percentage' in result.confidence_distribution.columns:
+                if not np.isclose(result.confidence_distribution['percentage'].sum(), 100, atol=1):
+                    issues.append("Distribution percentages do not sum to 100")
+        
+        # Check statistics
+        if statistics.total_rows != len(result.confidence_matrix):
+            issues.append(
+                f"Total rows mismatch: stats={statistics.total_rows}, "
+                f"result={len(result.confidence_matrix)}"
+            )
+        
+        if not (0 <= statistics.mean_confidence <= 1):
+            issues.append(f"Mean confidence outside [0,1]: {statistics.mean_confidence}")
+        
+        if not (0 <= statistics.median_confidence <= 1):
+            issues.append(f"Median confidence outside [0,1]: {statistics.median_confidence}")
+        
+        if statistics.high_confidence_pct + statistics.low_confidence_pct > 100:
+            issues.append(
+                f"High + Low percentages exceed 100: "
+                f"{statistics.high_confidence_pct + statistics.low_confidence_pct:.1f}%"
+            )
+        
+        # Check confidence matrix length equals signal length
+        if len(result.confidence_matrix) != len(result.signal_confidence):
+            issues.append(
+                f"Confidence matrix length ({len(result.confidence_matrix)}) "
+                f"does not match signal length ({len(result.signal_confidence)})"
+            )
+        
+        # Warnings (non-fatal)
+        if statistics.mean_confidence < 0.5:
+            warnings.append(f"Low average confidence: {statistics.mean_confidence:.3f}")
+        
+        if statistics.high_confidence_pct < 20:
+            warnings.append(f"Low high-confidence percentage: {statistics.high_confidence_pct:.1f}%")
+        
+        if warnings:
+            print("\n  WARNINGS:")
+            for warning in warnings:
+                print(f"    ⚠ {warning}")
+        
+        if issues:
+            raise ValueError(
+                f"Signal Confidence validation failed with {len(issues)} issue(s):\n" +
+                "\n".join(f"  - {issue}" for issue in issues)
+            )
+        
+        return True
+
+
+def run_validation(result, statistics):
+    """Run validation with user-friendly output."""
+    validator = SignalConfidenceValidator()
+    
+    print("\n" + "=" * 60)
+    print("SIGNAL CONFIDENCE VALIDATION")
+    print("=" * 60)
+    
+    try:
+        validator.validate(result, statistics)
+        print("\n  ✓ All validation checks passed")
+        print("=" * 60)
+        return True
+    except ValueError as e:
+        print(e)
+        print("=" * 60)
+        return False

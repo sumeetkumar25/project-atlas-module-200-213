@@ -1,0 +1,881 @@
+"""
+Module 204 - Feature Redundancy & Synergy Engine
+
+Evaluates feature groups for redundancy and synergy.
+
+Metrics:
+  1. Partial Correlation: Removes indirect relationships
+  2. Conditional Mutual Information: Unique information
+  3. Incremental Predictive Gain: Improvement from adding features
+  4. Tree Importance Increment: Feature importance change (RandomForest)
+  5. Permutation Importance: Performance loss when shuffled
+  6. Variance Inflation Factor: Multivariate redundancy
+  7. Feature Clustering: Group similar features
+  8. Synergy Score: Combined predictive power
+
+Output: Optimal feature set with redundancy/synergy decisions.
+"""
+
+import numpy as np
+import pandas as pd
+from dataclasses import dataclass
+from typing import Optional, Dict, Any, List, Tuple
+from itertools import combinations
+from scipy import stats
+from scipy.stats import pearsonr, spearmanr
+from sklearn.feature_selection import mutual_info_regression
+from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.inspection import permutation_importance
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from scipy.cluster.hierarchy import linkage, fcluster
+from scipy.spatial.distance import squareform
+from pathlib import Path
+import warnings
+warnings.filterwarnings('ignore')
+
+
+@dataclass
+class FeatureRedundancySynergyResult:
+    """Results from feature redundancy and synergy analysis."""
+    optimal_matrix: pd.DataFrame
+    redundancy_table: pd.DataFrame
+    synergy_matrix: pd.DataFrame
+    conditional_info: pd.DataFrame
+    feature_clusters: pd.DataFrame
+    removed_features: List[str]
+    kept_features: List[str]
+    summary_statistics: Dict[str, Any]
+
+
+class FeatureRedundancySynergyEngine:
+    """Core engine for feature redundancy and synergy analysis."""
+
+    # Columns to ignore
+    IGNORE_COLS = {"timestamp", "date", "time", "index", "close", "open", "high", "low", "volume"}
+
+    # Thresholds
+    PASS_THRESHOLD = 0.70
+    WARNING_THRESHOLD = 0.50
+
+    # Cluster threshold
+    CLUSTER_THRESHOLD = 0.40
+
+    # Weights for composite score
+    COMPOSITE_WEIGHTS = {
+        "conditional_mi": 0.35,
+        "incremental_gain": 0.20,
+        "permutation_importance": 0.15,
+        "partial_correlation": 0.10,
+        "tree_importance": 0.10,
+        "vif": 0.05,
+        "synergy": 0.05
+    }
+
+    def __init__(
+        self,
+        pass_threshold: float = 0.70,
+        warning_threshold: float = 0.50,
+        cluster_threshold: float = 0.40,
+        random_state: int = 42,
+        timestamp_column: str = "timestamp",
+        price_column: str = "close",
+        target_column: str = "future_breakout",
+        n_permutations: int = 10,
+        test_size: float = 0.3
+    ):
+        """
+        Initialize the feature redundancy and synergy engine.
+        
+        Args:
+            pass_threshold: Score above this threshold = KEEP
+            warning_threshold: Score above this threshold = WARNING
+            cluster_threshold: Distance threshold for clustering (0-1)
+            random_state: Random seed for reproducibility
+            timestamp_column: Name of the timestamp column
+            price_column: Name of the price column
+            target_column: Name of the target column
+            n_permutations: Number of permutations for permutation importance
+            test_size: Proportion of data to use for validation
+        """
+        self.pass_threshold = pass_threshold
+        self.warning_threshold = warning_threshold
+        self.cluster_threshold = cluster_threshold
+        self.random_state = random_state
+        self.timestamp_column = timestamp_column
+        self.price_column = price_column
+        self.target_column = target_column
+        self.n_permutations = n_permutations
+        self.test_size = test_size
+
+    def load_predictive_matrix(self, matrix_path: Path) -> pd.DataFrame:
+        """Load the predictive feature matrix."""
+        if not matrix_path.exists():
+            raise FileNotFoundError(f"Predictive matrix not found: {matrix_path}")
+        
+        if matrix_path.suffix == '.parquet':
+            df = pd.read_parquet(matrix_path)
+        else:
+            df = pd.read_csv(matrix_path)
+            if self.timestamp_column in df.columns:
+                df[self.timestamp_column] = pd.to_datetime(df[self.timestamp_column])
+        
+        return df
+
+    def get_feature_columns(self, df: pd.DataFrame) -> List[str]:
+        """Get feature columns (exclude timestamp and OHLCV)."""
+        return [c for c in df.columns if c not in self.IGNORE_COLS and c != self.timestamp_column]
+
+    def compute_target(self, df: pd.DataFrame) -> np.ndarray:
+        """Compute target variable."""
+        if self.target_column in df.columns:
+            return df[self.target_column].values
+        
+        # If no target, use future returns
+        if self.price_column in df.columns:
+            return (
+                df[self.price_column].shift(-1)
+                .div(df[self.price_column])
+                .sub(1)
+                .fillna(0)
+                .to_numpy()
+            )
+        
+        raise ValueError("No target found. Need 'future_breakout' or 'close' column.")
+
+    def compute_partial_correlation(
+        self,
+        df: pd.DataFrame,
+        f1: str,
+        f2: str,
+        conditional_features: List[str]
+    ) -> float:
+        """
+        Compute partial correlation between f1 and f2 given conditional features.
+        """
+        try:
+            # If no conditional features, use simple correlation
+            if not conditional_features:
+                corr = df[f1].corr(df[f2])
+                return abs(corr) if not np.isnan(corr) else 0.0
+            
+            # Prepare data
+            X_cond = df[conditional_features].values
+            X1 = df[f1].values
+            X2 = df[f2].values
+            
+            # Remove nans
+            clean_mask = ~(np.isnan(X1) | np.isnan(X2) | np.isnan(X_cond).any(axis=1))
+            X1 = X1[clean_mask]
+            X2 = X2[clean_mask]
+            X_cond = X_cond[clean_mask]
+            
+            if len(X1) < 10:
+                return 0.0
+            
+            # Fit models to residualize
+            lr1 = LinearRegression()
+            lr2 = LinearRegression()
+            
+            lr1.fit(X_cond, X1)
+            lr2.fit(X_cond, X2)
+            
+            # Residuals
+            resid1 = X1 - lr1.predict(X_cond)
+            resid2 = X2 - lr2.predict(X_cond)
+            
+            # Correlation of residuals
+            corr, _ = pearsonr(resid1, resid2)
+            return abs(corr) if not np.isnan(corr) else 0.0
+        except:
+            return 0.0
+
+    def compute_conditional_mutual_information(
+        self,
+        df: pd.DataFrame,
+        f1: str,
+        f2: str,
+        conditional_features: List[str]
+    ) -> float:
+        """
+        Compute conditional mutual information I(f1; f2 | conditional_features).
+        """
+        try:
+            X1 = df[f1].values
+            X2 = df[f2].values
+            
+            # Remove nans
+            clean_mask = ~(np.isnan(X1) | np.isnan(X2))
+            X1 = X1[clean_mask]
+            X2 = X2[clean_mask]
+            
+            if len(X1) < 10:
+                return 0.0
+            
+            # Compute MI between f1 and f2 unconditioned
+            mi_uncond = mutual_info_regression(
+                X1.reshape(-1, 1), X2, random_state=self.random_state
+            )[0]
+            
+            # If no conditional features, return unconditioned MI
+            if not conditional_features:
+                return float(min(1.0, max(0.0, mi_uncond)))
+            
+            # Compute conditional MI by binning conditional features
+            X_cond = df[conditional_features].values
+            X_cond = X_cond[clean_mask]
+            
+            # Discretize conditional features
+            n_bins = min(5, len(X1) // 10)
+            if n_bins < 2:
+                return float(min(1.0, max(0.0, mi_uncond)))
+            
+            # Conditional MI approximation
+            cond_mi_values = []
+            
+            for col_idx in range(X_cond.shape[1]):
+                # Discretize column
+                try:
+                    bins = np.percentile(X_cond[:, col_idx], np.linspace(0, 100, n_bins + 1))
+                    bins = np.unique(bins)
+                    if len(bins) < 2:
+                        continue
+                    X_disc = np.digitize(X_cond[:, col_idx], bins)
+                    
+                    # Compute MI for each bin
+                    for bin_val in np.unique(X_disc):
+                        mask = X_disc == bin_val
+                        if np.sum(mask) < 5:
+                            continue
+                        x1_subset = X1[mask]
+                        x2_subset = X2[mask]
+                        
+                        if len(x1_subset) > 5:
+                            mi_sub = mutual_info_regression(
+                                x1_subset.reshape(-1, 1),
+                                x2_subset,
+                                random_state=self.random_state
+                            )[0]
+                            cond_mi_values.append(mi_sub * np.sum(mask) / len(X1))
+                except:
+                    continue
+            
+            if cond_mi_values:
+                cond_mi = np.mean(cond_mi_values)
+                return float(min(1.0, max(0.0, cond_mi)))
+            
+            return float(min(1.0, max(0.0, mi_uncond)))
+        except:
+            return 0.0
+
+    def compute_incremental_gain(
+        self,
+        df: pd.DataFrame,
+        feature: str,
+        existing_features: List[str],
+        target: np.ndarray
+    ) -> float:
+        """
+        Compute incremental predictive gain from adding a feature.
+        Uses train-test split to avoid overfitting.
+        """
+        try:
+            # Split data
+            X_new = df[existing_features + [feature]].values
+            clean_mask = ~np.isnan(X_new).any(axis=1)
+            X_new = X_new[clean_mask]
+            y_new = target[clean_mask]
+            
+            if len(X_new) < 20:
+                return 0.0
+            
+            X_train, X_test, y_train, y_test = train_test_split(
+                X_new, y_new, test_size=self.test_size, random_state=self.random_state
+            )
+            
+            # Baseline score with existing features
+            if existing_features:
+                X_base = X_train[:, :-1]
+                X_base_test = X_test[:, :-1]
+            else:
+                X_base = X_train
+                X_base_test = X_test
+            
+            if len(X_base) < 10:
+                return 0.0
+            
+            rf_base = RandomForestRegressor(
+                n_estimators=50,
+                random_state=self.random_state,
+                n_jobs=-1
+            )
+            rf_base.fit(X_base, y_train)
+            base_score = rf_base.score(X_base_test, y_test)
+            
+            # Score with added feature
+            rf_new = RandomForestRegressor(
+                n_estimators=50,
+                random_state=self.random_state,
+                n_jobs=-1
+            )
+            rf_new.fit(X_train, y_train)
+            new_score = rf_new.score(X_test, y_test)
+            
+            # Gain
+            gain = max(0.0, new_score - base_score)
+            # Normalize to [0, 1] (max gain of 0.1 is considered strong)
+            return float(min(1.0, gain / 0.1))
+        except:
+            return 0.0
+
+    def compute_tree_importance_increment(
+        self,
+        df: pd.DataFrame,
+        feature: str,
+        existing_features: List[str],
+        target: np.ndarray
+    ) -> float:
+        """
+        Compute tree importance increment from adding a feature.
+        Uses RandomForest feature importances.
+        """
+        try:
+            if not existing_features:
+                return 0.5
+            
+            # Train model on existing features
+            X_base = df[existing_features].values
+            clean_mask = ~np.isnan(X_base).any(axis=1)
+            X_base = X_base[clean_mask]
+            y_base = target[clean_mask]
+            
+            if len(X_base) < 10:
+                return 0.0
+            
+            rf_base = RandomForestRegressor(
+                n_estimators=50,
+                random_state=self.random_state,
+                n_jobs=-1
+            )
+            rf_base.fit(X_base, y_base)
+            
+            # Train model with added feature
+            X_new = df[existing_features + [feature]].values
+            clean_mask = ~np.isnan(X_new).any(axis=1)
+            X_new = X_new[clean_mask]
+            y_new = target[clean_mask]
+            
+            if len(X_new) < 10:
+                return 0.0
+            
+            rf_new = RandomForestRegressor(
+                n_estimators=50,
+                random_state=self.random_state,
+                n_jobs=-1
+            )
+            rf_new.fit(X_new, y_new)
+            
+            # Compare feature importances
+            # Get importance of the new feature
+            importances_new = rf_new.feature_importances_
+            feature_idx = len(existing_features)
+            feature_importance = importances_new[feature_idx]
+            
+            # Normalize to [0, 1] (max importance of 0.2 is considered strong)
+            return float(min(1.0, feature_importance / 0.2))
+        except:
+            return 0.0
+
+    def compute_permutation_importance(
+        self,
+        df: pd.DataFrame,
+        feature: str,
+        existing_features: List[str],
+        target: np.ndarray
+    ) -> float:
+        """
+        Compute permutation importance of a feature.
+        """
+        try:
+            X = df[existing_features + [feature]].values
+            clean_mask = ~np.isnan(X).any(axis=1)
+            X = X[clean_mask]
+            y = target[clean_mask]
+            
+            if len(X) < 10:
+                return 0.0
+            
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, y, test_size=self.test_size, random_state=self.random_state
+            )
+            
+            rf = RandomForestRegressor(
+                n_estimators=50,
+                random_state=self.random_state,
+                n_jobs=-1
+            )
+            rf.fit(X_train, y_train)
+            
+            # Permutation importance
+            result = permutation_importance(
+                rf, X_test, y_test,
+                n_repeats=self.n_permutations,
+                random_state=self.random_state,
+                n_jobs=-1
+            )
+            
+            # Get importance of the feature
+            feature_idx = len(existing_features)
+            importance = result.importances_mean[feature_idx]
+            
+            # Normalize to [0, 1] (max importance of 0.05 is considered strong)
+            return float(min(1.0, importance / 0.05))
+        except:
+            return 0.0
+
+    def compute_vif(self, df: pd.DataFrame, feature: str, features: List[str]) -> float:
+        """
+        Compute Variance Inflation Factor using Linear Regression.
+        """
+        other_features = [f for f in features if f != feature]
+        
+        if not other_features:
+            return 1.0
+        
+        X = df[other_features].values
+        y = df[feature].values
+        
+        # Remove nans
+        clean_mask = ~(np.isnan(X).any(axis=1) | np.isnan(y))
+        X = X[clean_mask]
+        y = y[clean_mask]
+        
+        if len(X) < 10:
+            return 1.0
+        
+        try:
+            lr = LinearRegression()
+            lr.fit(X, y)
+            
+            y_pred = lr.predict(X)
+            ss_res = np.sum((y - y_pred) ** 2)
+            ss_tot = np.sum((y - np.mean(y)) ** 2)
+            r_squared = 1 - (ss_res / (ss_tot + 1e-12))
+            
+            vif = 1.0 / (1.0 - r_squared + 1e-12)
+            return float(max(1.0, vif))
+        except:
+            return 1.0
+
+    def compute_synergy_score(
+        self,
+        df: pd.DataFrame,
+        f1: str,
+        f2: str,
+        target: np.ndarray
+    ) -> float:
+        """
+        Compute synergy score between two features.
+        """
+        try:
+            # Individual scores
+            X1 = df[f1].values.reshape(-1, 1)
+            X2 = df[f2].values.reshape(-1, 1)
+            
+            clean_mask1 = ~np.isnan(X1.flatten())
+            clean_mask2 = ~np.isnan(X2.flatten())
+            clean_mask = clean_mask1 & clean_mask2
+            
+            X1_clean = X1[clean_mask]
+            X2_clean = X2[clean_mask]
+            y_clean = target[clean_mask]
+            
+            if len(X1_clean) < 10:
+                return 0.0
+            
+            # Individual MI
+            mi1 = mutual_info_regression(X1_clean, y_clean, random_state=self.random_state)[0]
+            mi2 = mutual_info_regression(X2_clean, y_clean, random_state=self.random_state)[0]
+            
+            # Combined MI
+            X_combined = np.column_stack([X1_clean, X2_clean])
+            mi_combined = mutual_info_regression(X_combined, y_clean, random_state=self.random_state).sum()
+            
+            # Synergy = MI(pair) - max(MI(f1), MI(f2))
+            synergy = max(0.0, mi_combined - max(mi1, mi2))
+            
+            # Normalize to [0, 1] (max synergy of 0.1 is considered strong)
+            return float(min(1.0, synergy / 0.1))
+        except:
+            return 0.0
+
+    def compute_composite_score(self, metrics: Dict[str, float]) -> float:
+        """
+        Compute composite redundancy/synergy score.
+        
+        For "good" metrics (higher = better):
+          - Conditional MI
+          - Incremental Gain
+          - Permutation Importance
+          - Synergy
+          - Tree Importance
+        
+        For "bad" metrics (higher = worse):
+          - Partial Correlation (inverted)
+          - VIF (inverted)
+        """
+        # Invert "bad" metrics
+        partial_score = 1.0 - metrics.get('partial_correlation', 0)
+        
+        # VIF normalization: higher VIF = lower score
+        vif_raw = metrics.get('vif', 1.0)
+        vif_score = max(0.0, 1.0 - min(vif_raw, 10.0) / 10.0)
+        
+        # Compile all scores (all should be in [0, 1] where higher = better)
+        scores = {
+            'conditional_mi': metrics.get('conditional_mi', 0),
+            'incremental_gain': metrics.get('incremental_gain', 0),
+            'permutation_importance': metrics.get('permutation_importance', 0),
+            'partial_correlation': partial_score,
+            'tree_importance': metrics.get('tree_importance', 0),
+            'vif': vif_score,
+            'synergy': metrics.get('synergy', 0)
+        }
+        
+        # Weighted combination
+        score = 0.0
+        for metric, weight in self.COMPOSITE_WEIGHTS.items():
+            score += weight * scores.get(metric, 0.0)
+        
+        return np.clip(score, 0.0, 1.0)
+
+    def make_decision(self, score: float) -> str:
+        """Make KEEP/WARNING/REMOVE decision."""
+        if score >= self.pass_threshold:
+            return "KEEP"
+        elif score >= self.warning_threshold:
+            return "WARNING"
+        else:
+            return "REMOVE"
+
+    def cluster_features(
+        self,
+        df: pd.DataFrame,
+        features: List[str],
+        redundancy_matrix: pd.DataFrame
+    ) -> pd.DataFrame:
+        """
+        Cluster features based on redundancy distance.
+        """
+        # Convert redundancy to distance
+        distance = 1 - redundancy_matrix.values
+        
+        # Ensure symmetry and valid diagonal
+        distance = (distance + distance.T) / 2
+        np.fill_diagonal(distance, 0)
+        distance = np.clip(distance, 0, 1)
+        
+        # Perform hierarchical clustering
+        condensed = squareform(distance)
+        Z = linkage(condensed, method='average')
+        cluster_labels = fcluster(Z, t=self.cluster_threshold, criterion='distance')
+        
+        return pd.DataFrame({
+            'feature': features,
+            'cluster': cluster_labels
+        })
+
+    def compute_statistics(
+        self,
+        features: List[str],
+        kept_features: List[str],
+        removed_features: List[str],
+        redundancy_table: pd.DataFrame,
+        synergy_matrix: pd.DataFrame,
+        clusters: pd.DataFrame
+    ) -> Dict[str, Any]:
+        """Compute summary statistics."""
+        total = len(features)
+        
+        # Cluster statistics
+        cluster_sizes = clusters.groupby('cluster').size()
+        unique_clusters = len(cluster_sizes)
+        
+        # Best and worst pairs
+        if not redundancy_table.empty:
+            best_idx = redundancy_table['composite_score'].idxmax()
+            worst_idx = redundancy_table['composite_score'].idxmin()
+            
+            best_pair = f"{redundancy_table.loc[best_idx, 'feature_a']} - {redundancy_table.loc[best_idx, 'feature_b']}"
+            worst_pair = f"{redundancy_table.loc[worst_idx, 'feature_a']} - {redundancy_table.loc[worst_idx, 'feature_b']}"
+            best_score = float(redundancy_table.loc[best_idx, 'composite_score'])
+            worst_score = float(redundancy_table.loc[worst_idx, 'composite_score'])
+        else:
+            best_pair = "N/A"
+            worst_pair = "N/A"
+            best_score = 0.0
+            worst_score = 0.0
+        
+        stats = {
+            'total_features': total,
+            'kept_features': len(kept_features),
+            'removed_features': len(removed_features),
+            'kept_percentage': len(kept_features) / total * 100 if total > 0 else 0,
+            'removed_percentage': len(removed_features) / total * 100 if total > 0 else 0,
+            'unique_clusters': unique_clusters,
+            'avg_conditional_mi': float(redundancy_table['conditional_mi'].mean()) if not redundancy_table.empty else 0,
+            'avg_synergy': float(synergy_matrix.values[np.triu_indices_from(synergy_matrix.values, k=1)].mean()) if len(synergy_matrix) > 1 else 0,
+            'avg_incremental_gain': float(redundancy_table['incremental_gain'].mean()) if not redundancy_table.empty else 0,
+            'avg_vif': float(redundancy_table['vif'].mean()) if not redundancy_table.empty else 0,
+            'best_pair': best_pair,
+            'worst_pair': worst_pair,
+            'best_score': best_score,
+            'worst_score': worst_score
+        }
+        
+        return stats
+
+    def save_outputs(
+        self,
+        df: pd.DataFrame,
+        kept_features: List[str],
+        removed_features: List[str],
+        redundancy_table: pd.DataFrame,
+        synergy_matrix: pd.DataFrame,
+        conditional_info: pd.DataFrame,
+        clusters: pd.DataFrame,
+        stats: Dict[str, Any],
+        output_dir: Path
+    ) -> None:
+        """Save all outputs."""
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Optimal matrix
+        optimal_df = df[[self.timestamp_column] + kept_features]
+        matrix_path = output_dir / "optimal_feature_matrix.parquet"
+        optimal_df.to_parquet(matrix_path, index=False)
+        print(f"  Saved optimal matrix to {matrix_path}")
+        
+        # Redundancy table
+        redundancy_path = output_dir / "feature_redundancy.csv"
+        redundancy_table.to_csv(redundancy_path, index=False)
+        print(f"  Saved redundancy table to {redundancy_path}")
+        
+        # Synergy matrix
+        synergy_path = output_dir / "synergy_matrix.csv"
+        synergy_matrix.to_csv(synergy_path)
+        print(f"  Saved synergy matrix to {synergy_path}")
+        
+        # Conditional information
+        cond_path = output_dir / "conditional_information.csv"
+        conditional_info.to_csv(cond_path, index=False)
+        print(f"  Saved conditional information to {cond_path}")
+        
+        # Clusters
+        cluster_path = output_dir / "feature_clusters.csv"
+        clusters.to_csv(cluster_path, index=False)
+        print(f"  Saved clusters to {cluster_path}")
+        
+        # Removed features
+        removed_df = pd.DataFrame({'removed_features': removed_features})
+        removed_path = output_dir / "removed_redundant_features.csv"
+        removed_df.to_csv(removed_path, index=False)
+        print(f"  Saved removed features to {removed_path}")
+        
+        # Statistics
+        stats_df = pd.DataFrame([stats])
+        stats_path = output_dir / "module204_statistics.csv"
+        stats_df.to_csv(stats_path, index=False)
+        print(f"  Saved statistics to {stats_path}")
+
+    def compute(self, matrix_path: Path, output_dir: Optional[Path] = None) -> FeatureRedundancySynergyResult:
+        """Main computation method."""
+        print("\n  Computing Feature Redundancy & Synergy...")
+        
+        if output_dir is None:
+            output_dir = Path("data/feature_store/optimal")
+        
+        # Load predictive matrix
+        print(f"  Loading predictive matrix from: {matrix_path}")
+        df = self.load_predictive_matrix(matrix_path)
+        print(f"  Shape: {df.shape}")
+        
+        # Get features
+        features = self.get_feature_columns(df)
+        print(f"  Found {len(features)} features")
+        
+        if len(features) < 2:
+            raise ValueError("Need at least 2 features for redundancy analysis")
+        
+        # Compute target
+        target = self.compute_target(df)
+        print(f"  Target computed")
+        
+        # Compute pair metrics
+        print("  Computing pair metrics...")
+        rows = []
+        n_features = len(features)
+        synergy_matrix = np.zeros((n_features, n_features))
+        conditional_info = []
+        removed = []
+        kept = []
+        
+        feature_index = {f: i for i, f in enumerate(features)}
+        
+        for i, f1 in enumerate(features):
+            for j, f2 in enumerate(features):
+                if i >= j:
+                    continue
+                
+                # Conditional features (all others except f1 and f2)
+                conditional_features = [f for f in features if f not in [f1, f2]]
+                
+                # Compute metrics
+                partial_corr = self.compute_partial_correlation(df, f1, f2, conditional_features)
+                cond_mi = self.compute_conditional_mutual_information(df, f1, f2, conditional_features)
+                incremental_gain = self.compute_incremental_gain(df, f1, [f2], target)
+                tree_imp = self.compute_tree_importance_increment(df, f1, [f2], target)
+                perm_imp = self.compute_permutation_importance(df, f1, [f2], target)
+                vif = self.compute_vif(df, f1, features)
+                synergy = self.compute_synergy_score(df, f1, f2, target)
+                
+                # Composite score (all metrics normalized so higher = better)
+                metrics = {
+                    'conditional_mi': cond_mi,
+                    'incremental_gain': incremental_gain,
+                    'permutation_importance': perm_imp,
+                    'partial_correlation': partial_corr,
+                    'tree_importance': tree_imp,
+                    'vif': vif,
+                    'synergy': synergy
+                }
+                composite_score = self.compute_composite_score(metrics)
+                decision = self.make_decision(composite_score)
+                
+                # Fill synergy matrix
+                synergy_matrix[i, j] = synergy
+                synergy_matrix[j, i] = synergy
+                
+                # Conditional info
+                conditional_info.append({
+                    'feature_a': f1,
+                    'feature_b': f2,
+                    'conditional_mi': cond_mi,
+                    'partial_correlation': partial_corr
+                })
+                
+                rows.append({
+                    'feature_a': f1,
+                    'feature_b': f2,
+                    'conditional_mi': cond_mi,
+                    'incremental_gain': incremental_gain,
+                    'permutation_importance': perm_imp,
+                    'partial_correlation': partial_corr,
+                    'tree_importance': tree_imp,
+                    'vif': vif,
+                    'synergy': synergy,
+                    'composite_score': composite_score,
+                    'decision': decision
+                })
+        
+        # Create DataFrames
+        redundancy_table = pd.DataFrame(rows)
+        redundancy_table = redundancy_table.sort_values('composite_score', ascending=False).reset_index(drop=True)
+        
+        # FIX: Create synergy DataFrame with writable diagonal
+        synergy_df = pd.DataFrame(
+            synergy_matrix,
+            index=features,
+            columns=features
+        )
+        
+        # Writable diagonal assignment
+        for i in range(len(synergy_df)):
+            synergy_df.iat[i, i] = 0.0
+        
+        conditional_df = pd.DataFrame(conditional_info)
+        
+        # Make decisions per feature
+        # For each feature, check if it's redundant with others
+        feature_scores = {}
+        
+        for feature in features:
+            # Average redundancy score with other features
+            feature_rows = redundancy_table[
+                (redundancy_table['feature_a'] == feature) | 
+                (redundancy_table['feature_b'] == feature)
+            ]
+            
+            if not feature_rows.empty:
+                avg_score = feature_rows['composite_score'].mean()
+                # Also consider synergy
+                synergy_col = synergy_df[feature]
+                max_synergy = synergy_col.max()
+                
+                # Final score: lower redundancy + higher synergy
+                final_score = (1 - avg_score) * 0.7 + max_synergy * 0.3
+                feature_scores[feature] = final_score
+            else:
+                feature_scores[feature] = 0.5
+        
+        # Make decisions using the correct score (not inverted)
+        for feature, score in feature_scores.items():
+            decision = self.make_decision(score)
+            if decision in ["KEEP", "WARNING"]:
+                kept.append(feature)
+            else:
+                removed.append(feature)
+        
+        # Cluster features
+        print("  Clustering features...")
+        # Build redundancy matrix from scores
+        n = len(features)
+        redundancy_matrix = np.zeros((n, n))
+        for _, row in redundancy_table.iterrows():
+            i = feature_index[row['feature_a']]
+            j = feature_index[row['feature_b']]
+            redundancy_matrix[i, j] = row['composite_score']
+            redundancy_matrix[j, i] = row['composite_score']
+        
+        # FIX: Set diagonal before converting to DataFrame
+        np.fill_diagonal(redundancy_matrix, 1.0)
+        
+        redundancy_matrix_df = pd.DataFrame(
+            redundancy_matrix,
+            index=features,
+            columns=features
+        )
+        
+        clusters = self.cluster_features(df, features, redundancy_matrix_df)
+        
+        # Compute statistics
+        stats = self.compute_statistics(
+            features, kept, removed, redundancy_table, synergy_df, clusters
+        )
+        
+        # Save outputs
+        print("\n  Saving outputs...")
+        self.save_outputs(
+            df, kept, removed, redundancy_table, synergy_df,
+            conditional_df, clusters, stats, output_dir
+        )
+        
+        print(f"\n  Redundancy & Synergy Summary:")
+        print(f"    Total Features: {stats['total_features']}")
+        print(f"    Kept: {stats['kept_features']}")
+        print(f"    Removed: {stats['removed_features']}")
+        print(f"    Clusters: {stats['unique_clusters']}")
+        print(f"    Avg Conditional MI: {stats['avg_conditional_mi']:.3f}")
+        print(f"    Avg Synergy: {stats['avg_synergy']:.3f}")
+        
+        return FeatureRedundancySynergyResult(
+            optimal_matrix=df[[self.timestamp_column] + kept],
+            redundancy_table=redundancy_table,
+            synergy_matrix=synergy_df,
+            conditional_info=conditional_df,
+            feature_clusters=clusters,
+            removed_features=removed,
+            kept_features=kept,
+            summary_statistics=stats
+        )

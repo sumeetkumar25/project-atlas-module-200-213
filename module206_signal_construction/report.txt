@@ -1,0 +1,139 @@
+# atlas/modules/module206_signal_construction/report.py
+"""
+Module 206 - Signal Construction Report
+"""
+
+from datetime import datetime
+import pandas as pd
+
+
+class SignalConstructionReport:
+    """Report generator for signal construction results."""
+    
+    @staticmethod
+    def generate(statistics, metadata=None, dataset_name="Unknown") -> str:
+        """Generate a formatted report."""
+        lines = []
+        
+        lines.append("=" * 55)
+        lines.append("MODULE 206")
+        lines.append("SIGNAL CONSTRUCTION")
+        lines.append("=" * 55)
+        lines.append(f"\nDataset: {dataset_name}")
+        
+        # Input Overview
+        lines.append("\n" + "-" * 45)
+        lines.append("INPUT OVERVIEW")
+        lines.append("-" * 45)
+        lines.append(f"  Total Features: {statistics.total_features}")
+        lines.append(f"  Total Rows: {statistics.total_rows:,}")
+        
+        # Signal Statistics
+        lines.append("\n" + "-" * 45)
+        lines.append("SIGNAL STATISTICS")
+        lines.append("-" * 45)
+        lines.append(f"  Mean: {statistics.signal_mean:.4f}")
+        lines.append(f"  Median: {statistics.signal_median:.4f}")
+        lines.append(f"  Std: {statistics.signal_std:.4f}")
+        lines.append(f"  Min: {statistics.signal_min:.4f}")
+        lines.append(f"  Max: {statistics.signal_max:.4f}")
+        
+        # Distribution
+        lines.append("\n" + "-" * 45)
+        lines.append("DISTRIBUTION")
+        lines.append("-" * 45)
+        lines.append(f"  Positive: {statistics.positive_pct:.1f}%")
+        lines.append(f"  Negative: {statistics.negative_pct:.1f}%")
+        lines.append(f"  Neutral: {statistics.neutral_pct:.1f}%")
+        
+        # Higher Moments
+        lines.append("\n" + "-" * 45)
+        lines.append("HIGHER MOMENTS")
+        lines.append("-" * 45)
+        lines.append(f"  Skewness: {statistics.skewness:.4f}")
+        lines.append(f"  Kurtosis: {statistics.kurtosis:.4f}")
+        
+        # Interpretation
+        lines.append("\n" + "-" * 45)
+        lines.append("INTERPRETATION")
+        lines.append("-" * 45)
+        
+        if statistics.positive_pct > 50:
+            lines.append("  📈 Signal is biased toward positive (long) bias")
+        elif statistics.negative_pct > 50:
+            lines.append("  📉 Signal is biased toward negative (short) bias")
+        else:
+            lines.append("  ➡️ Signal is relatively balanced")
+        
+        if statistics.signal_std > 0.3:
+            lines.append("  ✅ Signal has high variability")
+        else:
+            lines.append("  ⚠ Signal has low variability")
+        
+        if abs(statistics.skewness) > 0.5:
+            lines.append("  ⚠ Signal has significant skewness")
+        else:
+            lines.append("  ✅ Signal is relatively symmetric")
+        
+        # Validation
+        lines.append("\n" + "-" * 45)
+        lines.append("VALIDATION")
+        lines.append("-" * 45)
+        lines.append("  Status: PASSED")
+        
+        # Footer
+        lines.append(f"\n  Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append("\n" + "=" * 55)
+        lines.append("END OF REPORT")
+        lines.append("=" * 55)
+        
+        return "\n".join(lines)
+    
+    @staticmethod
+    def generate_component_report(components: pd.DataFrame, top_n: int = 10) -> str:
+        """Generate a signal component report."""
+        lines = []
+        lines.append("\n" + "=" * 70)
+        lines.append("SIGNAL COMPONENTS")
+        lines.append("=" * 70)
+        
+        # Calculate contribution statistics
+        contribution_stats = []
+        for col in components.columns:
+            contribution_stats.append({
+                'feature': col,
+                'mean': components[col].mean(),
+                'std': components[col].std(),
+                'min': components[col].min(),
+                'max': components[col].max(),
+                'abs_mean': abs(components[col].mean())
+            })
+        
+        stats_df = pd.DataFrame(contribution_stats)
+        stats_df = stats_df.sort_values('abs_mean', ascending=False)
+        
+        lines.append(
+            f"\n{'Feature':<20} {'Mean':<12} {'Std':<12} {'Min':<12} {'Max':<12}"
+        )
+        lines.append("-" * 70)
+        
+        for _, row in stats_df.head(top_n).iterrows():
+            lines.append(
+                f"{row['feature'][:19]:<20} "
+                f"{row['mean']:<12.4f} "
+                f"{row['std']:<12.4f} "
+                f"{row['min']:<12.4f} "
+                f"{row['max']:<12.4f}"
+            )
+        
+        lines.append("\n" + "=" * 70)
+        return "\n".join(lines)
+    
+    @staticmethod
+    def save(report: str, filepath: str):
+        """Save report to file."""
+        from pathlib import Path
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(report)

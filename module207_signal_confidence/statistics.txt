@@ -1,0 +1,59 @@
+# atlas/modules/module207_signal_confidence/statistics.py
+"""
+Module 207 - Signal Confidence Statistics
+"""
+
+from dataclasses import dataclass, asdict
+import pandas as pd
+from .engine import SignalConfidenceResult
+
+
+@dataclass
+class SignalConfidenceStatistics:
+    """High-level statistics from signal confidence analysis."""
+    mean_confidence: float
+    median_confidence: float
+    min_confidence: float
+    max_confidence: float
+    std_confidence: float
+    p95_confidence: float
+    high_confidence_pct: float
+    low_confidence_pct: float
+    positive_signal_mean_conf: float
+    negative_signal_mean_conf: float
+    total_rows: int
+
+
+class SignalConfidenceStatisticsEngine:
+    """Engine for generating high-level statistics."""
+    
+    METADATA = {
+        "module": 207,
+        "name": "Signal Confidence",
+        "version": "1.0.0",
+        "description": "Measures how reliable the signal is at any given time"
+    }
+    
+    def analyze(self, result: SignalConfidenceResult) -> SignalConfidenceStatistics:
+        """Analyze results and generate high-level statistics."""
+        return SignalConfidenceStatistics(
+            mean_confidence=result.confidence_statistics['mean_confidence'],
+            median_confidence=result.confidence_statistics['median_confidence'],
+            min_confidence=result.confidence_statistics['min_confidence'],
+            max_confidence=result.confidence_statistics['max_confidence'],
+            std_confidence=result.confidence_statistics['std_confidence'],
+            p95_confidence=result.confidence_statistics['p95_confidence'],
+            high_confidence_pct=result.confidence_statistics['high_confidence_pct'],
+            low_confidence_pct=result.confidence_statistics['low_confidence_pct'],
+            positive_signal_mean_conf=result.confidence_statistics['positive_signal_mean_conf'],
+            negative_signal_mean_conf=result.confidence_statistics['negative_signal_mean_conf'],
+            total_rows=result.confidence_statistics['total_rows']
+        )
+    
+    def summary_dataframe(self, stats: SignalConfidenceStatistics) -> pd.DataFrame:
+        """Convert statistics to DataFrame."""
+        return pd.DataFrame([asdict(stats)])
+    
+    def summary_dict(self, stats: SignalConfidenceStatistics) -> dict:
+        """Convert statistics to dictionary."""
+        return asdict(stats)

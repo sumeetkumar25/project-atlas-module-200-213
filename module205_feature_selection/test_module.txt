@@ -1,0 +1,448 @@
+# atlas/modules/module205_feature_selection/test_module.py
+"""
+Module 205 - Integration Test
+
+Tests feature selection engine, statistics, validator, report, and pipeline.
+"""
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
+
+import numpy as np
+import pandas as pd
+import tempfile
+
+from atlas.modules.module205_feature_selection.engine import FeatureSelectionEngine
+from atlas.modules.module205_feature_selection.statistics import FeatureSelectionStatisticsEngine
+from atlas.modules.module205_feature_selection.validator import run_validation
+from atlas.modules.module205_feature_selection.module import FeatureSelectionResearch
+
+
+def create_test_data(n=100, seed=42):
+    """Create synthetic test data for feature selection."""
+    np.random.seed(seed)
+    
+    features = [f'feature_{i}' for i in range(10)]
+    
+    # Create synthetic scores
+    predictive_scores = np.random.uniform(0.3, 0.9, 10)
+    stability_scores = np.random.uniform(0.4, 0.9, 10)
+    interaction_scores = np.random.uniform(0.2, 0.8, 10)
+    synergy_scores = np.random.uniform(0.1, 0.7, 10)
+    redundancy_scores = np.random.uniform(0.0, 0.6, 10)
+    
+    # Make some features clearly good
+    predictive_scores[0] = 0.85
+    stability_scores[0] = 0.90
+    predictive_scores[1] = 0.80
+    stability_scores[1] = 0.85
+    
+    # Make some features clearly bad
+    predictive_scores[7] = 0.20
+    stability_scores[7] = 0.30
+    predictive_scores[8] = 0.15
+    stability_scores[8] = 0.25
+    
+    # Create DataFrames
+    predictive_df = pd.DataFrame({
+        'timestamp': pd.date_range('2020-01-01', periods=n, freq='1h'),
+        **{f: np.random.randn(n) for f in features}
+    })
+    
+    stability_df = pd.DataFrame({
+        'feature': features,
+        'stability_score': stability_scores
+    })
+    
+    interaction_df = pd.DataFrame({
+        'feature': features,
+        'predictive_score': predictive_scores
+    })
+    
+    redundancy_df = pd.DataFrame({
+        'feature_a': [features[i] for i in range(5)],
+        'feature_b': [features[i+5] for i in range(5)],
+        'composite_score': redundancy_scores[:5],
+        'conditional_mi': np.random.uniform(0.1, 0.5, 5)
+    })
+    
+    removed_df = pd.DataFrame({
+        'removed_features': ['feature_9']
+    })
+    
+    return {
+        'predictive_matrix': predictive_df,
+        'stability': stability_df,
+        'interaction': interaction_df,
+        'redundancy': redundancy_df,
+        'removed': removed_df
+    }
+
+
+def test_engine_load_predictive():
+    """Test 1: Load predictive matrix."""
+    print("\n" + "=" * 60)
+    print("TEST 1: Load Predictive Matrix")
+    print("=" * 60)
+    
+    data = create_test_data()
+    engine = FeatureSelectionEngine()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        matrix_path = tmp_path / "predictive_feature_matrix.parquet"
+        data['predictive_matrix'].to_parquet(matrix_path, index=False)
+        
+        loaded_df = engine.load_predictive_matrix(matrix_path)
+        
+        assert not loaded_df.empty
+        assert 'timestamp' in loaded_df.columns
+    
+    print("  ✓ Load predictive test passed")
+    return True
+
+
+def test_engine_normalization():
+    """Test 2: Score normalization."""
+    print("\n" + "=" * 60)
+    print("TEST 2: Score Normalization")
+    print("=" * 60)
+    
+    engine = FeatureSelectionEngine()
+    
+    scores = pd.Series([0.2, 0.5, 0.8, 1.0])
+    normalized = engine.normalize_scores(scores)
+    
+    assert abs(normalized.min()) < 1e-10
+    assert abs(normalized.max() - 1.0) < 1e-10
+    
+    print("  ✓ Normalization test passed")
+    return True
+
+
+def test_engine_compute_scores():
+    """Test 3: Compute final scores."""
+    print("\n" + "=" * 60)
+    print("TEST 3: Compute Final Scores")
+    print("=" * 60)
+    
+    data = create_test_data()
+    engine = FeatureSelectionEngine()
+    
+    features = engine.get_feature_columns(data['predictive_matrix'])
+    
+    predictive = pd.Series({f: data['interaction'][data['interaction']['feature'] == f]['predictive_score'].iloc[0] for f in features})
+    stability = pd.Series({f: data['stability'][data['stability']['feature'] == f]['stability_score'].iloc[0] for f in features})
+    interaction = pd.Series({f: data['interaction'][data['interaction']['feature'] == f]['predictive_score'].iloc[0] for f in features})
+    synergy = pd.Series({f: 0.5 for f in features})
+    redundancy = pd.Series({f: 0.2 for f in features})
+    
+    scores_df = engine.compute_final_scores(
+        features, predictive, stability, interaction, synergy, redundancy
+    )
+    
+    assert not scores_df.empty
+    assert 'final_score' in scores_df.columns
+    assert all(0 <= score <= 1 for score in scores_df['final_score'])
+    
+    print("  ✓ Compute scores test passed")
+    return True
+
+
+def test_engine_filters():
+    """Test 4: Hard filters."""
+    print("\n" + "=" * 60)
+    print("TEST 4: Hard Filters")
+    print("=" * 60)
+    
+    data = create_test_data()
+    engine = FeatureSelectionEngine(
+        predictive_threshold=0.40,
+        stability_threshold=0.50
+    )
+    
+    features = engine.get_feature_columns(data['predictive_matrix'])
+    removed_features = data['removed']['removed_features'].tolist()
+    
+    # Create scores
+    scores_df = pd.DataFrame({
+        'feature': features,
+        'predictive_score': [0.85, 0.80, 0.50, 0.45, 0.40, 0.35, 0.30, 0.20, 0.15, 0.10],
+        'stability_score': [0.90, 0.85, 0.70, 0.60, 0.50, 0.45, 0.40, 0.30, 0.25, 0.20]
+    })
+    
+    filtered_df, selected, rejected = engine.apply_hard_filters(
+        scores_df, removed_features, features
+    )
+    
+    assert len(selected) > 0
+    assert len(rejected) > 0
+    assert 'feature_9' in rejected
+    
+    print("  ✓ Hard filters test passed")
+    return True
+
+
+def test_engine_ranking():
+    """Test 5: Feature ranking."""
+    print("\n" + "=" * 60)
+    print("TEST 5: Feature Ranking")
+    print("=" * 60)
+    
+    engine = FeatureSelectionEngine()
+    
+    scores_df = pd.DataFrame({
+        'feature': ['A', 'B', 'C', 'D'],
+        'final_score': [0.9, 0.8, 0.7, 0.6]
+    })
+    
+    ranking = engine.rank_features(scores_df)
+    
+    assert ranking.iloc[0]['feature'] == 'A'
+    assert ranking['rank'].tolist() == [1, 2, 3, 4]
+    assert all(ranking['final_score'].diff().dropna() <= 0)
+    
+    print("  ✓ Ranking test passed")
+    return True
+
+
+def test_engine_compute():
+    """Test 6: Full engine computation."""
+    print("\n" + "=" * 60)
+    print("TEST 6: Full Engine Computation")
+    print("=" * 60)
+    
+    data = create_test_data()
+    engine = FeatureSelectionEngine(
+        predictive_threshold=0.40,
+        stability_threshold=0.50
+    )
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        output_dir = tmp_path / "output"
+        
+        # Save all files
+        matrix_path = tmp_path / "predictive_feature_matrix.parquet"
+        stability_path = tmp_path / "feature_stability.csv"
+        interaction_path = tmp_path / "predictive_feature_scores.csv"
+        redundancy_path = tmp_path / "feature_redundancy.csv"
+        removed_path = tmp_path / "removed_redundant_features.csv"
+        
+        data['predictive_matrix'].to_parquet(matrix_path, index=False)
+        data['stability'].to_csv(stability_path, index=False)
+        data['interaction'].to_csv(interaction_path, index=False)
+        data['redundancy'].to_csv(redundancy_path, index=False)
+        data['removed'].to_csv(removed_path, index=False)
+        
+        result = engine.compute(
+            predictive_matrix_path=matrix_path,
+            stability_file=stability_path,
+            interaction_file=interaction_path,
+            redundancy_file=redundancy_path,
+            removed_file=removed_path,
+            output_dir=output_dir
+        )
+        
+        assert not result.feature_scores.empty
+        assert not result.feature_ranking.empty
+        assert len(result.selected_features) > 0
+        assert result.summary_statistics['total_features'] > 0
+        
+        # Check outputs were saved
+        assert (output_dir / "selected_features.csv").exists()
+        assert (output_dir / "feature_scores.csv").exists()
+        assert (output_dir / "feature_ranking.csv").exists()
+        assert (output_dir / "feature_selection_statistics.csv").exists()
+    
+    print("  ✓ Full engine test passed")
+    return True
+
+
+def test_statistics():
+    """Test 7: Statistics engine."""
+    print("\n" + "=" * 60)
+    print("TEST 7: Statistics Engine")
+    print("=" * 60)
+    
+    data = create_test_data()
+    engine = FeatureSelectionEngine()
+    stats_engine = FeatureSelectionStatisticsEngine()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        output_dir = tmp_path / "output"
+        
+        matrix_path = tmp_path / "predictive_feature_matrix.parquet"
+        stability_path = tmp_path / "feature_stability.csv"
+        interaction_path = tmp_path / "predictive_feature_scores.csv"
+        redundancy_path = tmp_path / "feature_redundancy.csv"
+        removed_path = tmp_path / "removed_redundant_features.csv"
+        
+        data['predictive_matrix'].to_parquet(matrix_path, index=False)
+        data['stability'].to_csv(stability_path, index=False)
+        data['interaction'].to_csv(interaction_path, index=False)
+        data['redundancy'].to_csv(redundancy_path, index=False)
+        data['removed'].to_csv(removed_path, index=False)
+        
+        result = engine.compute(
+            predictive_matrix_path=matrix_path,
+            stability_file=stability_path,
+            interaction_file=interaction_path,
+            redundancy_file=redundancy_path,
+            removed_file=removed_path,
+            output_dir=output_dir
+        )
+        
+        stats = stats_engine.analyze(result)
+        
+        assert stats.total_features == result.summary_statistics['total_features']
+        assert stats.selected_count == len(result.selected_features)
+        assert stats.rejected_count == len(result.rejected_features)
+    
+    print("  ✓ Statistics test passed")
+    return True
+
+
+def test_validator():
+    """Test 8: Validator."""
+    print("\n" + "=" * 60)
+    print("TEST 8: Validator")
+    print("=" * 60)
+    
+    data = create_test_data()
+    engine = FeatureSelectionEngine()
+    stats_engine = FeatureSelectionStatisticsEngine()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        output_dir = tmp_path / "output"
+        
+        matrix_path = tmp_path / "predictive_feature_matrix.parquet"
+        stability_path = tmp_path / "feature_stability.csv"
+        interaction_path = tmp_path / "predictive_feature_scores.csv"
+        redundancy_path = tmp_path / "feature_redundancy.csv"
+        removed_path = tmp_path / "removed_redundant_features.csv"
+        
+        data['predictive_matrix'].to_parquet(matrix_path, index=False)
+        data['stability'].to_csv(stability_path, index=False)
+        data['interaction'].to_csv(interaction_path, index=False)
+        data['redundancy'].to_csv(redundancy_path, index=False)
+        data['removed'].to_csv(removed_path, index=False)
+        
+        result = engine.compute(
+            predictive_matrix_path=matrix_path,
+            stability_file=stability_path,
+            interaction_file=interaction_path,
+            redundancy_file=redundancy_path,
+            removed_file=removed_path,
+            output_dir=output_dir
+        )
+        
+        stats = stats_engine.analyze(result)
+        
+        passed = run_validation(result, stats)
+        assert passed
+    
+    print("  ✓ Validator test passed")
+    return True
+
+
+def test_pipeline():
+    """Test 9: Full pipeline."""
+    print("\n" + "=" * 60)
+    print("TEST 9: Full Pipeline")
+    print("=" * 60)
+    
+    data = create_test_data()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        output_dir = tmp_path / "output"
+        
+        matrix_path = tmp_path / "predictive_feature_matrix.parquet"
+        stability_path = tmp_path / "feature_stability.csv"
+        interaction_path = tmp_path / "predictive_feature_scores.csv"
+        redundancy_path = tmp_path / "feature_redundancy.csv"
+        removed_path = tmp_path / "removed_redundant_features.csv"
+        
+        data['predictive_matrix'].to_parquet(matrix_path, index=False)
+        data['stability'].to_csv(stability_path, index=False)
+        data['interaction'].to_csv(interaction_path, index=False)
+        data['redundancy'].to_csv(redundancy_path, index=False)
+        data['removed'].to_csv(removed_path, index=False)
+        
+        research = FeatureSelectionResearch()
+        
+        result = research.run_selection(
+            predictive_matrix=matrix_path,
+            stability_file=stability_path,
+            interaction_file=interaction_path,
+            redundancy_file=redundancy_path,
+            removed_file=removed_path,
+            dataset_id="pipeline_test",
+            output_dir=output_dir
+        )
+        
+        assert result.status == "completed"
+        assert "feature_scores" in result.artifacts
+        assert "feature_ranking" in result.artifacts
+        assert "selected_features" in result.artifacts
+        assert "rejected_features" in result.artifacts
+        assert "feature_selection_statistics" in result.artifacts
+        assert "feature_selection_report" in result.artifacts
+        assert "ranking_report" in result.artifacts
+        assert result.statistics.get("software_validation_passed") == True
+        
+        # Check outputs were saved
+        assert (output_dir / "selected_features.csv").exists()
+        assert (output_dir / "feature_scores.csv").exists()
+        assert (output_dir / "feature_ranking.csv").exists()
+    
+    print("  ✓ Full pipeline test passed")
+    return True
+
+
+def main():
+    """Run all tests."""
+    print("\n" + "=" * 70)
+    print("PROJECT ATLAS - MODULE 205 INTEGRATION TEST")
+    print("Feature Selection & Ranking")
+    print("=" * 70)
+    
+    results = {}
+    
+    results["load_predictive"] = test_engine_load_predictive()
+    results["normalization"] = test_engine_normalization()
+    results["compute_scores"] = test_engine_compute_scores()
+    results["hard_filters"] = test_engine_filters()
+    results["ranking"] = test_engine_ranking()
+    results["full_engine"] = test_engine_compute()
+    results["statistics"] = test_statistics()
+    results["validator"] = test_validator()
+    results["pipeline"] = test_pipeline()
+    
+    print("\n" + "=" * 70)
+    print("RESULTS")
+    print("=" * 70)
+    
+    for name, ok in results.items():
+        print(f"  {'✓' if ok else '✗'} {name}")
+    
+    passed = sum(results.values())
+    total = len(results)
+    
+    print(f"\n  {passed}/{total} tests passed")
+    
+    if passed == total:
+        print("\n✓ Module 205 VALIDATED")
+        return 0
+    else:
+        print("\n⚠ Some tests failed")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

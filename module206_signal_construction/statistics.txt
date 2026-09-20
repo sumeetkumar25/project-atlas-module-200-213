@@ -1,0 +1,61 @@
+# atlas/modules/module206_signal_construction/statistics.py
+"""
+Module 206 - Signal Construction Statistics
+"""
+
+from dataclasses import dataclass, asdict
+import pandas as pd
+from .engine import SignalConstructionResult
+
+
+@dataclass
+class SignalConstructionStatistics:
+    """High-level statistics from signal construction."""
+    total_features: int
+    signal_mean: float
+    signal_median: float
+    signal_std: float
+    signal_min: float
+    signal_max: float
+    positive_pct: float
+    negative_pct: float
+    neutral_pct: float
+    skewness: float
+    kurtosis: float
+    total_rows: int
+
+
+class SignalConstructionStatisticsEngine:
+    """Engine for generating high-level statistics."""
+    
+    METADATA = {
+        "module": 206,
+        "name": "Signal Construction",
+        "version": "1.0.0",
+        "description": "Converts selected features into continuous trading signals"
+    }
+    
+    def analyze(self, result: SignalConstructionResult) -> SignalConstructionStatistics:
+        """Analyze results and generate high-level statistics."""
+        return SignalConstructionStatistics(
+            total_features=result.summary_statistics['total_features'],
+            signal_mean=result.summary_statistics['signal_mean'],
+            signal_median=result.summary_statistics['signal_median'],
+            signal_std=result.summary_statistics['signal_std'],
+            signal_min=result.summary_statistics['signal_min'],
+            signal_max=result.summary_statistics['signal_max'],
+            positive_pct=result.summary_statistics['positive_pct'],
+            negative_pct=result.summary_statistics['negative_pct'],
+            neutral_pct=result.summary_statistics['neutral_pct'],
+            skewness=result.summary_statistics['skewness'],
+            kurtosis=result.summary_statistics['kurtosis'],
+            total_rows=result.summary_statistics['total_rows']
+        )
+    
+    def summary_dataframe(self, stats: SignalConstructionStatistics) -> pd.DataFrame:
+        """Convert statistics to DataFrame."""
+        return pd.DataFrame([asdict(stats)])
+    
+    def summary_dict(self, stats: SignalConstructionStatistics) -> dict:
+        """Convert statistics to dictionary."""
+        return asdict(stats)

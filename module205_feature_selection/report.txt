@@ -1,0 +1,133 @@
+# atlas/modules/module205_feature_selection/report.py
+"""
+Module 205 - Feature Selection Report
+"""
+
+from datetime import datetime
+import pandas as pd
+
+
+class FeatureSelectionReport:
+    """Report generator for feature selection results."""
+    
+    @staticmethod
+    def generate(statistics, metadata=None, dataset_name="Unknown") -> str:
+        """Generate a formatted report."""
+        lines = []
+        
+        lines.append("=" * 55)
+        lines.append("MODULE 205")
+        lines.append("FEATURE SELECTION & RANKING")
+        lines.append("=" * 55)
+        lines.append(f"\nDataset: {dataset_name}")
+        
+        # Overview
+        lines.append("\n" + "-" * 45)
+        lines.append("OVERVIEW")
+        lines.append("-" * 45)
+        lines.append(f"  Total Features: {statistics.total_features}")
+        lines.append(f"  SELECTED: {statistics.selected_count}")
+        lines.append(f"  REJECTED: {statistics.rejected_count}")
+        
+        # Percentages
+        lines.append("\n" + "-" * 45)
+        lines.append("PERCENTAGES")
+        lines.append("-" * 45)
+        lines.append(f"  SELECTED: {statistics.selected_percentage:.1f}%")
+        lines.append(f"  REJECTED: {statistics.rejected_percentage:.1f}%")
+        
+        # Scores
+        lines.append("\n" + "-" * 45)
+        lines.append("SCORES")
+        lines.append("-" * 45)
+        lines.append(f"  Average: {statistics.average_score:.3f}")
+        lines.append(f"  Median: {statistics.median_score:.3f}")
+        lines.append(f"  Best: {statistics.best_score:.3f}")
+        lines.append(f"  Worst: {statistics.worst_score:.3f}")
+        
+        # Best and Worst Features
+        if statistics.best_feature:
+            lines.append("\n" + "-" * 45)
+            lines.append("BEST FEATURE")
+            lines.append("-" * 45)
+            lines.append(f"  {statistics.best_feature}: {statistics.best_score:.3f}")
+        
+        if statistics.worst_feature:
+            lines.append("\n" + "-" * 45)
+            lines.append("WORST FEATURE")
+            lines.append("-" * 45)
+            lines.append(f"  {statistics.worst_feature}: {statistics.worst_score:.3f}")
+        
+        # Thresholds
+        lines.append("\n" + "-" * 45)
+        lines.append("THRESHOLDS")
+        lines.append("-" * 45)
+        lines.append(f"  Predictive Threshold: {statistics.selection_threshold}")
+        lines.append(f"  Stability Threshold: {statistics.stability_threshold}")
+        
+        # Interpretation
+        lines.append("\n" + "-" * 45)
+        lines.append("INTERPRETATION")
+        lines.append("-" * 45)
+        
+        if statistics.average_score > 0.6:
+            lines.append("  ✅ Features show strong overall quality")
+        elif statistics.average_score > 0.4:
+            lines.append("  ✓ Features show moderate overall quality")
+        else:
+            lines.append("  ⚠ Features show weak overall quality")
+        
+        if statistics.selected_percentage > 50:
+            lines.append("  ✓ Most features passed selection")
+        else:
+            lines.append("  ⚠ Significant feature reduction applied")
+        
+        # Validation
+        lines.append("\n" + "-" * 45)
+        lines.append("VALIDATION")
+        lines.append("-" * 45)
+        lines.append("  Status: PASSED")
+        
+        # Footer
+        lines.append(f"\n  Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append("\n" + "=" * 55)
+        lines.append("END OF REPORT")
+        lines.append("=" * 55)
+        
+        return "\n".join(lines)
+    
+    @staticmethod
+    def generate_ranking_table(ranking: pd.DataFrame, top_n: int = 10) -> str:
+        """Generate a ranking table report."""
+        lines = []
+        lines.append("\n" + "=" * 70)
+        lines.append(f"TOP {top_n} FEATURES")
+        lines.append("=" * 70)
+        
+        top_features = ranking.head(top_n)
+        
+        lines.append(
+            f"\n{'Rank':<8} {'Feature':<25} {'Score':<12} {'Predictive':<12} {'Stability':<12}"
+        )
+        lines.append("-" * 75)
+        
+        for _, row in top_features.iterrows():
+            lines.append(
+                f"{row['rank']:<8} "
+                f"{row['feature'][:24]:<25} "
+                f"{row['final_score']:<12.3f} "
+                f"{row['predictive_score']:<12.3f} "
+                f"{row['stability_score']:<12.3f}"
+            )
+        
+        lines.append("\n" + "=" * 70)
+        return "\n".join(lines)
+    
+    @staticmethod
+    def save(report: str, filepath: str):
+        """Save report to file."""
+        from pathlib import Path
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(report)

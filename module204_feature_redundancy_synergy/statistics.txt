@@ -1,0 +1,65 @@
+# atlas/modules/module204_feature_redundancy_synergy/statistics.py
+"""
+Module 204 - Feature Redundancy & Synergy Statistics
+"""
+
+from dataclasses import dataclass, asdict
+import pandas as pd
+from .engine import FeatureRedundancySynergyResult
+
+
+@dataclass
+class FeatureRedundancySynergyStatistics:
+    """High-level statistics from feature redundancy and synergy analysis."""
+    total_features: int
+    kept_features: int
+    removed_features: int
+    kept_percentage: float
+    removed_percentage: float
+    unique_clusters: int
+    avg_conditional_mi: float
+    avg_synergy: float
+    avg_incremental_gain: float
+    avg_vif: float
+    best_pair: str
+    worst_pair: str
+    best_score: float
+    worst_score: float
+
+
+class FeatureRedundancySynergyStatisticsEngine:
+    """Engine for generating high-level statistics."""
+    
+    METADATA = {
+        "module": 204,
+        "name": "Feature Redundancy & Synergy",
+        "version": "1.0.0",
+        "description": "Evaluates feature groups for redundancy and synergy"
+    }
+    
+    def analyze(self, result: FeatureRedundancySynergyResult) -> FeatureRedundancySynergyStatistics:
+        """Analyze results and generate high-level statistics."""
+        return FeatureRedundancySynergyStatistics(
+            total_features=result.summary_statistics['total_features'],
+            kept_features=result.summary_statistics['kept_features'],
+            removed_features=result.summary_statistics['removed_features'],
+            kept_percentage=result.summary_statistics['kept_percentage'],
+            removed_percentage=result.summary_statistics['removed_percentage'],
+            unique_clusters=result.summary_statistics['unique_clusters'],
+            avg_conditional_mi=result.summary_statistics['avg_conditional_mi'],
+            avg_synergy=result.summary_statistics['avg_synergy'],
+            avg_incremental_gain=result.summary_statistics['avg_incremental_gain'],
+            avg_vif=result.summary_statistics['avg_vif'],
+            best_pair=result.summary_statistics['best_pair'],
+            worst_pair=result.summary_statistics['worst_pair'],
+            best_score=result.summary_statistics['best_score'],
+            worst_score=result.summary_statistics['worst_score']
+        )
+    
+    def summary_dataframe(self, stats: FeatureRedundancySynergyStatistics) -> pd.DataFrame:
+        """Convert statistics to DataFrame."""
+        return pd.DataFrame([asdict(stats)])
+    
+    def summary_dict(self, stats: FeatureRedundancySynergyStatistics) -> dict:
+        """Convert statistics to dictionary."""
+        return asdict(stats)

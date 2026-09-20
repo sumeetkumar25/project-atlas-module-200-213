@@ -1,0 +1,1 @@
+python -m atlas.modules.module206_signal_construction.test_module

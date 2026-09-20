@@ -1,0 +1,47 @@
+# atlas/modules/module206_signal_construction/exporter.py
+"""
+Module 206 - Signal Construction Exporter
+"""
+
+import pandas as pd
+from pathlib import Path
+
+
+class SignalConstructionExporter:
+    """Exporter for signal construction results."""
+    
+    @staticmethod
+    def export_signal_matrix(df: pd.DataFrame, filepath: str):
+        """Export signal matrix to Parquet."""
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_parquet(path, index=False)
+    
+    @staticmethod
+    def export_raw_signal(df: pd.DataFrame, filepath: str):
+        """Export raw signal to CSV."""
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(path, index=False)
+    
+    @staticmethod
+    def export_normalized_signal(df: pd.DataFrame, filepath: str):
+        """Export normalized signal to CSV."""
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(path, index=False)
+    
+    @staticmethod
+    def export_signal_components(df: pd.DataFrame, filepath: str):
+        """Export signal components to CSV."""
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(path, index=False)
+    
+    @staticmethod
+    def export_statistics(stats: dict, filepath: str):
+        """Export statistics to CSV."""
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df = pd.DataFrame([stats])
+        df.to_csv(path, index=False)

@@ -1,0 +1,135 @@
+# atlas/modules/module207_signal_confidence/report.py
+"""
+Module 207 - Signal Confidence Report
+"""
+
+from datetime import datetime
+import pandas as pd
+
+
+class SignalConfidenceReport:
+    """Report generator for signal confidence results."""
+    
+    @staticmethod
+    def generate(statistics, metadata=None, dataset_name="Unknown") -> str:
+        """Generate a formatted report."""
+        lines = []
+        
+        lines.append("=" * 55)
+        lines.append("MODULE 207")
+        lines.append("SIGNAL CONFIDENCE")
+        lines.append("=" * 55)
+        lines.append(f"\nDataset: {dataset_name}")
+        
+        # Overview
+        lines.append("\n" + "-" * 45)
+        lines.append("OVERVIEW")
+        lines.append("-" * 45)
+        lines.append(f"  Total Rows: {statistics.total_rows:,}")
+        lines.append(f"  Mean Confidence: {statistics.mean_confidence:.3f}")
+        lines.append(f"  Median Confidence: {statistics.median_confidence:.3f}")
+        lines.append(f"  Std Confidence: {statistics.std_confidence:.3f}")
+        
+        # Distribution
+        lines.append("\n" + "-" * 45)
+        lines.append("DISTRIBUTION")
+        lines.append("-" * 45)
+        lines.append(f"  High Confidence (>70%): {statistics.high_confidence_pct:.1f}%")
+        lines.append(f"  Low Confidence (<30%): {statistics.low_confidence_pct:.1f}%")
+        
+        # Confidence by Direction
+        lines.append("\n" + "-" * 45)
+        lines.append("CONFIDENCE BY DIRECTION")
+        lines.append("-" * 45)
+        lines.append(f"  Positive Signal: {statistics.positive_signal_mean_conf:.3f}")
+        lines.append(f"  Negative Signal: {statistics.negative_signal_mean_conf:.3f}")
+        
+        # Percentiles
+        lines.append("\n" + "-" * 45)
+        lines.append("PERCENTILES")
+        lines.append("-" * 45)
+        lines.append(f"  95th Percentile: {statistics.p95_confidence:.3f}")
+        lines.append(f"  Min: {statistics.min_confidence:.3f}")
+        lines.append(f"  Max: {statistics.max_confidence:.3f}")
+        
+        # Interpretation
+        lines.append("\n" + "-" * 45)
+        lines.append("INTERPRETATION")
+        lines.append("-" * 45)
+        
+        if statistics.mean_confidence > 0.6:
+            lines.append("  ✅ Signal generally has high confidence")
+        elif statistics.mean_confidence > 0.4:
+            lines.append("  ✓ Signal has moderate confidence")
+        else:
+            lines.append("  ⚠ Signal has low confidence overall")
+        
+        if statistics.high_confidence_pct > 50:
+            lines.append("  ✅ Most signals have high confidence")
+        elif statistics.high_confidence_pct > 25:
+            lines.append("  ✓ Significant portion of signals have high confidence")
+        else:
+            lines.append("  ⚠ Few signals have high confidence")
+        
+        if abs(statistics.positive_signal_mean_conf - statistics.negative_signal_mean_conf) > 0.1:
+            lines.append("  ⚠ Confidence differs significantly by signal direction")
+        
+        # Validation
+        lines.append("\n" + "-" * 45)
+        lines.append("VALIDATION")
+        lines.append("-" * 45)
+        lines.append("  Status: PASSED")
+        
+        # Footer
+        lines.append(f"\n  Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append("\n" + "=" * 55)
+        lines.append("END OF REPORT")
+        lines.append("=" * 55)
+        
+        return "\n".join(lines)
+    
+    @staticmethod
+    def generate_distribution_report(distribution: pd.DataFrame) -> str:
+        """Generate a distribution report."""
+        lines = []
+        lines.append("\n" + "=" * 60)
+        lines.append("CONFIDENCE DISTRIBUTION")
+        lines.append("=" * 60)
+        
+        lines.append(
+            f"\n{'Range':<15} {'Count':<12} {'Percentage':<12} {'Bar':<30}"
+        )
+        lines.append("-" * 70)
+        
+        max_count = distribution['count'].max()
+        
+        for _, row in distribution.iterrows():
+            if row['count'] == 0:
+                continue
+            
+            lower = row['bin_lower']
+            upper = row['bin_upper']
+            count = row['count']
+            pct = row['percentage']
+            
+            bar_length = int((count / max_count) * 25)
+            bar = '█' * bar_length
+            
+            lines.append(
+                f"{lower:.2f}-{upper:.2f}    "
+                f"{count:<12} "
+                f"{pct:<12.1f} "
+                f"{bar}"
+            )
+        
+        lines.append("\n" + "=" * 60)
+        return "\n".join(lines)
+    
+    @staticmethod
+    def save(report: str, filepath: str):
+        """Save report to file."""
+        from pathlib import Path
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(report)

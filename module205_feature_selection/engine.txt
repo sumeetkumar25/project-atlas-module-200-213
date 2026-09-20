@@ -1,0 +1,439 @@
+"""
+Module 205 - Feature Selection & Ranking Engine
+
+Produces the final feature set that every future model in Project Atlas will use.
+
+Inputs:
+  - Module201: predictive_feature_matrix.parquet
+  - Module202: feature_stability.csv
+  - Module203: interaction_statistics.csv
+  - Module204: feature_redundancy.csv, feature_clusters.csv, removed_features.csv
+
+Outputs:
+  - Selected features with final scores
+  - Feature rankings
+  - Selection statistics
+"""
+
+import numpy as np
+import pandas as pd
+from dataclasses import dataclass
+from typing import Optional, Dict, Any, List, Tuple
+from pathlib import Path
+import warnings
+warnings.filterwarnings('ignore')
+
+
+@dataclass
+class FeatureSelectionResult:
+    """Results from feature selection."""
+    selected_features: List[str]
+    rejected_features: List[str]
+    feature_scores: pd.DataFrame
+    feature_ranking: pd.DataFrame
+    summary_statistics: Dict[str, Any]
+
+
+class FeatureSelectionEngine:
+    """Core engine for feature selection and ranking."""
+
+    # Scoring weights
+    SCORING_WEIGHTS = {
+        "predictive": 0.30,
+        "stability": 0.25,
+        "interaction": 0.20,
+        "synergy": 0.15,
+        "redundancy": -0.10
+    }
+
+    # Hard thresholds for automatic rejection
+    PREDICTIVE_THRESHOLD = 0.40
+    STABILITY_THRESHOLD = 0.50
+
+    def __init__(
+        self,
+        predictive_threshold: float = 0.40,
+        stability_threshold: float = 0.50,
+        timestamp_column: str = "timestamp"
+    ):
+        """
+        Initialize the feature selection engine.
+        
+        Args:
+            predictive_threshold: Minimum predictive score to keep
+            stability_threshold: Minimum stability score to keep
+            timestamp_column: Name of the timestamp column
+        """
+        self.predictive_threshold = predictive_threshold
+        self.stability_threshold = stability_threshold
+        self.timestamp_column = timestamp_column
+
+    def load_predictive_matrix(self, matrix_path: Path) -> pd.DataFrame:
+        """Load the predictive feature matrix."""
+        if not matrix_path.exists():
+            raise FileNotFoundError(f"Predictive matrix not found: {matrix_path}")
+        
+        if matrix_path.suffix == '.parquet':
+            df = pd.read_parquet(matrix_path)
+        else:
+            df = pd.read_csv(matrix_path)
+            if self.timestamp_column in df.columns:
+                df[self.timestamp_column] = pd.to_datetime(df[self.timestamp_column])
+        
+        return df
+
+    def load_stability_scores(self, filepath: Path) -> pd.DataFrame:
+        """Load stability scores from Module 202."""
+        if not filepath.exists():
+            raise FileNotFoundError(f"Stability scores not found: {filepath}")
+        
+        df = pd.read_csv(filepath)
+        return df
+
+    def load_interaction_scores(self, filepath: Path) -> pd.DataFrame:
+        """Load interaction statistics from Module 203."""
+        if not filepath.exists():
+            raise FileNotFoundError(f"Interaction scores not found: {filepath}")
+        
+        df = pd.read_csv(filepath)
+        return df
+
+    def load_redundancy_data(self, filepath: Path) -> pd.DataFrame:
+        """Load redundancy data from Module 204."""
+        if not filepath.exists():
+            raise FileNotFoundError(f"Redundancy data not found: {filepath}")
+        
+        df = pd.read_csv(filepath)
+        return df
+
+    def load_removed_features(self, filepath: Path) -> List[str]:
+        """Load removed features from Module 204."""
+        if not filepath.exists():
+            return []
+        
+        df = pd.read_csv(filepath)
+        if 'removed_features' in df.columns:
+            return df['removed_features'].tolist()
+        return df.iloc[:, 0].tolist()
+
+    def get_feature_columns(self, df: pd.DataFrame) -> List[str]:
+        """Get feature columns (exclude timestamp and OHLCV)."""
+        ignore_cols = {"timestamp", "date", "time", "index", "close", "open", "high", "low", "volume"}
+        return [c for c in df.columns if c not in ignore_cols and c != self.timestamp_column]
+
+    def normalize_scores(self, scores: pd.Series, min_val: float = 0, max_val: float = 1) -> pd.Series:
+        """Normalize scores to [0, 1] range."""
+        if scores.min() == scores.max():
+            return pd.Series(0.5, index=scores.index)
+        return (scores - scores.min()) / (scores.max() - scores.min())
+
+    def compute_final_scores(
+        self,
+        features: List[str],
+        predictive_scores: pd.Series,
+        stability_scores: pd.Series,
+        interaction_scores: pd.Series,
+        synergy_scores: pd.Series,
+        redundancy_scores: pd.Series
+    ) -> pd.DataFrame:
+        """
+        Compute final scores using weighted combination.
+        """
+        # Normalize each metric to [0, 1]
+        pred_norm = self.normalize_scores(predictive_scores)
+        stab_norm = self.normalize_scores(stability_scores)
+        inter_norm = self.normalize_scores(interaction_scores)
+        syn_norm = self.normalize_scores(synergy_scores)
+        red_norm = self.normalize_scores(redundancy_scores)
+        
+        # Combine with weights
+        final_scores = (
+            self.SCORING_WEIGHTS["predictive"] * pred_norm +
+            self.SCORING_WEIGHTS["stability"] * stab_norm +
+            self.SCORING_WEIGHTS["interaction"] * inter_norm +
+            self.SCORING_WEIGHTS["synergy"] * syn_norm +
+            self.SCORING_WEIGHTS["redundancy"] * red_norm
+        )
+        
+        # Clip to [0, 1]
+        final_scores = np.clip(final_scores, 0.0, 1.0)
+        
+        # Create DataFrame
+        result_df = pd.DataFrame({
+            'feature': features,
+            'predictive_score': pred_norm.values,
+            'stability_score': stab_norm.values,
+            'interaction_score': inter_norm.values,
+            'synergy_score': syn_norm.values,
+            'redundancy_score': red_norm.values,
+            'final_score': final_scores.values
+        })
+        
+        return result_df
+
+    def apply_hard_filters(
+        self,
+        scores_df: pd.DataFrame,
+        removed_features: List[str],
+        all_features: List[str]
+    ) -> Tuple[pd.DataFrame, List[str], List[str]]:
+        """
+        Apply hard filters to reject features that fail minimum thresholds.
+        """
+        # Start with all features
+        selected = all_features.copy()
+        rejected = []
+        
+        # Check each feature
+        for feature in all_features:
+            row = scores_df[scores_df['feature'] == feature]
+            if row.empty:
+                rejected.append(feature)
+                continue
+            
+            # Check hard thresholds
+            predictive = row['predictive_score'].iloc[0]
+            stability = row['stability_score'].iloc[0]
+            
+            # Remove if predictive is too low
+            if predictive < self.predictive_threshold:
+                rejected.append(feature)
+                selected.remove(feature)
+                continue
+            
+            # Remove if stability is too low
+            if stability < self.stability_threshold:
+                rejected.append(feature)
+                selected.remove(feature)
+                continue
+            
+            # Remove if Module 204 flagged it
+            if feature in removed_features:
+                rejected.append(feature)
+                selected.remove(feature)
+                continue
+        
+        # Filter DataFrame
+        filtered_df = scores_df[scores_df['feature'].isin(selected)]
+        
+        return filtered_df, selected, rejected
+
+    def rank_features(self, scores_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Rank features by final score.
+        """
+        ranking = scores_df.sort_values('final_score', ascending=False).reset_index(drop=True)
+        ranking['rank'] = range(1, len(ranking) + 1)
+        return ranking
+
+    def compute_statistics(
+        self,
+        all_scores_df: pd.DataFrame,
+        selected: List[str],
+        rejected: List[str]
+    ) -> Dict[str, Any]:
+        """
+        Compute summary statistics using the full scores DataFrame (before filtering).
+        """
+        total = len(all_scores_df)
+        scores = all_scores_df['final_score']
+        
+        # Find best and worst from all scores (not filtered)
+        best_idx = scores.idxmax()
+        worst_idx = scores.idxmin()
+        
+        stats = {
+            'total_features': total,
+            'selected_count': len(selected),
+            'rejected_count': len(rejected),
+            'selected_percentage': len(selected) / total * 100 if total > 0 else 0,
+            'rejected_percentage': len(rejected) / total * 100 if total > 0 else 0,
+            'average_score': float(scores.mean()),
+            'median_score': float(scores.median()),
+            'min_score': float(scores.min()),
+            'max_score': float(scores.max()),
+            'best_feature': all_scores_df.iloc[best_idx]['feature'] if not all_scores_df.empty else None,
+            'worst_feature': all_scores_df.iloc[worst_idx]['feature'] if not all_scores_df.empty else None,
+            'best_score': float(scores.max()),
+            'worst_score': float(scores.min()),
+            'selection_threshold': self.predictive_threshold,
+            'stability_threshold': self.stability_threshold
+        }
+        
+        return stats
+
+    def save_outputs(
+        self,
+        selected: List[str],
+        rejected: List[str],
+        scores_df: pd.DataFrame,
+        ranking_df: pd.DataFrame,
+        stats: Dict[str, Any],
+        output_dir: Path
+    ) -> None:
+        """Save all outputs."""
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Selected features
+        selected_df = pd.DataFrame({'selected_features': selected})
+        selected_path = output_dir / "selected_features.csv"
+        selected_df.to_csv(selected_path, index=False)
+        print(f"  Saved selected features to {selected_path}")
+        
+        # Feature scores
+        scores_path = output_dir / "feature_scores.csv"
+        scores_df.to_csv(scores_path, index=False)
+        print(f"  Saved feature scores to {scores_path}")
+        
+        # Feature ranking
+        ranking_path = output_dir / "feature_ranking.csv"
+        ranking_df.to_csv(ranking_path, index=False)
+        print(f"  Saved feature ranking to {ranking_path}")
+        
+        # Statistics
+        stats_df = pd.DataFrame([stats])
+        stats_path = output_dir / "feature_selection_statistics.csv"
+        stats_df.to_csv(stats_path, index=False)
+        print(f"  Saved statistics to {stats_path}")
+
+    def compute(
+        self,
+        predictive_matrix_path: Path,
+        stability_file: Path,
+        interaction_file: Path,
+        redundancy_file: Path,
+        removed_file: Path,
+        output_dir: Optional[Path] = None
+    ) -> FeatureSelectionResult:
+        """
+        Main computation method.
+        """
+        print("\n  Computing Feature Selection & Ranking...")
+        
+        if output_dir is None:
+            output_dir = Path("data/feature_store/selected")
+        
+        # Load all inputs
+        print(f"  Loading predictive matrix from: {predictive_matrix_path}")
+        predictive_df = self.load_predictive_matrix(predictive_matrix_path)
+        features = self.get_feature_columns(predictive_df)
+        print(f"  Found {len(features)} features")
+        
+        print(f"  Loading stability scores from: {stability_file}")
+        stability_df = self.load_stability_scores(stability_file)
+        
+        print(f"  Loading interaction scores from: {interaction_file}")
+        interaction_df = self.load_interaction_scores(interaction_file)
+        
+        print(f"  Loading redundancy data from: {redundancy_file}")
+        redundancy_df = self.load_redundancy_data(redundancy_file)
+        
+        print(f"  Loading removed features from: {removed_file}")
+        removed_features = self.load_removed_features(removed_file)
+        print(f"  Found {len(removed_features)} previously removed features")
+        
+        # ------------------------------------------------------------
+        # FIX: Module 201 Predictive Scores - use actual scores
+        # ------------------------------------------------------------
+        
+        # Option 1: From Module 203's interaction_df (contains predictive scores)
+        if 'predictive_score' in interaction_df.columns:
+            predictive_dict = dict(zip(interaction_df['feature'], interaction_df['predictive_score']))
+            print(f"  Using predictive scores from Module 203")
+        else:
+            # Option 2: Fallback - use normalized scores from predictive matrix
+            # This could be extracted from Module 201 output
+            predictive_dict = {f: 0.5 for f in features}
+            print(f"  Warning: No predictive scores found, using defaults")
+        
+        # Stability scores (Module 202)
+        stability_dict = dict(zip(stability_df['feature'], stability_df['stability_score']))
+        
+        # Interaction scores (Module 203)
+        if 'predictive_score' in interaction_df.columns:
+            interaction_dict = dict(zip(interaction_df['feature'], interaction_df['predictive_score']))
+        else:
+            interaction_dict = {f: 0.5 for f in features}
+        
+        # Synergy scores (Module 204 - conditional MI)
+        if 'conditional_mi' in redundancy_df.columns:
+            synergy_dict = {}
+            for feature in features:
+                rows = redundancy_df[
+                    (redundancy_df['feature_a'] == feature) | 
+                    (redundancy_df['feature_b'] == feature)
+                ]
+                if not rows.empty:
+                    synergy_dict[feature] = rows['conditional_mi'].mean()
+                else:
+                    synergy_dict[feature] = 0.5
+        else:
+            synergy_dict = {f: 0.5 for f in features}
+        
+        # Redundancy scores (Module 204 - composite score)
+        if 'composite_score' in redundancy_df.columns:
+            redundancy_dict = {}
+            for feature in features:
+                rows = redundancy_df[
+                    (redundancy_df['feature_a'] == feature) | 
+                    (redundancy_df['feature_b'] == feature)
+                ]
+                if not rows.empty:
+                    redundancy_dict[feature] = rows['composite_score'].mean()
+                else:
+                    redundancy_dict[feature] = 0.0
+        else:
+            redundancy_dict = {f: 0.0 for f in features}
+        
+        # Create series (with proper defaults for missing features)
+        predictive_scores = pd.Series({f: predictive_dict.get(f, 0.5) for f in features})
+        stability_series = pd.Series({f: stability_dict.get(f, 0.5) for f in features})
+        interaction_series = pd.Series({f: interaction_dict.get(f, 0.5) for f in features})
+        synergy_series = pd.Series({f: synergy_dict.get(f, 0.5) for f in features})
+        redundancy_series = pd.Series({f: redundancy_dict.get(f, 0.0) for f in features})
+        
+        # Compute final scores
+        print("  Computing final scores...")
+        scores_df = self.compute_final_scores(
+            features,
+            predictive_scores,
+            stability_series,
+            interaction_series,
+            synergy_series,
+            redundancy_series
+        )
+        
+        # Apply hard filters
+        print("  Applying hard filters...")
+        filtered_df, selected, rejected = self.apply_hard_filters(
+            scores_df, removed_features, features
+        )
+        print(f"    Selected: {len(selected)} features")
+        print(f"    Rejected: {len(rejected)} features")
+        
+        # Rank features (using filtered_df which only contains selected features)
+        print("  Ranking features...")
+        ranking_df = self.rank_features(filtered_df)
+        
+        # Compute statistics (using scores_df which contains ALL features)
+        stats = self.compute_statistics(scores_df, selected, rejected)
+        
+        # Save outputs
+        print("\n  Saving outputs...")
+        self.save_outputs(selected, rejected, scores_df, ranking_df, stats, output_dir)
+        
+        print(f"\n  Selection Summary:")
+        print(f"    Total Features: {stats['total_features']}")
+        print(f"    Selected: {stats['selected_count']}")
+        print(f"    Rejected: {stats['rejected_count']}")
+        print(f"    Average Score: {stats['average_score']:.3f}")
+        print(f"    Best Feature: {stats['best_feature']}")
+        print(f"    Worst Feature: {stats['worst_feature']}")
+        
+        return FeatureSelectionResult(
+            selected_features=selected,
+            rejected_features=rejected,
+            feature_scores=scores_df,  # All features, not just selected
+            feature_ranking=ranking_df,
+            summary_statistics=stats
+        )

@@ -1,0 +1,231 @@
+# atlas/modules/module207_signal_confidence/module.py
+"""
+Module 207
+Signal Confidence
+
+Measures how reliable the signal is at any given time.
+
+Pipeline: load signal matrix → compute confidence factors → calculate confidence →
+          statistics → validation → report → export
+"""
+
+from typing import Optional, Dict, Any
+import pandas as pd
+from pathlib import Path
+
+from atlas.core.base_research_module import BaseResearchModule
+from atlas.framework.registry import AtlasRegistry
+
+from .engine import SignalConfidenceEngine
+from .statistics import SignalConfidenceStatisticsEngine
+from .validator import run_validation
+from .report import SignalConfidenceReport
+from .exporter import SignalConfidenceExporter
+
+
+class SignalConfidenceResearch(BaseResearchModule):
+    """Main research module for signal confidence."""
+    
+    MODULE_OUTPUT = "module207"
+    METADATA = SignalConfidenceStatisticsEngine.METADATA
+    
+    def __init__(
+        self,
+        registry: Optional[AtlasRegistry] = None,
+        rolling_window: int = 100,
+        timestamp_column: str = "timestamp",
+        signal_column: str = "normalized_signal"
+    ):
+        """
+        Initialize the signal confidence module.
+        
+        Args:
+            registry: Optional Atlas registry
+            rolling_window: Window for rolling statistics
+            timestamp_column: Name of the timestamp column
+            signal_column: Name of the signal column
+        """
+        super().__init__(
+            module_name="Signal Confidence",
+            module_version=self.METADATA["version"],
+        )
+        
+        self.registry = registry or AtlasRegistry()
+        self.engine = SignalConfidenceEngine(
+            rolling_window=rolling_window,
+            timestamp_column=timestamp_column,
+            signal_column=signal_column
+        )
+        self.stats_engine = SignalConfidenceStatisticsEngine()
+        self.result_data = None
+        self.statistics = None
+        self.distribution_report = None
+        self._output_dir = None
+        self._paths = None
+
+    def _register_pipeline_steps(self):
+        """Register pipeline steps."""
+        self.pipeline_steps = [
+            ("signal_confidence", self._compute_confidence),
+            ("statistics", self._compute_statistics),
+            ("validate", self._validate),
+            ("export", self._export_results),
+        ]
+    
+    def _prepare_data(self) -> Dict[str, Any]:
+        """Prepare data."""
+        if self._paths is None:
+            raise ValueError("File paths not provided. Use run_confidence() method.")
+        return self._paths
+    
+    def _compute_confidence(self) -> Dict[str, Any]:
+        """Step 1: Compute signal confidence."""
+        self.logger.info("Step 1: Computing signal confidence")
+        
+        prepared = self._prepare_data()
+        
+        self.result_data = self.engine.compute(
+            signal_matrix_path=prepared["signal_matrix"],
+            signal_components_path=prepared["signal_components"],
+            output_dir=self._output_dir
+        )
+        
+        self.logger.metric(
+            "Mean Confidence",
+            f"{self.result_data.confidence_statistics['mean_confidence']:.3f}"
+        )
+        self.logger.metric(
+            "High Confidence",
+            f"{self.result_data.confidence_statistics['high_confidence_pct']:.1f}%"
+        )
+        self.logger.metric(
+            "Low Confidence",
+            f"{self.result_data.confidence_statistics['low_confidence_pct']:.1f}%"
+        )
+        self.logger.success("Signal confidence computed")
+        
+        # Generate distribution report
+        self.distribution_report = SignalConfidenceReport.generate_distribution_report(
+            self.result_data.confidence_distribution
+        )
+        
+        return {
+            "mean_confidence": self.result_data.confidence_statistics["mean_confidence"],
+            "high_confidence_pct": self.result_data.confidence_statistics["high_confidence_pct"],
+            "low_confidence_pct": self.result_data.confidence_statistics["low_confidence_pct"],
+            "total_rows": self.result_data.confidence_statistics["total_rows"]
+        }
+    
+    def _compute_statistics(self) -> Dict[str, Any]:
+        """Step 2: Computing statistics."""
+        self.logger.info("Step 2: Computing statistics")
+        self.statistics = self.stats_engine.analyze(self.result_data)
+        
+        self.logger.metric(
+            "Positive Signal Conf",
+            f"{self.statistics.positive_signal_mean_conf:.3f}"
+        )
+        self.logger.metric(
+            "Negative Signal Conf",
+            f"{self.statistics.negative_signal_mean_conf:.3f}"
+        )
+        self.logger.success("Statistics computed")
+        
+        return self.stats_engine.summary_dict(self.statistics)
+    
+    def _validate(self) -> Dict[str, Any]:
+        """Step 3: Validation."""
+        self.logger.info("Step 3: Validation")
+        passed = run_validation(self.result_data, self.statistics)
+        self.logger.success("Validation complete")
+        return {"software_validation_passed": passed}
+    
+    def _export_results(self) -> Dict[str, Any]:
+        """Step 4: Export."""
+        self.logger.info("Step 4: Export")
+        
+        # Register DataFrames as artifacts
+        self.result.artifacts["confidence_matrix"] = self.result_data.confidence_matrix
+        self.result.artifacts["confidence_distribution"] = self.result_data.confidence_distribution
+        
+        # Store signal confidence
+        conf_df = pd.DataFrame({
+            'confidence': self.result_data.signal_confidence.values
+        })
+        self.result.artifacts["signal_confidence"] = conf_df
+        
+        # Store summary
+        stats_df = pd.DataFrame([self.result_data.confidence_statistics])
+        self.result.artifacts["confidence_statistics"] = stats_df
+        
+        # Generate and register reports
+        main_report = SignalConfidenceReport.generate(
+            self.statistics,
+            metadata=self.METADATA,
+            dataset_name=self.result.dataset_identifier,
+        )
+        self.result.artifacts["signal_confidence_report"] = main_report
+        self.result.artifacts["distribution_report"] = self.distribution_report
+        
+        self.logger.metric("Artifacts", str(len(self.result.artifacts)))
+        self.logger.success("Export complete")
+        
+        return {
+            "export_status": "complete",
+            "artifact_count": len(self.result.artifacts),
+            "mean_confidence": self.result_data.confidence_statistics["mean_confidence"],
+            "total_rows": self.result_data.confidence_statistics["total_rows"]
+        }
+    
+    def compute(self) -> Dict[str, Any]:
+        """Run the full computation pipeline."""
+        self.logger.section("Signal Confidence Pipeline")
+        results = self.execute_pipeline()
+        self.result.status = "completed"
+        self.logger.success("Module 207 complete")
+        return results
+    
+    def run(self, filepath: str, output_dir=None):
+        """Run module on file."""
+        self._output_dir = Path(output_dir) if output_dir else None
+        return super().run(filepath, output_dir)
+    
+    def run_dataframe(self, df, dataset_id="in_memory", output_dir=None):
+        """Run module on a single DataFrame."""
+        self._output_dir = Path(output_dir) if output_dir else None
+        return super().run_dataframe(df, dataset_id, output_dir)
+    
+    def run_confidence(
+        self,
+        signal_matrix_path: Path,
+        signal_components_path: Path,
+        dataset_id: str = "signal_confidence",
+        output_dir: Optional[Path] = None
+    ) -> Any:
+        """
+        Run the signal confidence analysis.
+        
+        Args:
+            signal_matrix_path: Path to signal_matrix.parquet from Module 206
+            signal_components_path: Path to signal_components.csv from Module 206
+            dataset_id: Identifier for the dataset
+            output_dir: Output directory for results
+        """
+        self._paths = {
+            "signal_matrix": signal_matrix_path,
+            "signal_components": signal_components_path
+        }
+        self._output_dir = Path(output_dir) if output_dir else Path("data/feature_store/confidence")
+        
+        # Create a dummy DataFrame to satisfy BaseResearchModule
+        dummy = pd.DataFrame(
+            {
+                "timestamp": [pd.Timestamp("2000-01-01")]
+            }
+        )
+        
+        return super().run_dataframe(
+            dummy,
+            dataset_id=dataset_id,
+            output_dir=self._output_dir
+        )

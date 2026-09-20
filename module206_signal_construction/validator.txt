@@ -1,0 +1,122 @@
+# atlas/modules/module206_signal_construction/validator.py
+"""
+Module 206 - Signal Construction Validator
+"""
+
+import numpy as np
+import pandas as pd
+from .engine import SignalConstructionResult
+from .statistics import SignalConstructionStatistics
+
+
+class SignalConstructionValidator:
+    """Validator for signal construction results."""
+    
+    def __init__(self, timestamp_column: str = "timestamp"):
+        self.timestamp_column = timestamp_column
+    
+    def validate(
+        self,
+        result: SignalConstructionResult,
+        statistics: SignalConstructionStatistics
+    ) -> bool:
+        """Validate results and statistics."""
+        issues = []
+        warnings = []
+        
+        # Check signal matrix
+        if result.signal_matrix.empty:
+            issues.append("Signal matrix is empty")
+        else:
+            if self.timestamp_column not in result.signal_matrix.columns:
+                issues.append("Missing timestamp column")
+            
+            # Check no duplicate timestamps
+            dup_count = result.signal_matrix[self.timestamp_column].duplicated().sum()
+            if dup_count > 0:
+                warnings.append(f"Found {dup_count} duplicate timestamps")
+        
+        # Check raw signal
+        if result.raw_signal.empty:
+            issues.append("Raw signal is empty")
+        else:
+            # Check no NaN
+            if result.raw_signal.isna().any():
+                issues.append("NaN values found in raw signal")
+        
+        # Check normalized signal
+        if result.normalized_signal.empty:
+            issues.append("Normalized signal is empty")
+        else:
+            # Check no NaN
+            if result.normalized_signal.isna().any():
+                issues.append("NaN values found in normalized signal")
+            
+            # Check signal in [-1, 1]
+            if not np.all((-1 <= result.normalized_signal) & 
+                         (result.normalized_signal <= 1)):
+                issues.append("Normalized signal outside [-1, 1] range")
+        
+        # Check signal components
+        if result.signal_components.empty:
+            issues.append("Signal components is empty")
+        else:
+            # Check no NaN
+            if result.signal_components.isna().any().any():
+                issues.append("NaN values found in signal components")
+        
+        # Check statistics
+        if statistics.total_features <= 0:
+            issues.append(f"Invalid total features: {statistics.total_features}")
+        
+        if statistics.total_rows != len(result.signal_matrix):
+            issues.append(
+                f"Total rows mismatch: stats={statistics.total_rows}, "
+                f"result={len(result.signal_matrix)}"
+            )
+        
+        # Check percentages sum to 100
+        if abs(statistics.positive_pct + statistics.negative_pct + statistics.neutral_pct - 100) > 1:
+            issues.append(
+                f"Percentages do not sum to 100: "
+                f"{statistics.positive_pct + statistics.negative_pct + statistics.neutral_pct:.1f}%"
+            )
+        
+        # Warnings (non-fatal)
+        if statistics.positive_pct < 20 or statistics.negative_pct < 20:
+            warnings.append("Signal is not well-balanced (too few positive or negative values)")
+        
+        if abs(statistics.signal_mean) > 0.1:
+            warnings.append(f"Signal has significant mean drift: {statistics.signal_mean:.4f}")
+        
+        if warnings:
+            print("\n  WARNINGS:")
+            for warning in warnings:
+                print(f"    ⚠ {warning}")
+        
+        if issues:
+            raise ValueError(
+                f"Signal Construction validation failed with {len(issues)} issue(s):\n" +
+                "\n".join(f"  - {issue}" for issue in issues)
+            )
+        
+        return True
+
+
+def run_validation(result, statistics):
+    """Run validation with user-friendly output."""
+    validator = SignalConstructionValidator()
+    
+    print("\n" + "=" * 60)
+    print("SIGNAL CONSTRUCTION VALIDATION")
+    print("=" * 60)
+    
+    try:
+        validator.validate(result, statistics)
+        print("\n  ✓ All validation checks passed")
+        print("=" * 60)
+        return True
+    except ValueError as e:
+        print(e)
+        print("=" * 60)
+        return False

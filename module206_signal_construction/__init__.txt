@@ -1,0 +1,9 @@
+# atlas/modules/module206_signal_construction/__init__.py
+"""
+Module 206
+Signal Construction
+"""
+
+from .module import SignalConstructionResearch
+
+__all__ = ["SignalConstructionResearch"]

@@ -1,0 +1,508 @@
+"""
+Module 206 - Signal Construction Engine
+
+Converts selected features into one or more continuous trading signals.
+
+Steps:
+  1. Load selected features
+  2. Extract feature columns
+  3. Normalize features (rolling z-score)
+  4. Weight features
+  5. Construct signal
+
+Output: Raw signal, normalized signal, and signal statistics.
+"""
+
+import numpy as np
+import pandas as pd
+from dataclasses import dataclass
+from typing import Optional, Dict, Any, List, Tuple
+from abc import ABC, abstractmethod
+from scipy import stats
+from pathlib import Path
+import warnings
+warnings.filterwarnings('ignore')
+
+
+@dataclass
+class SignalConstructionResult:
+    """Results from signal construction."""
+    signal_matrix: pd.DataFrame
+    raw_signal: pd.Series
+    normalized_signal: pd.Series
+    signal_components: pd.DataFrame
+    contribution_percentages: pd.Series
+    summary_statistics: Dict[str, Any]
+
+
+class SignalWeightingStrategy(ABC):
+    """Abstract base class for signal weighting strategies."""
+    
+    @abstractmethod
+    def compute_weights(self, feature_scores: pd.DataFrame) -> pd.Series:
+        """
+        Compute weights for each feature.
+        
+        Args:
+            feature_scores: DataFrame with 'feature' and 'final_score' columns
+            
+        Returns:
+            Series with feature names as index and weights as values
+        """
+        pass
+
+
+class ScoreWeightingStrategy(SignalWeightingStrategy):
+    """Weight features by their final scores."""
+    
+    def compute_weights(self, feature_scores: pd.DataFrame) -> pd.Series:
+        """Use final_score as weights."""
+        weights = feature_scores.set_index('feature')['final_score'].clip(lower=0)
+        weights = weights / weights.sum()
+        return weights
+
+
+class RankWeightingStrategy(SignalWeightingStrategy):
+    """Weight features by their rank."""
+    
+    def compute_weights(self, feature_scores: pd.DataFrame) -> pd.Series:
+        """Use rank as weights (higher rank = higher weight)."""
+        sorted_df = feature_scores.sort_values('final_score', ascending=False)
+        n = len(sorted_df)
+        weights = pd.Series(
+            np.linspace(n, 1, n) / np.sum(np.linspace(n, 1, n)),
+            index=sorted_df['feature']
+        )
+        return weights
+
+
+class SignalConstructionEngine:
+    """Core engine for signal construction."""
+
+    def __init__(
+        self,
+        weighting_strategy: Optional[SignalWeightingStrategy] = None,
+        timestamp_column: str = "timestamp",
+        normalization_window: int = 500,
+        normalization_method: str = "rolling",  # "rolling", "expanding", "global"
+        signal_scaling: str = "tanh",  # "tanh" or "clip"
+        handle_missing: bool = True
+    ):
+        """
+        Initialize the signal construction engine.
+        
+        Args:
+            weighting_strategy: Strategy for computing feature weights
+            timestamp_column: Name of the timestamp column
+            normalization_window: Window size for rolling normalization
+            normalization_method: Method for feature normalization ('rolling', 'expanding', 'global')
+            signal_scaling: Method for scaling signal ('tanh' or 'clip')
+            handle_missing: Whether to renormalize weights when features are missing
+        """
+        self.weighting_strategy = weighting_strategy or ScoreWeightingStrategy()
+        self.timestamp_column = timestamp_column
+        self.normalization_window = normalization_window
+        self.normalization_method = normalization_method
+        self.signal_scaling = signal_scaling
+        self.handle_missing = handle_missing
+
+    def load_selected_features(self, filepath: Path) -> List[str]:
+        """Load selected features from Module 205."""
+        if not filepath.exists():
+            raise FileNotFoundError(f"Selected features not found: {filepath}")
+        
+        df = pd.read_csv(filepath)
+        if 'selected_features' in df.columns:
+            return df['selected_features'].tolist()
+        return df.iloc[:, 0].tolist()
+
+    def load_feature_scores(self, filepath: Path) -> pd.DataFrame:
+        """Load feature scores from Module 205."""
+        if not filepath.exists():
+            raise FileNotFoundError(f"Feature scores not found: {filepath}")
+        
+        return pd.read_csv(filepath)
+
+    def load_predictive_matrix(self, matrix_path: Path) -> pd.DataFrame:
+        """Load the predictive feature matrix."""
+        if not matrix_path.exists():
+            raise FileNotFoundError(f"Predictive matrix not found: {matrix_path}")
+        
+        if matrix_path.suffix == '.parquet':
+            df = pd.read_parquet(matrix_path)
+        else:
+            df = pd.read_csv(matrix_path)
+            if self.timestamp_column in df.columns:
+                df[self.timestamp_column] = pd.to_datetime(df[self.timestamp_column])
+        
+        return df
+
+    def normalize_features(self, df: pd.DataFrame, features: List[str]) -> pd.DataFrame:
+        """
+        Normalize features using rolling/expanding/global z-score.
+        """
+        normalized_df = df.copy()
+        
+        for feature in features:
+            # Check if feature exists
+            if feature not in df.columns:
+                print(f"  Warning: Feature '{feature}' not found in dataframe, skipping")
+                continue
+            
+            series = df[feature]
+            
+            # Remove NaN for statistics
+            clean_series = series.dropna()
+            
+            if len(clean_series) == 0:
+                normalized_df[feature] = 0.0
+                continue
+            
+            if self.normalization_method == "rolling":
+                # Rolling z-score (no look-ahead bias)
+                rolling_mean = series.rolling(window=self.normalization_window, min_periods=10).mean()
+                rolling_std = series.rolling(window=self.normalization_window, min_periods=10).std()
+                normalized_df[feature] = (series - rolling_mean) / (rolling_std + 1e-12)
+                # Fill initial NaN with global normalization
+                if normalized_df[feature].isna().all():
+                    global_mean = clean_series.mean()
+                    global_std = clean_series.std()
+                    if global_std > 0:
+                        normalized_df[feature] = (series - global_mean) / global_std
+                    else:
+                        normalized_df[feature] = 0.0
+            
+            elif self.normalization_method == "expanding":
+                # Expanding z-score (no look-ahead bias)
+                expanding_mean = series.expanding(min_periods=10).mean()
+                expanding_std = series.expanding(min_periods=10).std()
+                normalized_df[feature] = (series - expanding_mean) / (expanding_std + 1e-12)
+            
+            else:
+                # Global z-score (has look-ahead bias - for research only)
+                mean = clean_series.mean()
+                std = clean_series.std()
+                if std > 0:
+                    normalized_df[feature] = (series - mean) / std
+                else:
+                    normalized_df[feature] = 0.0
+        
+        return normalized_df
+
+    def compute_weights(self, feature_scores: pd.DataFrame, features: List[str]) -> pd.Series:
+        """
+        Compute weights for selected features.
+        """
+        # Filter scores for selected features
+        filtered_scores = feature_scores[feature_scores['feature'].isin(features)]
+        
+        # Compute weights using strategy
+        weights = self.weighting_strategy.compute_weights(filtered_scores)
+        
+        # Ensure all selected features have weights
+        for feature in features:
+            if feature not in weights.index:
+                weights[feature] = 0.0
+        
+        return weights
+
+    def construct_signal(
+        self,
+        normalized_df: pd.DataFrame,
+        weights: pd.Series,
+        features: List[str]
+    ) -> Tuple[pd.Series, pd.Series]:
+        """
+        Construct signal as weighted sum of normalized features.
+        """
+        signal = pd.Series(0.0, index=normalized_df.index)
+        available_features = []
+        
+        for feature in features:
+            # Check if feature exists in normalized_df
+            if feature not in normalized_df.columns:
+                print(f"  Warning: Feature '{feature}' not normalized, skipping")
+                continue
+            
+            weight = weights.get(feature, 0.0)
+            if weight > 0:
+                # Check if feature has any non-NaN values
+                if normalized_df[feature].notna().any():
+                    signal += weight * normalized_df[feature].fillna(0)
+                    available_features.append(feature)
+        
+        # If missing features, renormalize weights for available features
+        if self.handle_missing and len(available_features) < len(features):
+            available_weights = weights[available_features]
+            if len(available_weights) > 0 and available_weights.sum() > 0:
+                # Renormalize to sum to 1
+                normalized_weights = available_weights / available_weights.sum()
+                # Reconstruct signal with renormalized weights
+                signal = pd.Series(0.0, index=normalized_df.index)
+                for feature in available_features:
+                    signal += normalized_weights[feature] * normalized_df[feature].fillna(0)
+        
+        return signal, pd.Series(available_features)
+
+    def normalize_signal(self, signal: pd.Series) -> pd.Series:
+        """
+        Normalize signal using tanh or clip.
+        """
+        clean_signal = signal.dropna()
+        
+        if len(clean_signal) == 0:
+            return pd.Series(0.0, index=signal.index)
+        
+        if self.signal_scaling == "tanh":
+            # Tanh scaling (smooth, no hard clipping)
+            normalized = np.tanh(signal)
+        else:
+            # Clip scaling (hard clipping)
+            # Use robust scaling to handle outliers
+            median = clean_signal.median()
+            q75 = clean_signal.quantile(0.75)
+            q25 = clean_signal.quantile(0.25)
+            iqr = q75 - q25
+            
+            if iqr > 0:
+                scaled = (signal - median) / (iqr * 1.5)
+                normalized = np.clip(scaled, -1.0, 1.0)
+            else:
+                normalized = pd.Series(0.0, index=signal.index)
+        
+        return normalized
+
+    def compute_signal_components(
+        self,
+        normalized_df: pd.DataFrame,
+        weights: pd.Series,
+        features: List[str]
+    ) -> Tuple[pd.DataFrame, pd.Series]:
+        """
+        Compute individual component contributions and percentages.
+        """
+        components = pd.DataFrame(index=normalized_df.index)
+        total_abs = pd.Series(0.0, index=normalized_df.index)
+        
+        for feature in features:
+            if feature not in normalized_df.columns:
+                continue
+            
+            weight = weights.get(feature, 0.0)
+            if weight > 0:
+                component = weight * normalized_df[feature].fillna(0)
+                components[feature] = component
+                total_abs += abs(component)
+        
+        # Compute contribution percentages
+        contribution_pcts = pd.Series(index=components.columns)
+        for feature in components.columns:
+            total_abs_feature = abs(components[feature]).sum()
+            if total_abs.sum() > 0:
+                contribution_pcts[feature] = total_abs_feature / total_abs.sum() * 100
+            else:
+                contribution_pcts[feature] = 0.0
+        
+        return components, contribution_pcts
+
+    def compute_statistics(
+        self,
+        signal: pd.Series,
+        normalized_signal: pd.Series,
+        features: List[str],
+        weights: pd.Series
+    ) -> Dict[str, Any]:
+        """
+        Compute signal statistics.
+        """
+        clean_signal = normalized_signal.dropna()
+        
+        if len(clean_signal) == 0:
+            return {
+                'total_features': len(features),
+                'signal_mean': 0.0,
+                'signal_median': 0.0,
+                'signal_std': 0.0,
+                'signal_min': 0.0,
+                'signal_max': 0.0,
+                'positive_pct': 0.0,
+                'negative_pct': 0.0,
+                'neutral_pct': 0.0,
+                'skewness': 0.0,
+                'kurtosis': 0.0,
+                'total_rows': len(signal),
+                'feature_weights': weights.to_dict()
+            }
+        
+        positive = np.sum(clean_signal > 0.05)
+        negative = np.sum(clean_signal < -0.05)
+        neutral = np.sum((clean_signal >= -0.05) & (clean_signal <= 0.05))
+        
+        stats_dict = {
+            'total_features': len(features),
+            'signal_mean': float(clean_signal.mean()),
+            'signal_median': float(clean_signal.median()),
+            'signal_std': float(clean_signal.std()),
+            'signal_min': float(clean_signal.min()),
+            'signal_max': float(clean_signal.max()),
+            'positive_pct': positive / len(clean_signal) * 100,
+            'negative_pct': negative / len(clean_signal) * 100,
+            'neutral_pct': neutral / len(clean_signal) * 100,
+            'skewness': float(stats.skew(clean_signal)),
+            'kurtosis': float(stats.kurtosis(clean_signal)),
+            'total_rows': len(signal),
+            'feature_weights': weights.to_dict()
+        }
+        
+        return stats_dict
+
+    def save_outputs(
+        self,
+        signal_matrix: pd.DataFrame,
+        raw_signal: pd.Series,
+        normalized_signal: pd.Series,
+        components: pd.DataFrame,
+        contribution_pcts: pd.Series,
+        stats: Dict[str, Any],
+        output_dir: Path
+    ) -> None:
+        """Save all outputs."""
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Signal matrix
+        matrix_path = output_dir / "signal_matrix.parquet"
+        signal_matrix.to_parquet(matrix_path, index=False)
+        print(f"  Saved signal matrix to {matrix_path}")
+        
+        # Raw signal
+        raw_df = pd.DataFrame({'timestamp': raw_signal.index, 'raw_signal': raw_signal.values})
+        if self.timestamp_column in raw_df.columns:
+            raw_df = raw_df.rename(columns={'timestamp': self.timestamp_column})
+        raw_path = output_dir / "raw_signal.csv"
+        raw_df.to_csv(raw_path, index=False)
+        print(f"  Saved raw signal to {raw_path}")
+        
+        # Normalized signal
+        norm_df = pd.DataFrame({'timestamp': normalized_signal.index, 'normalized_signal': normalized_signal.values})
+        if self.timestamp_column in norm_df.columns:
+            norm_df = norm_df.rename(columns={'timestamp': self.timestamp_column})
+        norm_path = output_dir / "normalized_signal.csv"
+        norm_df.to_csv(norm_path, index=False)
+        print(f"  Saved normalized signal to {norm_path}")
+        
+        # Signal components
+        comp_df = components.reset_index()
+        comp_path = output_dir / "signal_components.csv"
+        comp_df.to_csv(comp_path, index=False)
+        print(f"  Saved signal components to {comp_path}")
+        
+        # Contribution percentages
+        contrib_df = pd.DataFrame({
+            'feature': contribution_pcts.index,
+            'contribution_percentage': contribution_pcts.values
+        }).sort_values('contribution_percentage', ascending=False)
+        contrib_path = output_dir / "contribution_percentages.csv"
+        contrib_df.to_csv(contrib_path, index=False)
+        print(f"  Saved contribution percentages to {contrib_path}")
+        
+        # Statistics
+        stats_df = pd.DataFrame([stats])
+        stats_path = output_dir / "signal_statistics.csv"
+        stats_df.to_csv(stats_path, index=False)
+        print(f"  Saved statistics to {stats_path}")
+
+    def compute(
+        self,
+        selected_features_path: Path,
+        feature_scores_path: Path,
+        predictive_matrix_path: Path,
+        output_dir: Optional[Path] = None
+    ) -> SignalConstructionResult:
+        """
+        Main computation method.
+        """
+        print("\n  Computing Signal Construction...")
+        print(f"  Normalization method: {self.normalization_method}")
+        print(f"  Signal scaling: {self.signal_scaling}")
+        
+        if output_dir is None:
+            output_dir = Path("data/feature_store/signal")
+        
+        # Step 1: Load selected features
+        print(f"  Loading selected features from: {selected_features_path}")
+        selected_features = self.load_selected_features(selected_features_path)
+        print(f"  Found {len(selected_features)} selected features")
+        
+        if not selected_features:
+            raise ValueError("No selected features found")
+        
+        # Step 2: Load feature scores
+        print(f"  Loading feature scores from: {feature_scores_path}")
+        feature_scores = self.load_feature_scores(feature_scores_path)
+        print(f"  Loaded {len(feature_scores)} feature scores")
+        
+        # Step 3: Load predictive matrix
+        print(f"  Loading predictive matrix from: {predictive_matrix_path}")
+        predictive_df = self.load_predictive_matrix(predictive_matrix_path)
+        print(f"  Shape: {predictive_df.shape}")
+        
+        # Step 4: Compute weights
+        print("  Computing feature weights...")
+        weights = self.compute_weights(feature_scores, selected_features)
+        print(f"  Computed {len(weights)} weights")
+        
+        # Step 5: Normalize features (no look-ahead bias)
+        print(f"  Normalizing features using {self.normalization_method}...")
+        normalized_df = self.normalize_features(predictive_df, selected_features)
+        
+        # Step 6: Construct signal
+        print("  Constructing signal...")
+        raw_signal, available_features = self.construct_signal(normalized_df, weights, selected_features)
+        print(f"  Used {len(available_features)} features in signal")
+        
+        # Step 7: Normalize signal
+        print(f"  Normalizing signal using {self.signal_scaling}...")
+        normalized_signal = self.normalize_signal(raw_signal)
+        
+        # Step 8: Compute components and contributions
+        print("  Computing signal components...")
+        components, contribution_pcts = self.compute_signal_components(
+            normalized_df, weights, selected_features
+        )
+        
+        # Step 9: Compute statistics
+        print("  Computing signal statistics...")
+        stats = self.compute_statistics(
+            raw_signal, normalized_signal, selected_features, weights
+        )
+        
+        # Step 10: Build signal matrix
+        signal_matrix = pd.DataFrame({
+            self.timestamp_column: predictive_df[self.timestamp_column],
+            'raw_signal': raw_signal.values,
+            'normalized_signal': normalized_signal.values
+        })
+        
+        # Save outputs
+        print("\n  Saving outputs...")
+        self.save_outputs(
+            signal_matrix, raw_signal, normalized_signal,
+            components, contribution_pcts, stats, output_dir
+        )
+        
+        print(f"\n  Signal Construction Summary:")
+        print(f"    Total Features: {stats['total_features']}")
+        print(f"    Signal Mean: {stats['signal_mean']:.4f}")
+        print(f"    Signal Std: {stats['signal_std']:.4f}")
+        print(f"    Positive: {stats['positive_pct']:.1f}%")
+        print(f"    Negative: {stats['negative_pct']:.1f}%")
+        print(f"    Neutral: {stats['neutral_pct']:.1f}%")
+        
+        return SignalConstructionResult(
+            signal_matrix=signal_matrix,
+            raw_signal=raw_signal,
+            normalized_signal=normalized_signal,
+            signal_components=components,
+            contribution_percentages=contribution_pcts,
+            summary_statistics=stats
+        )

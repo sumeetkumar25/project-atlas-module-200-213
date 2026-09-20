@@ -1,0 +1,9 @@
+# atlas/modules/module207_signal_confidence/__init__.py
+"""
+Module 207
+Signal Confidence
+"""
+
+from .module import SignalConfidenceResearch
+
+__all__ = ["SignalConfidenceResearch"]

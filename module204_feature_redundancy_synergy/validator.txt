@@ -1,0 +1,146 @@
+# atlas/modules/module204_feature_redundancy_synergy/validator.py
+"""
+Module 204 - Feature Redundancy & Synergy Validator
+"""
+
+import numpy as np
+import pandas as pd
+from .engine import FeatureRedundancySynergyResult
+from .statistics import FeatureRedundancySynergyStatistics
+
+
+class FeatureRedundancySynergyValidator:
+    """Validator for feature redundancy and synergy results."""
+
+    def __init__(self, timestamp_column: str = "timestamp"):
+        self.timestamp_column = timestamp_column
+
+    def validate(
+        self,
+        result: FeatureRedundancySynergyResult,
+        statistics: FeatureRedundancySynergyStatistics
+    ) -> bool:
+        """Validate results and statistics."""
+        issues = []
+        warnings = []
+        
+        # Check optimal matrix
+        if result.optimal_matrix.empty:
+            issues.append("Optimal matrix is empty")
+        else:
+            if self.timestamp_column not in result.optimal_matrix.columns:
+                issues.append("Missing timestamp column")
+        
+        # Check redundancy table
+        if result.redundancy_table.empty:
+            issues.append("Redundancy table is empty")
+        else:
+            required_cols = ['feature_a', 'feature_b', 'composite_score', 'decision']
+            missing = set(required_cols) - set(result.redundancy_table.columns)
+            if missing:
+                issues.append(f"Missing columns in redundancy table: {missing}")
+            
+            # Check scores are in [0, 1]
+            if 'composite_score' in result.redundancy_table.columns:
+                if not np.all((0 <= result.redundancy_table['composite_score']) & 
+                            (result.redundancy_table['composite_score'] <= 1)):
+                    issues.append("Composite scores outside [0, 1] range")
+            
+            # Check no duplicate pairs
+            pairs = set(zip(result.redundancy_table['feature_a'], 
+                          result.redundancy_table['feature_b']))
+            if len(pairs) != len(result.redundancy_table):
+                issues.append("Duplicate feature pairs found")
+        
+        # Check synergy matrix
+        if result.synergy_matrix.empty:
+            issues.append("Synergy matrix is empty")
+        else:
+            # Check symmetry
+            if not np.allclose(result.synergy_matrix.values, 
+                              result.synergy_matrix.values.T, atol=1e-10):
+                issues.append("Synergy matrix is not symmetric")
+        
+        # Check conditional information
+        if result.conditional_info.empty:
+            issues.append("Conditional information is empty")
+        else:
+            # Check conditional MI >= 0
+            if 'conditional_mi' in result.conditional_info.columns:
+                if not np.all(result.conditional_info['conditional_mi'] >= 0):
+                    issues.append("Conditional MI values are negative")
+        
+        # Check clusters
+        if result.feature_clusters.empty:
+            issues.append("Feature clusters is empty")
+        
+        # Check kept/removed lists
+        total = len(result.kept_features) + len(result.removed_features)
+        if total != result.summary_statistics['total_features']:
+            issues.append(
+                f"Feature count mismatch: {total} vs {result.summary_statistics['total_features']}"
+            )
+        
+        # Check statistics match result
+        if statistics.total_features != result.summary_statistics['total_features']:
+            issues.append(
+                f"Total features mismatch: stats={statistics.total_features}, "
+                f"result={result.summary_statistics['total_features']}"
+            )
+        
+        if statistics.kept_features != len(result.kept_features):
+            issues.append(
+                f"Kept features mismatch: stats={statistics.kept_features}, "
+                f"result={len(result.kept_features)}"
+            )
+        
+        if statistics.removed_features != len(result.removed_features):
+            issues.append(
+                f"Removed features mismatch: stats={statistics.removed_features}, "
+                f"result={len(result.removed_features)}"
+            )
+        
+        if statistics.unique_clusters != result.feature_clusters['cluster'].nunique():
+            issues.append(
+                f"Unique clusters mismatch: stats={statistics.unique_clusters}, "
+                f"result={result.feature_clusters['cluster'].nunique()}"
+            )
+        
+        # Warnings (non-fatal)
+        if statistics.kept_percentage < 30:
+            warnings.append(f"Low kept percentage: {statistics.kept_percentage:.1f}%")
+        
+        if statistics.avg_conditional_mi < 0.1:
+            warnings.append(f"Low average conditional MI: {statistics.avg_conditional_mi:.3f}")
+        
+        if warnings:
+            print("\n  WARNINGS:")
+            for warning in warnings:
+                print(f"    ⚠ {warning}")
+        
+        if issues:
+            raise ValueError(
+                f"Feature Redundancy & Synergy validation failed with {len(issues)} issue(s):\n" +
+                "\n".join(f"  - {issue}" for issue in issues)
+            )
+        
+        return True
+
+
+def run_validation(result, statistics):
+    """Run validation with user-friendly output."""
+    validator = FeatureRedundancySynergyValidator()
+    
+    print("\n" + "=" * 60)
+    print("FEATURE REDUNDANCY & SYNERGY VALIDATION")
+    print("=" * 60)
+    
+    try:
+        validator.validate(result, statistics)
+        print("\n  ✓ All validation checks passed")
+        print("=" * 60)
+        return True
+    except ValueError as e:
+        print(e)
+        print("=" * 60)
+        return False
