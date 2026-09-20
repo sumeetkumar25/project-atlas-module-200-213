@@ -1,0 +1,9 @@
+# atlas/modules/module203_feature_predictive_power/__init__.py
+"""
+Module 203
+Feature Predictive Power
+"""
+
+from .module import FeaturePredictivePowerResearch
+
+__all__ = ["FeaturePredictivePowerResearch"]

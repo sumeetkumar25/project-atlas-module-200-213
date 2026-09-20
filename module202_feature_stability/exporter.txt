@@ -1,0 +1,55 @@
+# atlas/modules/module202_feature_stability/exporter.py
+"""
+Module 202 - Feature Stability Exporter
+"""
+
+import pandas as pd
+from pathlib import Path
+
+
+class FeatureStabilityExporter:
+    """Exporter for feature stability results."""
+    
+    @staticmethod
+    def export_stable_matrix(df: pd.DataFrame, filepath: str):
+        """Export stable matrix to Parquet."""
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_parquet(path, index=False)
+    
+    @staticmethod
+    def export_feature_stability(df: pd.DataFrame, filepath: str):
+        """Export feature stability to CSV."""
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(path, index=False)
+    
+    @staticmethod
+    def export_rolling_statistics(df: pd.DataFrame, filepath: str):
+        """Export rolling statistics to CSV."""
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(path, index=False)
+    
+    @staticmethod
+    def export_regime_statistics(df: pd.DataFrame, filepath: str):
+        """Export regime statistics to CSV."""
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(path, index=False)
+    
+    @staticmethod
+    def export_removed_features(features: list, filepath: str):
+        """Export removed features to CSV."""
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df = pd.DataFrame({'removed_features': features})
+        df.to_csv(path, index=False)
+    
+    @staticmethod
+    def export_summary(summary: dict, filepath: str):
+        """Export summary to CSV."""
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df = pd.DataFrame([summary])
+        df.to_csv(path, index=False)

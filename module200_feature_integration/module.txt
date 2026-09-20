@@ -1,0 +1,236 @@
+# atlas/modules/module200_feature_integration/module.py
+"""
+Module 200
+Feature Integration
+
+Validates and normalizes the master feature matrix.
+
+Pipeline: load master matrix → validate → remove duplicates/constants →
+          normalize → build feature index → save integrated matrix
+"""
+
+from typing import Optional, Dict, Any
+import pandas as pd
+from pathlib import Path
+
+from atlas.core.base_research_module import BaseResearchModule
+from atlas.framework.registry import AtlasRegistry
+
+from .engine import FeatureIntegrationEngine
+from .statistics import FeatureIntegrationStatisticsEngine
+from .validator import run_validation
+from .report import FeatureIntegrationReport
+from .exporter import FeatureIntegrationExporter
+
+
+class FeatureIntegrationResearch(BaseResearchModule):
+    """Main research module for feature integration."""
+    
+    MODULE_OUTPUT = "module200"
+    METADATA = FeatureIntegrationStatisticsEngine.METADATA
+    
+    def __init__(
+        self,
+        registry: Optional[AtlasRegistry] = None,
+        timestamp_column: str = "timestamp",
+        remove_duplicates: bool = True,
+        remove_constant: bool = True,
+        normalize: bool = True
+    ):
+        """
+        Initialize the feature integration module.
+        
+        Args:
+            registry: Optional Atlas registry
+            timestamp_column: Name of the timestamp column
+            remove_duplicates: Whether to remove duplicate columns
+            remove_constant: Whether to remove constant columns
+            normalize: Whether to normalize features
+        """
+        super().__init__(
+            module_name="Feature Integration",
+            module_version=self.METADATA["version"],
+        )
+        
+        self.registry = registry or AtlasRegistry()
+        self.engine = FeatureIntegrationEngine(
+            timestamp_column=timestamp_column,
+            remove_duplicates=remove_duplicates,
+            remove_constant=remove_constant,
+            normalize=normalize
+        )
+        self.stats_engine = FeatureIntegrationStatisticsEngine()
+        self.result_data = None
+        self.statistics = None
+        self.feature_index_report = None
+        self._output_dir = None
+        self._master_path = None
+        self._metadata_path = None
+
+    def _register_pipeline_steps(self):
+        """Register pipeline steps."""
+        self.pipeline_steps = [
+            ("feature_integration", self._integrate_features),
+            ("statistics", self._compute_statistics),
+            ("validate", self._validate),
+            ("export", self._export_results),
+        ]
+    
+    def _prepare_data(self) -> Dict[str, Any]:
+        """Prepare data from DataFrame."""
+        if self._master_path is None:
+            raise ValueError("Master path not provided. Use run_integration() method.")
+        return {
+            "master_path": self._master_path,
+            "metadata_path": self._metadata_path,
+            "output_dir": self._output_dir
+        }
+    
+    def _integrate_features(self) -> Dict[str, Any]:
+        """Step 1: Integrate features."""
+        self.logger.info("Step 1: Integrating features")
+        
+        prepared = self._prepare_data()
+        
+        self.result_data = self.engine.compute(
+            master_path=prepared["master_path"],
+            metadata_path=prepared["metadata_path"],
+            output_dir=prepared["output_dir"]
+        )
+        
+        self.logger.metric(
+            "Total Features",
+            str(self.result_data.summary_statistics["total_features"])
+        )
+        self.logger.metric(
+            "Normalized",
+            str(self.result_data.summary_statistics["normalized_features"])
+        )
+        self.logger.metric(
+            "Removed Duplicates",
+            str(self.result_data.summary_statistics["removed_duplicates"])
+        )
+        self.logger.metric(
+            "Removed Constants",
+            str(self.result_data.summary_statistics["removed_constants"])
+        )
+        self.logger.success("Feature integration complete")
+        
+        # Generate report
+        self.feature_index_report = FeatureIntegrationReport.generate_feature_index(
+            self.result_data.feature_index,
+            top_n=20
+        )
+        
+        return {
+            "total_features": self.result_data.summary_statistics["total_features"],
+            "normalized_features": self.result_data.summary_statistics["normalized_features"],
+            "removed_duplicates": self.result_data.summary_statistics["removed_duplicates"],
+            "removed_constants": self.result_data.summary_statistics["removed_constants"]
+        }
+    
+    def _compute_statistics(self) -> Dict[str, Any]:
+        """Step 2: Computing statistics."""
+        self.logger.info("Step 2: Computing statistics")
+        self.statistics = self.stats_engine.analyze(self.result_data)
+        
+        self.logger.metric(
+            "Feature Density",
+            f"{self.statistics.feature_density:.2%}"
+        )
+        self.logger.metric(
+            "Memory",
+            f"{self.statistics.memory_usage_mb:.2f} MB"
+        )
+        self.logger.success("Statistics computed")
+        
+        return self.stats_engine.summary_dict(self.statistics)
+    
+    def _validate(self) -> Dict[str, Any]:
+        """Step 3: Validation."""
+        self.logger.info("Step 3: Validation")
+        passed = run_validation(self.result_data, self.statistics)
+        self.logger.success("Validation complete")
+        return {"software_validation_passed": passed}
+    
+    def _export_results(self) -> Dict[str, Any]:
+        """Step 4: Export."""
+        self.logger.info("Step 4: Export")
+        
+        # Register DataFrames as artifacts
+        self.result.artifacts["integrated_matrix"] = self.result_data.integrated_matrix
+        self.result.artifacts["feature_index"] = self.result_data.feature_index
+        
+        # Store summary
+        summary_df = pd.DataFrame([self.result_data.summary_statistics])
+        self.result.artifacts["integration_summary"] = summary_df
+        
+        # Generate and register reports
+        main_report = FeatureIntegrationReport.generate(
+            self.statistics,
+            metadata=self.METADATA,
+            dataset_name=self.result.dataset_identifier,
+        )
+        self.result.artifacts["feature_integration_report"] = main_report
+        self.result.artifacts["feature_index_report"] = self.feature_index_report
+        
+        self.logger.metric("Artifacts", str(len(self.result.artifacts)))
+        self.logger.success("Export complete")
+        
+        return {
+            "export_status": "complete",
+            "artifact_count": len(self.result.artifacts),
+            "total_features": self.result_data.summary_statistics["total_features"]
+        }
+    
+    def compute(self) -> Dict[str, Any]:
+        """Run the full computation pipeline."""
+        self.logger.section("Feature Integration Pipeline")
+        results = self.execute_pipeline()
+        self.result.status = "completed"
+        self.logger.success("Module 200 complete")
+        return results
+    
+    def run(self, filepath: str, output_dir=None):
+        """Run module on file."""
+        self._output_dir = Path(output_dir) if output_dir else None
+        return super().run(filepath, output_dir)
+    
+    def run_dataframe(self, df, dataset_id="in_memory", output_dir=None):
+        """Run module on a single DataFrame."""
+        self._output_dir = Path(output_dir) if output_dir else None
+        return super().run_dataframe(df, dataset_id, output_dir)
+    
+    def run_integration(
+        self,
+        master_path: Path,
+        metadata_path: Optional[Path] = None,
+        dataset_id: str = "feature_integration",
+        output_dir: Optional[Path] = None
+    ) -> Any:
+        """
+        Run the feature integration.
+        
+        Args:
+            master_path: Path to the master feature matrix
+            metadata_path: Path to the feature metadata
+            dataset_id: Identifier for the dataset
+            output_dir: Output directory for results
+        """
+        self._master_path = master_path
+        self._metadata_path = metadata_path
+        self._output_dir = Path(output_dir) if output_dir else Path("data/feature_store/master")
+        
+        # Create a dummy DataFrame to satisfy BaseResearchModule
+        dummy = pd.DataFrame(
+            {
+                "timestamp": [pd.Timestamp("2000-01-01")]
+            }
+        )
+        
+        # Let BaseResearchModule.run_dataframe() initialize everything
+        return super().run_dataframe(
+            dummy,
+            dataset_id=dataset_id,
+            output_dir=self._output_dir
+        )

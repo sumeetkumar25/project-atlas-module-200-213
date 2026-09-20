@@ -1,0 +1,1 @@
+python -m atlas.modules.module202_feature_stability.test_module

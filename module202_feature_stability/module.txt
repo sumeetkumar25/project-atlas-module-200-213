@@ -1,0 +1,239 @@
+# atlas/modules/module202_feature_stability/module.py
+"""
+Module 202
+Feature Stability
+
+Determines which features remain statistically stable across time and regimes.
+
+Pipeline: load independent matrix → compute stability metrics → score features →
+          decisions → save stable matrix
+"""
+
+from typing import Optional, Dict, Any
+import pandas as pd
+from pathlib import Path
+
+from atlas.core.base_research_module import BaseResearchModule
+from atlas.framework.registry import AtlasRegistry
+
+from .engine import FeatureStabilityEngine
+from .statistics import FeatureStabilityStatisticsEngine
+from .validator import run_validation
+from .report import FeatureStabilityReport
+from .exporter import FeatureStabilityExporter
+
+
+class FeatureStabilityResearch(BaseResearchModule):
+    """Main research module for feature stability."""
+    
+    MODULE_OUTPUT = "module202"
+    METADATA = FeatureStabilityStatisticsEngine.METADATA
+    
+    def __init__(
+        self,
+        registry: Optional[AtlasRegistry] = None,
+        pass_threshold: float = 0.80,
+        warning_threshold: float = 0.60,
+        rolling_window: int = 500,
+        outlier_threshold: float = 3.0,
+        price_column: str = "close",
+        timestamp_column: str = "timestamp"
+    ):
+        """
+        Initialize the feature stability module.
+        
+        Args:
+            registry: Optional Atlas registry
+            pass_threshold: Score above this threshold = KEEP
+            warning_threshold: Score above this threshold = WARNING
+            rolling_window: Window size for rolling statistics
+            outlier_threshold: Z-score threshold for outliers
+            price_column: Column name for price data
+            timestamp_column: Column name for timestamp
+        """
+        super().__init__(
+            module_name="Feature Stability",
+            module_version=self.METADATA["version"],
+        )
+        
+        self.registry = registry or AtlasRegistry()
+        self.engine = FeatureStabilityEngine(
+            pass_threshold=pass_threshold,
+            warning_threshold=warning_threshold,
+            rolling_window=rolling_window,
+            outlier_threshold=outlier_threshold,
+            price_column=price_column,
+            timestamp_column=timestamp_column
+        )
+        self.stats_engine = FeatureStabilityStatisticsEngine()
+        self.result_data = None
+        self.statistics = None
+        self.stability_report = None
+        self._output_dir = None
+        self._matrix_path = None
+
+    def _register_pipeline_steps(self):
+        """Register pipeline steps."""
+        self.pipeline_steps = [
+            ("feature_stability", self._compute_stability),
+            ("statistics", self._compute_statistics),
+            ("validate", self._validate),
+            ("export", self._export_results),
+        ]
+    
+    def _prepare_data(self) -> Dict[str, Any]:
+        """Prepare data."""
+        if self._matrix_path is None:
+            raise ValueError("Matrix path not provided. Use run_stability() method.")
+        return {"matrix_path": self._matrix_path}
+    
+    def _compute_stability(self) -> Dict[str, Any]:
+        """Step 1: Compute feature stability."""
+        self.logger.info("Step 1: Computing feature stability")
+        
+        prepared = self._prepare_data()
+        
+        self.result_data = self.engine.compute(
+            matrix_path=prepared["matrix_path"],
+            output_dir=self._output_dir
+        )
+        
+        self.logger.metric(
+            "Total Features",
+            str(self.result_data.summary_statistics["total_features"])
+        )
+        self.logger.metric(
+            "KEPT",
+            str(self.result_data.summary_statistics["kept_count"])
+        )
+        self.logger.metric(
+            "REMOVED",
+            str(self.result_data.summary_statistics["removed_count"])
+        )
+        self.logger.metric(
+            "Avg Stability",
+            f"{self.result_data.summary_statistics['average_stability']:.3f}"
+        )
+        self.logger.success("Feature stability computed")
+        
+        # Generate report
+        self.stability_report = FeatureStabilityReport.generate_stability_table(
+            self.result_data.feature_stability,
+            top_n=10
+        )
+        
+        return {
+            "total_features": self.result_data.summary_statistics["total_features"],
+            "kept_count": self.result_data.summary_statistics["kept_count"],
+            "removed_count": self.result_data.summary_statistics["removed_count"],
+            "average_stability": self.result_data.summary_statistics["average_stability"]
+        }
+    
+    def _compute_statistics(self) -> Dict[str, Any]:
+        """Step 2: Computing statistics."""
+        self.logger.info("Step 2: Computing statistics")
+        self.statistics = self.stats_engine.analyze(self.result_data)
+        
+        self.logger.metric(
+            "Best Feature",
+            self.statistics.best_feature
+        )
+        self.logger.metric(
+            "Avg ADF p-value",
+            f"{self.statistics.average_adf_pvalue:.4f}"
+        )
+        self.logger.success("Statistics computed")
+        
+        return self.stats_engine.summary_dict(self.statistics)
+    
+    def _validate(self) -> Dict[str, Any]:
+        """Step 3: Validation."""
+        self.logger.info("Step 3: Validation")
+        passed = run_validation(self.result_data, self.statistics)
+        self.logger.success("Validation complete")
+        return {"software_validation_passed": passed}
+    
+    def _export_results(self) -> Dict[str, Any]:
+        """Step 4: Export."""
+        self.logger.info("Step 4: Export")
+        
+        # Register DataFrames as artifacts
+        self.result.artifacts["stable_matrix"] = self.result_data.stable_matrix
+        self.result.artifacts["feature_stability"] = self.result_data.feature_stability
+        self.result.artifacts["rolling_statistics"] = self.result_data.rolling_statistics
+        self.result.artifacts["regime_statistics"] = self.result_data.regime_statistics
+        
+        # Store removed features
+        removed_df = pd.DataFrame({'removed_features': self.result_data.removed_features})
+        self.result.artifacts["removed_features"] = removed_df
+        
+        # Store summary
+        summary_df = pd.DataFrame([self.result_data.summary_statistics])
+        self.result.artifacts["stability_summary"] = summary_df
+        
+        # Generate and register reports
+        main_report = FeatureStabilityReport.generate(
+            self.statistics,
+            metadata=self.METADATA,
+            dataset_name=self.result.dataset_identifier,
+        )
+        self.result.artifacts["feature_stability_report"] = main_report
+        self.result.artifacts["stability_report"] = self.stability_report
+        
+        self.logger.metric("Artifacts", str(len(self.result.artifacts)))
+        self.logger.success("Export complete")
+        
+        return {
+            "export_status": "complete",
+            "artifact_count": len(self.result.artifacts),
+            "kept_count": self.result_data.summary_statistics["kept_count"],
+            "removed_count": self.result_data.summary_statistics["removed_count"]
+        }
+    
+    def compute(self) -> Dict[str, Any]:
+        """Run the full computation pipeline."""
+        self.logger.section("Feature Stability Pipeline")
+        results = self.execute_pipeline()
+        self.result.status = "completed"
+        self.logger.success("Module 202 complete")
+        return results
+    
+    def run(self, filepath: str, output_dir=None):
+        """Run module on file."""
+        self._output_dir = Path(output_dir) if output_dir else None
+        return super().run(filepath, output_dir)
+    
+    def run_dataframe(self, df, dataset_id="in_memory", output_dir=None):
+        """Run module on a single DataFrame."""
+        self._output_dir = Path(output_dir) if output_dir else None
+        return super().run_dataframe(df, dataset_id, output_dir)
+    
+    def run_stability(
+        self,
+        matrix_path: Path,
+        dataset_id: str = "feature_stability",
+        output_dir: Optional[Path] = None
+    ) -> Any:
+        """
+        Run the feature stability analysis.
+        
+        Args:
+            matrix_path: Path to the independent feature matrix
+            dataset_id: Identifier for the dataset
+            output_dir: Output directory for results
+        """
+        self._matrix_path = matrix_path
+        self._output_dir = Path(output_dir) if output_dir else Path("data/feature_store/stable")
+        
+        # Create a dummy DataFrame to satisfy BaseResearchModule
+        dummy = pd.DataFrame(
+            {
+                "timestamp": [pd.Timestamp("2000-01-01")]
+            }
+        )
+        
+        return super().run_dataframe(
+            dummy,
+            dataset_id=dataset_id,
+            output_dir=self._output_dir
+        )

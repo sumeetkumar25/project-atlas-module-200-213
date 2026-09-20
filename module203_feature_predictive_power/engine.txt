@@ -1,0 +1,631 @@
+"""
+Module 203 - Feature Predictive Power Engine
+
+Measures how much future market information each stable feature contains.
+
+Metrics:
+  1. Information Coefficient (IC) - Pearson correlation
+  2. Rank IC - Spearman correlation
+  3. Mutual Information
+  4. Predictive Stability
+  5. Horizon Consistency
+  6. Direction Accuracy
+  7. Statistical Significance
+  8. False Discovery Correction (Benjamini-Hochberg)
+
+Output: Predictive feature scores and decisions.
+"""
+
+import numpy as np
+import pandas as pd
+from dataclasses import dataclass
+from typing import Optional, Dict, Any, List, Tuple
+from scipy import stats
+from scipy.stats import pearsonr, spearmanr, norm
+from sklearn.feature_selection import mutual_info_regression
+from statsmodels.stats.multitest import multipletests
+from pathlib import Path
+import warnings
+warnings.filterwarnings('ignore')
+
+
+@dataclass
+class FeaturePredictivePowerResult:
+    """Results from feature predictive power analysis."""
+    predictive_matrix: pd.DataFrame
+    feature_scores: pd.DataFrame
+    feature_rankings: pd.DataFrame
+    removed_features: List[str]
+    kept_features: List[str]
+    summary_statistics: Dict[str, Any]
+
+
+class FeaturePredictivePowerEngine:
+    """Core engine for feature predictive power analysis."""
+
+    # Default horizons
+    DEFAULT_HORIZONS = [1, 3, 5, 10, 20, 50]
+
+    # Columns to ignore
+    IGNORE_COLS = {"timestamp", "date", "time", "index", "close", "open", "high", "low", "volume"}
+
+    # Thresholds
+    PASS_THRESHOLD = 0.80
+    WARNING_THRESHOLD = 0.60
+
+    # FDR significance level
+    FDR_ALPHA = 0.05
+
+    # Normalization thresholds
+    IC_THRESHOLD = 0.10  # IC >= 0.10 is considered strong
+    MI_THRESHOLD = 0.10   # MI >= 0.10 is considered strong
+    STABILITY_THRESHOLD = 0.70  # Stability >= 0.70 is considered good
+    CONSISTENCY_THRESHOLD = 0.70  # Consistency >= 0.70 is considered good
+    DIRECTION_THRESHOLD = 0.60  # Direction accuracy >= 0.60 is considered good
+    SIGNIFICANCE_THRESHOLD = 0.80  # Significance >= 0.80 is considered good
+
+    def __init__(
+        self,
+        horizons: List[int] = None,
+        pass_threshold: float = 0.80,
+        warning_threshold: float = 0.60,
+        rolling_window: int = 100,
+        fdr_alpha: float = 0.05,
+        timestamp_column: str = "timestamp",
+        price_column: str = "close",
+        ic_threshold: float = 0.10,
+        mi_threshold: float = 0.10,
+        stability_threshold: float = 0.70,
+        consistency_threshold: float = 0.70,
+        direction_threshold: float = 0.60,
+        significance_threshold: float = 0.80
+    ):
+        """
+        Initialize the feature predictive power engine.
+        
+        Args:
+            horizons: List of forecast horizons
+            pass_threshold: Score above this threshold = KEEP
+            warning_threshold: Score above this threshold = WARNING
+            rolling_window: Window for rolling IC stability
+            fdr_alpha: False Discovery Rate significance level
+            timestamp_column: Name of the timestamp column
+            price_column: Name of the price column
+            ic_threshold: IC value considered "strong" (default 0.10)
+            mi_threshold: MI value considered "strong" (default 0.10)
+            stability_threshold: Stability value considered "good" (default 0.70)
+            consistency_threshold: Consistency value considered "good" (default 0.70)
+            direction_threshold: Direction accuracy considered "good" (default 0.60)
+            significance_threshold: Significance considered "good" (default 0.80)
+        """
+        self.horizons = horizons or self.DEFAULT_HORIZONS
+        self.pass_threshold = pass_threshold
+        self.warning_threshold = warning_threshold
+        self.rolling_window = rolling_window
+        self.fdr_alpha = fdr_alpha
+        self.timestamp_column = timestamp_column
+        self.price_column = price_column
+        self.ic_threshold = ic_threshold
+        self.mi_threshold = mi_threshold
+        self.stability_threshold = stability_threshold
+        self.consistency_threshold = consistency_threshold
+        self.direction_threshold = direction_threshold
+        self.significance_threshold = significance_threshold
+
+    def load_stable_matrix(self, matrix_path: Path) -> pd.DataFrame:
+        """Load the stable feature matrix."""
+        if not matrix_path.exists():
+            raise FileNotFoundError(f"Stable matrix not found: {matrix_path}")
+        
+        if matrix_path.suffix == '.parquet':
+            df = pd.read_parquet(matrix_path)
+        else:
+            df = pd.read_csv(matrix_path)
+            if self.timestamp_column in df.columns:
+                df[self.timestamp_column] = pd.to_datetime(df[self.timestamp_column])
+        
+        return df
+
+    def get_feature_columns(self, df: pd.DataFrame) -> List[str]:
+        """Get feature columns (exclude timestamp and OHLCV)."""
+        return [c for c in df.columns if c not in self.IGNORE_COLS and c != self.timestamp_column]
+
+    def compute_future_returns(self, df: pd.DataFrame, horizon: int) -> np.ndarray:
+        """Compute future returns for a given horizon."""
+        if self.price_column not in df.columns:
+            raise ValueError(f"Price column '{self.price_column}' not found")
+        
+        future_returns = df[self.price_column].shift(-horizon) / df[self.price_column] - 1
+        return future_returns.values
+
+    def compute_information_coefficient(
+        self,
+        feature: pd.Series,
+        future_returns: np.ndarray
+    ) -> Dict[str, float]:
+        """
+        Compute Information Coefficient (Pearson correlation).
+        """
+        clean_mask = ~(np.isnan(feature) | np.isnan(future_returns))
+        x = feature[clean_mask].values
+        y = future_returns[clean_mask]
+        
+        if len(x) < 10:
+            return {'ic': 0.0, 'ic_pvalue': 1.0}
+        
+        try:
+            ic, p_value = pearsonr(x, y)
+            return {'ic': float(ic), 'ic_pvalue': float(p_value)}
+        except:
+            return {'ic': 0.0, 'ic_pvalue': 1.0}
+
+    def compute_rank_ic(
+        self,
+        feature: pd.Series,
+        future_returns: np.ndarray
+    ) -> Dict[str, float]:
+        """
+        Compute Rank IC (Spearman correlation).
+        """
+        clean_mask = ~(np.isnan(feature) | np.isnan(future_returns))
+        x = feature[clean_mask].values
+        y = future_returns[clean_mask]
+        
+        if len(x) < 10:
+            return {'rank_ic': 0.0, 'rank_ic_pvalue': 1.0}
+        
+        try:
+            rank_ic, p_value = spearmanr(x, y)
+            return {'rank_ic': float(rank_ic), 'rank_ic_pvalue': float(p_value)}
+        except:
+            return {'rank_ic': 0.0, 'rank_ic_pvalue': 1.0}
+
+    def compute_mutual_information(
+        self,
+        feature: pd.Series,
+        future_returns: np.ndarray
+    ) -> float:
+        """
+        Compute Mutual Information between feature and future returns.
+        """
+        clean_mask = ~(np.isnan(feature) | np.isnan(future_returns))
+        x = feature[clean_mask].values.reshape(-1, 1)
+        y = future_returns[clean_mask]
+        
+        if len(x) < 10:
+            return 0.0
+        
+        try:
+            mi = mutual_info_regression(x, y, random_state=42)[0]
+            return float(min(1.0, max(0.0, mi)))
+        except:
+            return 0.0
+
+    def compute_predictive_stability(
+        self,
+        feature: pd.Series,
+        future_returns: np.ndarray
+    ) -> float:
+        """
+        Compute predictive stability using rolling IC.
+        """
+        clean_mask = ~(np.isnan(feature) | np.isnan(future_returns))
+        feature_clean = feature[clean_mask]
+        returns_clean = future_returns[clean_mask]
+        
+        if len(feature_clean) < self.rolling_window * 2:
+            return 0.0
+        
+        ics = []
+        n_windows = len(feature_clean) // self.rolling_window
+        
+        for i in range(n_windows - 1):
+            start = i * self.rolling_window
+            end = start + self.rolling_window
+            window_feature = feature_clean.iloc[start:end]
+            window_returns = returns_clean[start:end]
+            
+            try:
+                ic, _ = pearsonr(window_feature, window_returns)
+                ics.append(ic)
+            except:
+                continue
+        
+        if len(ics) < 2:
+            return 0.0
+        
+        # Stability = 1 - std(IC) (normalized)
+        ic_std = np.std(ics)
+        stability = max(0.0, 1.0 - min(1.0, ic_std * 5))
+        return float(stability)
+
+    def compute_horizon_consistency(
+        self,
+        feature: pd.Series,
+        df: pd.DataFrame,
+        horizons: List[int]
+    ) -> float:
+        """
+        Compute horizon consistency across different forecast horizons.
+        """
+        ics = []
+        
+        for horizon in horizons:
+            future_returns = self.compute_future_returns(df, horizon)
+            ic_result = self.compute_information_coefficient(feature, future_returns)
+            ics.append(ic_result['ic'])
+        
+        if len(ics) < 2:
+            return 0.0
+        
+        # Consistency = 1 - std(IC across horizons)
+        ic_std = np.std(ics)
+        consistency = max(0.0, 1.0 - min(1.0, ic_std * 5))
+        return float(consistency)
+
+    def compute_direction_accuracy(
+        self,
+        feature: pd.Series,
+        future_returns: np.ndarray
+    ) -> float:
+        """
+        Compute direction accuracy (feature predicts up/down).
+        """
+        clean_mask = ~(np.isnan(feature) | np.isnan(future_returns))
+        x = feature[clean_mask].values
+        y = future_returns[clean_mask]
+        
+        if len(x) < 10:
+            return 0.5
+        
+        # Sign of feature vs sign of return
+        feature_sign = np.sign(x)
+        return_sign = np.sign(y)
+        
+        correct = np.sum(feature_sign == return_sign)
+        return float(correct / len(x))
+
+    def normalize_metric(self, value: float, threshold: float, is_abs: bool = True) -> float:
+        """
+        Normalize a metric to [0, 1] based on a threshold.
+        
+        Args:
+            value: Raw metric value
+            threshold: Value considered "strong/good"
+            is_abs: Whether to use absolute value
+            
+        Returns:
+            Normalized score in [0, 1]
+        """
+        if is_abs:
+            value = abs(value)
+        
+        # If threshold is 0, return 0
+        if threshold == 0:
+            return 0.0
+        
+        # Normalize: value / threshold, capped at 1.0
+        normalized = min(1.0, value / threshold)
+        return max(0.0, normalized)
+
+    def compute_composite_score(self, metrics: Dict[str, float]) -> float:
+        """
+        Compute composite predictive score with normalized metrics.
+        
+        Each metric is normalized to [0, 1] based on thresholds:
+        - IC >= 0.10 -> 1.0 (strong predictive power)
+        - Rank IC >= 0.10 -> 1.0
+        - MI >= 0.10 -> 1.0
+        - Stability >= 0.70 -> 1.0
+        - Consistency >= 0.70 -> 1.0
+        - Direction Accuracy >= 0.60 -> 1.0
+        - Significance >= 0.80 -> 1.0
+        """
+        # Normalize each metric to [0, 1]
+        ic_score = self.normalize_metric(metrics.get('ic', 0), self.ic_threshold, is_abs=True)
+        rank_ic_score = self.normalize_metric(metrics.get('rank_ic', 0), self.ic_threshold, is_abs=True)
+        mi_score = self.normalize_metric(metrics.get('mutual_information', 0), self.mi_threshold, is_abs=False)
+        stability_score = self.normalize_metric(metrics.get('predictive_stability', 0), self.stability_threshold, is_abs=False)
+        consistency_score = self.normalize_metric(metrics.get('horizon_consistency', 0), self.consistency_threshold, is_abs=False)
+        direction_score = self.normalize_metric(metrics.get('direction_accuracy', 0), self.direction_threshold, is_abs=False)
+        significance_score = self.normalize_metric(metrics.get('significance', 0), self.significance_threshold, is_abs=False)
+        
+        # Weighted combination
+        weights = {
+            'ic': 0.30,
+            'rank_ic': 0.15,
+            'mutual_information': 0.20,
+            'predictive_stability': 0.15,
+            'horizon_consistency': 0.10,
+            'direction_accuracy': 0.05,
+            'significance': 0.05
+        }
+        
+        score = (
+            weights['ic'] * ic_score +
+            weights['rank_ic'] * rank_ic_score +
+            weights['mutual_information'] * mi_score +
+            weights['predictive_stability'] * stability_score +
+            weights['horizon_consistency'] * consistency_score +
+            weights['direction_accuracy'] * direction_score +
+            weights['significance'] * significance_score
+        )
+        
+        return np.clip(score, 0.0, 1.0)
+
+    def make_decision(self, score: float) -> str:
+        """Make KEEP/WARNING/REMOVE decision."""
+        if score >= self.pass_threshold:
+            return "KEEP"
+        elif score >= self.warning_threshold:
+            return "WARNING"
+        else:
+            return "REMOVE"
+
+    def apply_fdr_correction(
+        self,
+        p_values: np.ndarray,
+        alpha: float = 0.05
+    ) -> np.ndarray:
+        """
+        Apply Benjamini-Hochberg FDR correction to p-values.
+        
+        Args:
+            p_values: Array of p-values from hypothesis tests (one per feature)
+            alpha: FDR significance level
+            
+        Returns:
+            Boolean array indicating significant features
+        """
+        p_values = np.asarray(p_values, dtype=float)
+        
+        if p_values.size == 0:
+            return np.array([])
+        
+        # Handle NaN values
+        p_values = np.nan_to_num(p_values, nan=1.0)
+        
+        # Apply Benjamini-Hochberg correction
+        _, corrected_p, _, _ = multipletests(
+            p_values,
+            alpha=alpha,
+            method='fdr_bh'
+        )
+        
+        return corrected_p < alpha
+
+    def compute_statistics(
+        self,
+        feature_scores: pd.DataFrame,
+        kept_features: List[str],
+        removed_features: List[str]
+    ) -> Dict[str, Any]:
+        """Compute summary statistics."""
+        total = len(feature_scores)
+        scores = feature_scores['predictive_score']
+        
+        stats = {
+            'total_features': total,
+            'kept_count': len(kept_features),
+            'removed_count': len(removed_features),
+            'kept_percentage': len(kept_features) / total * 100 if total > 0 else 0,
+            'removed_percentage': len(removed_features) / total * 100 if total > 0 else 0,
+            'average_predictive_score': float(scores.mean()),
+            'median_predictive_score': float(scores.median()),
+            'min_predictive_score': float(scores.min()),
+            'max_predictive_score': float(scores.max()),
+            'best_feature': feature_scores.iloc[0]['feature'] if not feature_scores.empty else None,
+            'worst_feature': feature_scores.iloc[-1]['feature'] if not feature_scores.empty else None,
+            'average_ic': float(feature_scores['ic'].mean()) if not feature_scores.empty else 0,
+            'average_rank_ic': float(feature_scores['rank_ic'].mean()) if not feature_scores.empty else 0,
+            'average_mi': float(feature_scores['mutual_information'].mean()) if not feature_scores.empty else 0
+        }
+        
+        return stats
+
+    def save_outputs(
+        self,
+        df: pd.DataFrame,
+        kept_features: List[str],
+        removed_features: List[str],
+        feature_scores: pd.DataFrame,
+        feature_rankings: pd.DataFrame,
+        stats: Dict[str, Any],
+        output_dir: Path
+    ) -> None:
+        """Save all outputs."""
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Predictive matrix
+        predictive_df = df[[self.timestamp_column] + kept_features]
+        matrix_path = output_dir / "predictive_feature_matrix.parquet"
+        predictive_df.to_parquet(matrix_path, index=False)
+        print(f"  Saved predictive matrix to {matrix_path}")
+        
+        # Feature scores
+        scores_path = output_dir / "predictive_feature_scores.csv"
+        feature_scores.to_csv(scores_path, index=False)
+        print(f"  Saved feature scores to {scores_path}")
+        
+        # Feature rankings
+        rankings_path = output_dir / "feature_rankings.csv"
+        feature_rankings.to_csv(rankings_path, index=False)
+        print(f"  Saved feature rankings to {rankings_path}")
+        
+        # Removed features
+        removed_df = pd.DataFrame({'removed_features': removed_features})
+        removed_path = output_dir / "removed_non_predictive_features.csv"
+        removed_df.to_csv(removed_path, index=False)
+        print(f"  Saved removed features to {removed_path}")
+        
+        # Statistics
+        stats_df = pd.DataFrame([stats])
+        stats_path = output_dir / "prediction_statistics.csv"
+        stats_df.to_csv(stats_path, index=False)
+        print(f"  Saved statistics to {stats_path}")
+
+    def compute(self, matrix_path: Path, output_dir: Optional[Path] = None) -> FeaturePredictivePowerResult:
+        """Main computation method."""
+        print("\n  Computing Feature Predictive Power...")
+        
+        if output_dir is None:
+            output_dir = Path("data/feature_store/predictive")
+        
+        # Load stable matrix
+        print(f"  Loading stable matrix from: {matrix_path}")
+        df = self.load_stable_matrix(matrix_path)
+        print(f"  Shape: {df.shape}")
+        
+        # Get features
+        features = self.get_feature_columns(df)
+        print(f"  Found {len(features)} features")
+        
+        if not features:
+            raise ValueError("No features found for predictive power analysis")
+        
+        # Compute metrics for each feature
+        rows = []
+        kept = []
+        removed = []
+        
+        for feature in features:
+            series = df[feature]
+            
+            # Compute metrics across horizons
+            ic_values = []
+            rank_ic_values = []
+            mi_values = []
+            direction_accuracies = []
+            p_values = []
+            
+            for horizon in self.horizons:
+                future_returns = self.compute_future_returns(df, horizon)
+                
+                # IC
+                ic_result = self.compute_information_coefficient(series, future_returns)
+                ic_values.append(ic_result['ic'])
+                p_values.append(ic_result['ic_pvalue'])
+                
+                # Rank IC
+                rank_ic_result = self.compute_rank_ic(series, future_returns)
+                rank_ic_values.append(rank_ic_result['rank_ic'])
+                
+                # Mutual Information
+                mi = self.compute_mutual_information(series, future_returns)
+                mi_values.append(mi)
+                
+                # Direction Accuracy
+                dir_acc = self.compute_direction_accuracy(series, future_returns)
+                direction_accuracies.append(dir_acc)
+            
+            # Aggregate metrics (average across horizons)
+            avg_ic = np.mean(ic_values)
+            avg_rank_ic = np.mean(rank_ic_values)
+            avg_mi = np.mean(mi_values)
+            avg_dir_acc = np.mean(direction_accuracies)
+            
+            # Predictive stability (using first horizon)
+            first_returns = self.compute_future_returns(df, self.horizons[0])
+            predictive_stability = self.compute_predictive_stability(series, first_returns)
+            
+            # Horizon consistency
+            horizon_consistency = self.compute_horizon_consistency(series, df, self.horizons)
+            
+            # Average p-value
+            avg_p_value = np.mean(p_values)
+            
+            # Significance score (higher = more significant)
+            significance = 1.0 - min(1.0, avg_p_value * 10)
+            
+            # Compile metrics
+            metrics = {
+                'ic': avg_ic,
+                'rank_ic': avg_rank_ic,
+                'mutual_information': avg_mi,
+                'predictive_stability': predictive_stability,
+                'horizon_consistency': horizon_consistency,
+                'direction_accuracy': avg_dir_acc,
+                'significance': significance
+            }
+            
+            # Composite score with normalized metrics
+            predictive_score = self.compute_composite_score(metrics)
+            decision = self.make_decision(predictive_score)
+            
+            if decision in ["KEEP", "WARNING"]:
+                kept.append(feature)
+            else:
+                removed.append(feature)
+            
+            rows.append({
+                'feature': feature,
+                'ic': avg_ic,
+                'rank_ic': avg_rank_ic,
+                'mutual_information': avg_mi,
+                'predictive_stability': predictive_stability,
+                'horizon_consistency': horizon_consistency,
+                'direction_accuracy': avg_dir_acc,
+                'significance': significance,
+                'predictive_score': predictive_score,
+                'decision': decision,
+                'avg_p_value': avg_p_value
+            })
+        
+        # Create DataFrames
+        feature_scores = pd.DataFrame(rows)
+        feature_scores = feature_scores.sort_values('predictive_score', ascending=False).reset_index(drop=True)
+        
+        # Apply FDR correction to average p-values (one per feature)
+        feature_scores["fdr_significant"] = self.apply_fdr_correction(
+            feature_scores["avg_p_value"].to_numpy(),
+            self.fdr_alpha
+        )
+        
+        # Create rankings
+        feature_rankings = feature_scores[['feature', 'predictive_score']].copy()
+        feature_rankings['rank'] = feature_rankings['predictive_score'].rank(ascending=False).astype(int)
+        feature_rankings = feature_rankings.sort_values('rank')
+        
+        # Print feature scores before decisions
+        print("\n================ FEATURE SCORES ================\n")
+        print(
+            feature_scores[
+                [
+                    "feature",
+                    "ic",
+                    "rank_ic",
+                    "mutual_information",
+                    "predictive_stability",
+                    "horizon_consistency",
+                    "direction_accuracy",
+                    "significance",
+                    "predictive_score",
+                    "decision"
+                ]
+            ].to_string(index=False)
+        )
+        print("\n================================================\n")
+        
+        # Compute statistics
+        stats = self.compute_statistics(feature_scores, kept, removed)
+        
+        # Save outputs
+        print("\n  Saving outputs...")
+        self.save_outputs(df, kept, removed, feature_scores, feature_rankings, stats, output_dir)
+        
+        print(f"\n  Predictive Summary:")
+        print(f"    Total Features: {stats['total_features']}")
+        print(f"    Kept: {stats['kept_count']}")
+        print(f"    Removed: {stats['removed_count']}")
+        print(f"    Average Predictive Score: {stats['average_predictive_score']:.3f}")
+        print(f"    Average IC: {stats['average_ic']:.3f}")
+        print(f"    Average Rank IC: {stats['average_rank_ic']:.3f}")
+        
+        return FeaturePredictivePowerResult(
+            predictive_matrix=df[[self.timestamp_column] + kept],
+            feature_scores=feature_scores,
+            feature_rankings=feature_rankings,
+            removed_features=removed,
+            kept_features=kept,
+            summary_statistics=stats
+        )

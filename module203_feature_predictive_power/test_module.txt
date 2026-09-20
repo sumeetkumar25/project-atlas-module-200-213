@@ -1,0 +1,361 @@
+"""
+Module 203 - Integration Test
+
+Tests feature predictive power engine, statistics, validator, report, and pipeline.
+"""
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
+
+import numpy as np
+import pandas as pd
+import tempfile
+
+from atlas.modules.module203_feature_predictive_power.engine import FeaturePredictivePowerEngine
+from atlas.modules.module203_feature_predictive_power.statistics import FeaturePredictivePowerStatisticsEngine
+from atlas.modules.module203_feature_predictive_power.validator import run_validation
+from atlas.modules.module203_feature_predictive_power.module import FeaturePredictivePowerResearch
+
+
+def create_test_matrix(n=500, n_features=10):
+    """Create a synthetic feature matrix for testing."""
+    np.random.seed(42)
+    
+    timestamps = pd.date_range('2020-01-01', periods=n, freq='1h')
+    
+    df = pd.DataFrame({'timestamp': timestamps})
+    
+    # Add close price for future returns (as pandas Series)
+    close = pd.Series(
+        100 + np.cumsum(np.random.randn(n) * 0.5),
+        index=df.index
+    )
+    df['close'] = close
+    
+    # Predictive features (correlated with future returns)
+    df['predictive_feature'] = (
+        close.shift(-1) - close +
+        np.random.randn(n) * 0.5
+    )
+    
+    # Weakly predictive feature
+    df['weak_feature'] = (
+        np.random.randn(n) * 0.5 +
+        close.shift(-1) - close
+    )
+    
+    # Non-predictive feature
+    df['noise_feature'] = np.random.randn(n) * 10
+    
+    # More features
+    for i in range(4, n_features + 1):
+        df[f'feature_{i}'] = np.random.randn(n) * 10 + 50
+    
+    return df
+
+
+def test_engine_load():
+    """Test 1: Load stable matrix."""
+    print("\n" + "=" * 60)
+    print("TEST 1: Load Stable Matrix")
+    print("=" * 60)
+    
+    df = create_test_matrix()
+    engine = FeaturePredictivePowerEngine()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        matrix_path = tmp_path / "stable_feature_matrix.parquet"
+        df.to_parquet(matrix_path, index=False)
+        
+        loaded_df = engine.load_stable_matrix(matrix_path)
+        
+        assert not loaded_df.empty
+        assert 'timestamp' in loaded_df.columns
+        assert len(loaded_df) == len(df)
+    
+    print("  ✓ Load test passed")
+    return True
+
+
+def test_engine_future_returns():
+    """Test 2: Future returns computation."""
+    print("\n" + "=" * 60)
+    print("TEST 2: Future Returns")
+    print("=" * 60)
+    
+    df = create_test_matrix()
+    engine = FeaturePredictivePowerEngine()
+    
+    future_returns = engine.compute_future_returns(df, horizon=1)
+    
+    assert len(future_returns) == len(df)
+    assert np.isnan(future_returns[-1])  # Last value should be NaN
+    
+    print("  ✓ Future returns test passed")
+    return True
+
+
+def test_engine_information_coefficient():
+    """Test 3: Information Coefficient."""
+    print("\n" + "=" * 60)
+    print("TEST 3: Information Coefficient")
+    print("=" * 60)
+    
+    df = create_test_matrix()
+    engine = FeaturePredictivePowerEngine()
+    
+    future_returns = engine.compute_future_returns(df, horizon=1)
+    
+    # Predictive feature should have positive IC
+    ic_result = engine.compute_information_coefficient(df['predictive_feature'], future_returns)
+    assert ic_result['ic'] > 0.01
+    
+    # Noise feature should have near-zero IC
+    ic_result = engine.compute_information_coefficient(df['noise_feature'], future_returns)
+    assert abs(ic_result['ic']) < 0.1
+    
+    print("  ✓ IC test passed")
+    return True
+
+
+def test_engine_rank_ic():
+    """Test 4: Rank IC."""
+    print("\n" + "=" * 60)
+    print("TEST 4: Rank IC")
+    print("=" * 60)
+    
+    df = create_test_matrix()
+    engine = FeaturePredictivePowerEngine()
+    
+    future_returns = engine.compute_future_returns(df, horizon=1)
+    
+    rank_ic = engine.compute_rank_ic(df['predictive_feature'], future_returns)
+    assert rank_ic['rank_ic'] > 0.01
+    
+    print("  ✓ Rank IC test passed")
+    return True
+
+
+def test_engine_mutual_information():
+    """Test 5: Mutual Information."""
+    print("\n" + "=" * 60)
+    print("TEST 5: Mutual Information")
+    print("=" * 60)
+    
+    df = create_test_matrix()
+    engine = FeaturePredictivePowerEngine()
+    
+    future_returns = engine.compute_future_returns(df, horizon=1)
+    
+    mi = engine.compute_mutual_information(df['predictive_feature'], future_returns)
+    assert mi > 0
+    
+    print("  ✓ Mutual Information test passed")
+    return True
+
+
+def test_engine_predictive_stability():
+    """Test 6: Predictive stability."""
+    print("\n" + "=" * 60)
+    print("TEST 6: Predictive Stability")
+    print("=" * 60)
+    
+    df = create_test_matrix()
+    engine = FeaturePredictivePowerEngine(rolling_window=50)
+    
+    future_returns = engine.compute_future_returns(df, horizon=1)
+    
+    stability = engine.compute_predictive_stability(df['predictive_feature'], future_returns)
+    assert 0 <= stability <= 1
+    
+    print("  ✓ Predictive stability test passed")
+    return True
+
+
+def test_engine_compute():
+    """Test 7: Full engine computation."""
+    print("\n" + "=" * 60)
+    print("TEST 7: Full Engine Computation")
+    print("=" * 60)
+    
+    df = create_test_matrix()
+    engine = FeaturePredictivePowerEngine()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        matrix_path = tmp_path / "stable_feature_matrix.parquet"
+        output_dir = tmp_path / "output"
+        df.to_parquet(matrix_path, index=False)
+        
+        result = engine.compute(
+            matrix_path=matrix_path,
+            output_dir=output_dir
+        )
+        
+        assert not result.predictive_matrix.empty
+        assert not result.feature_scores.empty
+        assert not result.feature_rankings.empty
+        assert len(result.kept_features) > 0
+        assert result.summary_statistics['total_features'] > 0
+        
+        # Check outputs were saved
+        assert (output_dir / "predictive_feature_matrix.parquet").exists()
+        assert (output_dir / "predictive_feature_scores.csv").exists()
+        assert (output_dir / "feature_rankings.csv").exists()
+        assert (output_dir / "removed_non_predictive_features.csv").exists()
+        assert (output_dir / "prediction_statistics.csv").exists()
+    
+    print("  ✓ Full engine test passed")
+    return True
+
+
+def test_statistics():
+    """Test 8: Statistics engine."""
+    print("\n" + "=" * 60)
+    print("TEST 8: Statistics Engine")
+    print("=" * 60)
+    
+    df = create_test_matrix()
+    engine = FeaturePredictivePowerEngine()
+    stats_engine = FeaturePredictivePowerStatisticsEngine()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        matrix_path = tmp_path / "stable_feature_matrix.parquet"
+        output_dir = tmp_path / "output"
+        df.to_parquet(matrix_path, index=False)
+        
+        result = engine.compute(
+            matrix_path=matrix_path,
+            output_dir=output_dir
+        )
+        
+        stats = stats_engine.analyze(result)
+        
+        assert stats.total_features == result.summary_statistics['total_features']
+        assert stats.kept_count == len(result.kept_features)
+        assert stats.removed_count == len(result.removed_features)
+        assert stats.average_ic == result.summary_statistics['average_ic']
+    
+    print("  ✓ Statistics test passed")
+    return True
+
+
+def test_validator():
+    """Test 9: Validator."""
+    print("\n" + "=" * 60)
+    print("TEST 9: Validator")
+    print("=" * 60)
+    
+    df = create_test_matrix()
+    engine = FeaturePredictivePowerEngine()
+    stats_engine = FeaturePredictivePowerStatisticsEngine()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        matrix_path = tmp_path / "stable_feature_matrix.parquet"
+        output_dir = tmp_path / "output"
+        df.to_parquet(matrix_path, index=False)
+        
+        result = engine.compute(
+            matrix_path=matrix_path,
+            output_dir=output_dir
+        )
+        
+        stats = stats_engine.analyze(result)
+        
+        passed = run_validation(result, stats)
+        assert passed
+    
+    print("  ✓ Validator test passed")
+    return True
+
+
+def test_pipeline():
+    """Test 10: Full pipeline."""
+    print("\n" + "=" * 60)
+    print("TEST 10: Full Pipeline")
+    print("=" * 60)
+    
+    df = create_test_matrix()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        matrix_path = tmp_path / "stable_feature_matrix.parquet"
+        output_dir = tmp_path / "output"
+        df.to_parquet(matrix_path, index=False)
+        
+        research = FeaturePredictivePowerResearch()
+        
+        result = research.run_predictive(
+            matrix_path=matrix_path,
+            dataset_id="pipeline_test",
+            output_dir=output_dir
+        )
+        
+        assert result.status == "completed"
+        assert "predictive_matrix" in result.artifacts
+        assert "feature_scores" in result.artifacts
+        assert "feature_rankings" in result.artifacts
+        assert "removed_features" in result.artifacts
+        assert "prediction_statistics" in result.artifacts
+        assert "feature_predictive_power_report" in result.artifacts
+        assert "score_report" in result.artifacts
+        assert result.statistics.get("software_validation_passed") == True
+        
+        # Check outputs were saved
+        assert (output_dir / "predictive_feature_matrix.parquet").exists()
+        assert (output_dir / "predictive_feature_scores.csv").exists()
+        assert (output_dir / "feature_rankings.csv").exists()
+        assert (output_dir / "removed_non_predictive_features.csv").exists()
+        assert (output_dir / "prediction_statistics.csv").exists()
+    
+    print("  ✓ Full pipeline test passed")
+    return True
+
+
+def main():
+    """Run all tests."""
+    print("\n" + "=" * 70)
+    print("PROJECT ATLAS - MODULE 203 INTEGRATION TEST")
+    print("Feature Predictive Power")
+    print("=" * 70)
+    
+    results = {}
+    
+    results["load"] = test_engine_load()
+    results["future_returns"] = test_engine_future_returns()
+    results["information_coefficient"] = test_engine_information_coefficient()
+    results["rank_ic"] = test_engine_rank_ic()
+    results["mutual_information"] = test_engine_mutual_information()
+    results["predictive_stability"] = test_engine_predictive_stability()
+    results["full_engine"] = test_engine_compute()
+    results["statistics"] = test_statistics()
+    results["validator"] = test_validator()
+    results["pipeline"] = test_pipeline()
+    
+    print("\n" + "=" * 70)
+    print("RESULTS")
+    print("=" * 70)
+    
+    for name, ok in results.items():
+        print(f"  {'✓' if ok else '✗'} {name}")
+    
+    passed = sum(results.values())
+    total = len(results)
+    
+    print(f"\n  {passed}/{total} tests passed")
+    
+    if passed == total:
+        print("\n✓ Module 203 VALIDATED")
+        return 0
+    else:
+        print("\n⚠ Some tests failed")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

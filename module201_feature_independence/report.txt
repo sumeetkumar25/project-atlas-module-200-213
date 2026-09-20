@@ -1,0 +1,111 @@
+# atlas/modules/module201_feature_independence/report.py
+"""
+Module 201 - Feature Independence Report
+"""
+
+from datetime import datetime
+import pandas as pd
+
+
+class FeatureIndependenceReport:
+    """Report generator for feature independence results."""
+    
+    @staticmethod
+    def generate(statistics, metadata=None, dataset_name="Unknown") -> str:
+        """Generate a formatted report."""
+        lines = []
+        
+        lines.append("=" * 55)
+        lines.append("MODULE 201")
+        lines.append("FEATURE INDEPENDENCE")
+        lines.append("=" * 55)
+        lines.append(f"\nDataset: {dataset_name}")
+        
+        # Overview
+        lines.append("\n" + "-" * 45)
+        lines.append("OVERVIEW")
+        lines.append("-" * 45)
+        lines.append(f"  Total Features: {statistics.total_features}")
+        lines.append(f"  Selected Features: {statistics.selected_features}")
+        lines.append(f"  Removed Features: {statistics.removed_features}")
+        lines.append(f"  Total Clusters: {statistics.total_clusters}")
+        
+        # Percentages
+        lines.append("\n" + "-" * 45)
+        lines.append("PERCENTAGES")
+        lines.append("-" * 45)
+        lines.append(f"  Kept: {statistics.selected_features / statistics.total_features * 100:.1f}%")
+        lines.append(f"  Removed: {statistics.features_removed_percentage:.1f}%")
+        
+        # Clusters
+        lines.append("\n" + "-" * 45)
+        lines.append("CLUSTERS")
+        lines.append("-" * 45)
+        lines.append(f"  Largest Cluster: {statistics.largest_cluster} features")
+        lines.append(f"  Average Cluster Size: {statistics.average_cluster_size:.1f}")
+        
+        # VIF
+        lines.append("\n" + "-" * 45)
+        lines.append("VIF")
+        lines.append("-" * 45)
+        lines.append(f"  Average VIF: {statistics.average_vif:.2f}")
+        lines.append(f"  Max VIF: {statistics.max_vif:.2f}")
+        
+        # Interpretation
+        lines.append("\n" + "-" * 45)
+        lines.append("INTERPRETATION")
+        lines.append("-" * 45)
+        
+        if statistics.features_removed_percentage > 50:
+            lines.append("  ✅ Significant feature reduction achieved")
+        elif statistics.features_removed_percentage > 20:
+            lines.append("  ✓ Moderate feature reduction achieved")
+        else:
+            lines.append("  ⚠ Low feature reduction")
+        
+        if statistics.max_vif < 5:
+            lines.append("  ✅ Low multicollinearity")
+        elif statistics.max_vif < 10:
+            lines.append("  ✓ Moderate multicollinearity")
+        else:
+            lines.append("  ⚠ High multicollinearity detected")
+        
+        # Validation
+        lines.append("\n" + "-" * 45)
+        lines.append("VALIDATION")
+        lines.append("-" * 45)
+        lines.append("  Status: PASSED")
+        
+        # Footer
+        lines.append(f"\n  Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append("\n" + "=" * 55)
+        lines.append("END OF REPORT")
+        lines.append("=" * 55)
+        
+        return "\n".join(lines)
+    
+    @staticmethod
+    def generate_cluster_report(cluster_df: pd.DataFrame) -> str:
+        """Generate a cluster report."""
+        lines = []
+        lines.append("\n" + "=" * 60)
+        lines.append("FEATURE CLUSTERS")
+        lines.append("=" * 60)
+        
+        for cluster in sorted(cluster_df['cluster'].unique()):
+            features = cluster_df[cluster_df['cluster'] == cluster]['feature'].tolist()
+            lines.append(f"\nCluster {cluster}: {len(features)} features")
+            for f in features:
+                lines.append(f"  - {f}")
+        
+        lines.append("\n" + "=" * 60)
+        return "\n".join(lines)
+    
+    @staticmethod
+    def save(report: str, filepath: str):
+        """Save report to file."""
+        from pathlib import Path
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(report)

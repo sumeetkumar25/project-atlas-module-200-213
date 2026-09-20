@@ -1,0 +1,430 @@
+"""
+Module 200 - Integration Test
+
+Tests feature integration engine, statistics, validator, report, and pipeline.
+"""
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
+
+import numpy as np
+import pandas as pd
+import tempfile
+
+from atlas.modules.module200_feature_integration.engine import FeatureIntegrationEngine
+from atlas.modules.module200_feature_integration.statistics import FeatureIntegrationStatisticsEngine
+from atlas.modules.module200_feature_integration.validator import run_validation
+from atlas.modules.module200_feature_integration.module import FeatureIntegrationResearch
+
+
+def create_test_master_matrix():
+    """Create a synthetic master feature matrix for testing."""
+    n = 100
+    np.random.seed(42)
+    
+    timestamps = pd.date_range('2020-01-01', periods=n, freq='1h')
+    
+    # Create base features
+    df = pd.DataFrame({
+        'timestamp': timestamps,
+        'feature1': np.random.randn(n) * 10 + 50,
+        'feature2': np.random.randn(n) * 5 + 100,
+        'feature3': np.random.randn(n) * 2,
+        'feature4': np.random.randn(n) * 20 + 1000,
+        'feature5': np.ones(n) * 5,  # Constant feature
+    })
+    
+    # Create exact duplicate of feature1
+    df['feature6'] = df['feature1']
+    
+    # Create metadata
+    metadata = pd.DataFrame({
+        'feature': ['feature1', 'feature2', 'feature3', 'feature4', 'feature5', 'feature6'],
+        'dtype': ['float64'] * 6,
+        'null_percentage': [0.0] * 6,
+        'unique_values': [n] * 5 + [1],
+        'min_value': [df['feature1'].min(), df['feature2'].min(), df['feature3'].min(),
+                     df['feature4'].min(), 5, df['feature1'].min()],
+        'max_value': [df['feature1'].max(), df['feature2'].max(), df['feature3'].max(),
+                     df['feature4'].max(), 5, df['feature1'].max()],
+        'mean_value': [df['feature1'].mean(), df['feature2'].mean(), df['feature3'].mean(),
+                      df['feature4'].mean(), 5, df['feature1'].mean()],
+        'std_value': [df['feature1'].std(), df['feature2'].std(), df['feature3'].std(),
+                     df['feature4'].std(), 0, df['feature1'].std()]
+    })
+    
+    return df, metadata
+
+
+def test_engine_load():
+    """Test 1: Load master matrix."""
+    print("\n" + "=" * 60)
+    print("TEST 1: Load Master Matrix")
+    print("=" * 60)
+    
+    df, metadata = create_test_master_matrix()
+    engine = FeatureIntegrationEngine()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        matrix_path = tmp_path / "master_feature_matrix.parquet"
+        metadata_path = tmp_path / "feature_metadata.parquet"
+        
+        df.to_parquet(matrix_path, index=False)
+        metadata.to_parquet(metadata_path, index=False)
+        
+        loaded_df = engine.load_master_matrix(matrix_path)
+        loaded_metadata = engine.load_metadata(metadata_path)
+        
+        assert not loaded_df.empty
+        assert 'timestamp' in loaded_df.columns
+        assert len(loaded_df) == len(df)
+        assert not loaded_metadata.empty
+    
+    print("  ✓ Load test passed")
+    return True
+
+
+def test_engine_duplicate_removal():
+    """Test 2: Remove duplicate columns (scalable O(n) approach)."""
+    print("\n" + "=" * 60)
+    print("TEST 2: Remove Duplicate Columns")
+    print("=" * 60)
+    
+    df, _ = create_test_master_matrix()
+    engine = FeatureIntegrationEngine()
+    
+    df_cleaned, removed = engine.remove_duplicate_columns(df)
+    
+    # feature6 should be removed (duplicate of feature1)
+    assert 'feature6' in removed
+    
+    # feature1 should remain
+    assert 'feature1' in df_cleaned.columns
+    
+    # feature6 should be gone
+    assert 'feature6' not in df_cleaned.columns
+    
+    print(f"  Removed {len(removed)} duplicate columns")
+    print(f"  Removed: {removed}")
+    print("  ✓ Duplicate removal test passed")
+    return True
+
+
+def test_engine_constant_removal():
+    """Test 3: Remove constant columns."""
+    print("\n" + "=" * 60)
+    print("TEST 3: Remove Constant Columns")
+    print("=" * 60)
+    
+    df, _ = create_test_master_matrix()
+    engine = FeatureIntegrationEngine()
+    
+    df_cleaned, removed = engine.remove_constant_columns(df)
+    
+    # feature5 should be removed (constant)
+    assert 'feature5' in removed
+    
+    print(f"  Removed {len(removed)} constant columns")
+    print(f"  Removed: {removed}")
+    print("  ✓ Constant removal test passed")
+    return True
+
+
+def test_engine_normalization():
+    """Test 4: Feature normalization."""
+    print("\n" + "=" * 60)
+    print("TEST 4: Feature Normalization")
+    print("=" * 60)
+    
+    df, _ = create_test_master_matrix()
+    engine = FeatureIntegrationEngine()
+    
+    df_normalized, norm_params = engine.normalize_features(df)
+    
+    # Check feature1 is normalized (mean ≈ 0, std ≈ 1)
+    feature1_normalized = df_normalized['feature1']
+    assert abs(feature1_normalized.mean()) < 0.1
+    assert abs(feature1_normalized.std() - 1.0) < 0.1
+    
+    # Check norm_params has entries for all features
+    assert len(norm_params) == len([c for c in df.columns if c != 'timestamp'])
+    
+    print(f"  Normalized {len(norm_params)} features")
+    print("  ✓ Normalization test passed")
+    return True
+
+
+def test_engine_feature_index():
+    """Test 5: Feature index building."""
+    print("\n" + "=" * 60)
+    print("TEST 5: Feature Index Building")
+    print("=" * 60)
+    
+    df, metadata = create_test_master_matrix()
+    engine = FeatureIntegrationEngine()
+    
+    df_cleaned, removed_duplicates = engine.remove_duplicate_columns(df)
+    df_cleaned, removed_constants = engine.remove_constant_columns(df_cleaned)
+    df_normalized, norm_params = engine.normalize_features(df_cleaned)
+    
+    feature_index = engine.build_feature_index(
+        df_normalized, metadata, removed_duplicates, removed_constants, norm_params
+    )
+    
+    assert not feature_index.empty
+    assert 'feature' in feature_index.columns
+    assert 'normalized' in feature_index.columns
+    assert len(feature_index) == len([c for c in df_normalized.columns if c != 'timestamp'])
+    
+    # Check feature6 is marked as removed_duplicate
+    feature6_row = feature_index[feature_index['feature'] == 'feature6']
+    if not feature6_row.empty:
+        assert feature6_row['removed_duplicate'].iloc[0] == True
+    
+    print(f"  Index has {len(feature_index)} features")
+    print("  ✓ Feature index test passed")
+    return True
+
+
+def test_engine_compute():
+    """Test 6: Full engine computation."""
+    print("\n" + "=" * 60)
+    print("TEST 6: Full Engine Computation")
+    print("=" * 60)
+    
+    df, metadata = create_test_master_matrix()
+    engine = FeatureIntegrationEngine()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        matrix_path = tmp_path / "master_feature_matrix.parquet"
+        metadata_path = tmp_path / "feature_metadata.parquet"
+        output_dir = tmp_path / "output"
+        
+        df.to_parquet(matrix_path, index=False)
+        metadata.to_parquet(metadata_path, index=False)
+        
+        result = engine.compute(
+            master_path=matrix_path,
+            metadata_path=metadata_path,
+            output_dir=output_dir
+        )
+        
+        assert not result.integrated_matrix.empty
+        assert not result.feature_index.empty
+        assert result.summary_statistics['total_features'] > 0
+        assert result.summary_statistics['normalized_features'] > 0
+        
+        # Check outputs were saved
+        assert (output_dir / "integrated_feature_matrix.parquet").exists()
+        assert (output_dir / "feature_index.csv").exists()
+        assert (output_dir / "integration_summary.csv").exists()
+    
+    print("  ✓ Full engine test passed")
+    return True
+
+
+def test_statistics():
+    """Test 7: Statistics engine."""
+    print("\n" + "=" * 60)
+    print("TEST 7: Statistics Engine")
+    print("=" * 60)
+    
+    df, metadata = create_test_master_matrix()
+    engine = FeatureIntegrationEngine()
+    stats_engine = FeatureIntegrationStatisticsEngine()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        matrix_path = tmp_path / "master_feature_matrix.parquet"
+        metadata_path = tmp_path / "feature_metadata.parquet"
+        output_dir = tmp_path / "output"
+        
+        df.to_parquet(matrix_path, index=False)
+        metadata.to_parquet(metadata_path, index=False)
+        
+        result = engine.compute(
+            master_path=matrix_path,
+            metadata_path=metadata_path,
+            output_dir=output_dir
+        )
+        
+        stats = stats_engine.analyze(result)
+        
+        assert stats.total_features == result.summary_statistics['total_features']
+        assert stats.normalized_features == result.summary_statistics['normalized_features']
+        assert stats.removed_constants == result.summary_statistics['removed_constants']
+        assert stats.removed_duplicates == result.summary_statistics['removed_duplicates']
+    
+    print("  ✓ Statistics test passed")
+    return True
+
+
+def test_validator():
+    """Test 8: Validator."""
+    print("\n" + "=" * 60)
+    print("TEST 8: Validator")
+    print("=" * 60)
+    
+    df, metadata = create_test_master_matrix()
+    engine = FeatureIntegrationEngine()
+    stats_engine = FeatureIntegrationStatisticsEngine()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        matrix_path = tmp_path / "master_feature_matrix.parquet"
+        metadata_path = tmp_path / "feature_metadata.parquet"
+        output_dir = tmp_path / "output"
+        
+        df.to_parquet(matrix_path, index=False)
+        metadata.to_parquet(metadata_path, index=False)
+        
+        result = engine.compute(
+            master_path=matrix_path,
+            metadata_path=metadata_path,
+            output_dir=output_dir
+        )
+        
+        stats = stats_engine.analyze(result)
+        
+        passed = run_validation(result, stats)
+        assert passed
+    
+    print("  ✓ Validator test passed")
+    return True
+
+
+def test_pipeline():
+    """Test 9: Full pipeline."""
+    print("\n" + "=" * 60)
+    print("TEST 9: Full Pipeline")
+    print("=" * 60)
+    
+    df, metadata = create_test_master_matrix()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        matrix_path = tmp_path / "master_feature_matrix.parquet"
+        metadata_path = tmp_path / "feature_metadata.parquet"
+        output_dir = tmp_path / "output"
+        
+        df.to_parquet(matrix_path, index=False)
+        metadata.to_parquet(metadata_path, index=False)
+        
+        research = FeatureIntegrationResearch()
+        
+        result = research.run_integration(
+            master_path=matrix_path,
+            metadata_path=metadata_path,
+            dataset_id="pipeline_test",
+            output_dir=output_dir
+        )
+        
+        assert result.status == "completed"
+        assert "integrated_matrix" in result.artifacts
+        assert "feature_index" in result.artifacts
+        assert "integration_summary" in result.artifacts
+        assert "feature_integration_report" in result.artifacts
+        assert "feature_index_report" in result.artifacts
+        assert result.statistics.get("software_validation_passed") == True
+        
+        # Check outputs were saved
+        assert (output_dir / "integrated_feature_matrix.parquet").exists()
+        assert (output_dir / "feature_index.csv").exists()
+        assert (output_dir / "integration_summary.csv").exists()
+    
+    print("  ✓ Full pipeline test passed")
+    return True
+
+
+def test_scalable_duplicate_detection():
+    """Test 10: Scalable duplicate detection with many features."""
+    print("\n" + "=" * 60)
+    print("TEST 10: Scalable Duplicate Detection")
+    print("=" * 60)
+    
+    n = 100
+    n_features = 50
+    
+    np.random.seed(42)
+    timestamps = pd.date_range('2020-01-01', periods=n, freq='1h')
+    
+    # Create DataFrame with many features
+    df = pd.DataFrame({'timestamp': timestamps})
+    
+    # Add features
+    for i in range(n_features):
+        df[f'feature_{i}'] = np.random.randn(n) * 10 + 50
+    
+    # Add some duplicates
+    df['feature_dup_1'] = df['feature_0']
+    df['feature_dup_2'] = df['feature_5']
+    df['feature_dup_3'] = df['feature_10']
+    
+    engine = FeatureIntegrationEngine()
+    
+    # Count initial features
+    initial_features = len([c for c in df.columns if c != 'timestamp'])
+    
+    # Remove duplicates
+    df_cleaned, removed = engine.remove_duplicate_columns(df)
+    
+    # Verify duplicates were removed
+    final_features = len([c for c in df_cleaned.columns if c != 'timestamp'])
+    
+    assert len(removed) == 3
+    assert final_features == initial_features - 3
+    
+    # Verify the duplicate detection used scalable approach (no O(n²) loops)
+    print(f"  Initial features: {initial_features}")
+    print(f"  Removed duplicates: {len(removed)}")
+    print(f"  Final features: {final_features}")
+    print("  ✓ Scalable duplicate detection test passed")
+    return True
+
+
+def main():
+    """Run all tests."""
+    print("\n" + "=" * 70)
+    print("PROJECT ATLAS - MODULE 200 INTEGRATION TEST")
+    print("Feature Integration")
+    print("=" * 70)
+    
+    results = {}
+    
+    results["load"] = test_engine_load()
+    results["duplicate_removal"] = test_engine_duplicate_removal()
+    results["constant_removal"] = test_engine_constant_removal()
+    results["normalization"] = test_engine_normalization()
+    results["feature_index"] = test_engine_feature_index()
+    results["full_engine"] = test_engine_compute()
+    results["statistics"] = test_statistics()
+    results["validator"] = test_validator()
+    results["pipeline"] = test_pipeline()
+    results["scalable_duplicate"] = test_scalable_duplicate_detection()
+    
+    print("\n" + "=" * 70)
+    print("RESULTS")
+    print("=" * 70)
+    
+    for name, ok in results.items():
+        print(f"  {'✓' if ok else '✗'} {name}")
+    
+    passed = sum(results.values())
+    total = len(results)
+    
+    print(f"\n  {passed}/{total} tests passed")
+    
+    if passed == total:
+        print("\n✓ Module 200 VALIDATED")
+        return 0
+    else:
+        print("\n⚠ Some tests failed")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

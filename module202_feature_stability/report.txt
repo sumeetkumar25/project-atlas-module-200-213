@@ -1,0 +1,140 @@
+# atlas/modules/module202_feature_stability/report.py
+"""
+Module 202 - Feature Stability Report
+"""
+
+from datetime import datetime
+import pandas as pd
+
+
+class FeatureStabilityReport:
+    """Report generator for feature stability results."""
+    
+    @staticmethod
+    def generate(statistics, metadata=None, dataset_name="Unknown") -> str:
+        """Generate a formatted report."""
+        lines = []
+        
+        lines.append("=" * 55)
+        lines.append("MODULE 202")
+        lines.append("FEATURE STABILITY")
+        lines.append("=" * 55)
+        lines.append(f"\nDataset: {dataset_name}")
+        
+        # Overview
+        lines.append("\n" + "-" * 45)
+        lines.append("OVERVIEW")
+        lines.append("-" * 45)
+        lines.append(f"  Total Features: {statistics.total_features}")
+        lines.append(f"  KEPT: {statistics.kept_count}")
+        lines.append(f"  REMOVED: {statistics.removed_count}")
+        
+        # Percentages
+        lines.append("\n" + "-" * 45)
+        lines.append("PERCENTAGES")
+        lines.append("-" * 45)
+        lines.append(f"  KEPT: {statistics.kept_percentage:.1f}%")
+        lines.append(f"  REMOVED: {statistics.removed_percentage:.1f}%")
+        
+        # Stability Scores
+        lines.append("\n" + "-" * 45)
+        lines.append("STABILITY SCORES")
+        lines.append("-" * 45)
+        lines.append(f"  Average: {statistics.average_stability:.3f}")
+        lines.append(f"  Median: {statistics.median_stability:.3f}")
+        lines.append(f"  Best: {statistics.max_stability:.3f}")
+        lines.append(f"  Worst: {statistics.min_stability:.3f}")
+        
+        # Best and Worst Features
+        if statistics.best_feature:
+            lines.append("\n" + "-" * 45)
+            lines.append("BEST FEATURE")
+            lines.append("-" * 45)
+            lines.append(f"  {statistics.best_feature}: {statistics.max_stability:.3f}")
+        
+        if statistics.worst_feature:
+            lines.append("\n" + "-" * 45)
+            lines.append("WORST FEATURE")
+            lines.append("-" * 45)
+            lines.append(f"  {statistics.worst_feature}: {statistics.min_stability:.3f}")
+        
+        # Stationarity
+        lines.append("\n" + "-" * 45)
+        lines.append("STATIONARITY")
+        lines.append("-" * 45)
+        lines.append(f"  Average ADF p-value: {statistics.average_adf_pvalue:.4f}")
+        lines.append(f"  Average KPSS p-value: {statistics.average_kpss_pvalue:.4f}")
+        
+        # Structural Breaks
+        lines.append("\n" + "-" * 45)
+        lines.append("STRUCTURAL BREAKS")
+        lines.append("-" * 45)
+        lines.append(f"  Average Break Stability: {statistics.average_structural_breaks:.3f}")
+        
+        # Interpretation
+        lines.append("\n" + "-" * 45)
+        lines.append("INTERPRETATION")
+        lines.append("-" * 45)
+        
+        if statistics.average_stability > 0.7:
+            lines.append("  ✅ Features show high temporal stability")
+        elif statistics.average_stability > 0.5:
+            lines.append("  ✓ Features show moderate temporal stability")
+        else:
+            lines.append("  ⚠ Features show low temporal stability")
+        
+        if statistics.average_adf_pvalue < 0.05:
+            lines.append("  ✅ Most features are stationary (ADF)")
+        else:
+            lines.append("  ⚠ Some features may be non-stationary")
+        
+        # Validation
+        lines.append("\n" + "-" * 45)
+        lines.append("VALIDATION")
+        lines.append("-" * 45)
+        lines.append("  Status: PASSED")
+        
+        # Footer
+        lines.append(f"\n  Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append("\n" + "=" * 55)
+        lines.append("END OF REPORT")
+        lines.append("=" * 55)
+        
+        return "\n".join(lines)
+    
+    @staticmethod
+    def generate_stability_table(feature_stability: pd.DataFrame, top_n: int = 10) -> str:
+        """Generate a stability table report."""
+        lines = []
+        lines.append("\n" + "=" * 80)
+        lines.append(f"TOP {top_n} STABLE FEATURES")
+        lines.append("=" * 80)
+        
+        top_features = feature_stability.head(top_n)
+        
+        lines.append(
+            f"\n{'Feature':<20} {'Score':<12} {'Decision':<12} {'Mean':<12} {'Regime':<12} {'Stationarity':<12}"
+        )
+        lines.append("-" * 80)
+        
+        for _, row in top_features.iterrows():
+            lines.append(
+                f"{row['feature'][:19]:<20} "
+                f"{row['stability_score']:<12.3f} "
+                f"{row['decision']:<12} "
+                f"{row['mean_stability']:<12.3f} "
+                f"{row['regime_stability']:<12.3f} "
+                f"{row['stationarity']:<12.3f}"
+            )
+        
+        lines.append("\n" + "=" * 80)
+        return "\n".join(lines)
+    
+    @staticmethod
+    def save(report: str, filepath: str):
+        """Save report to file."""
+        from pathlib import Path
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(report)

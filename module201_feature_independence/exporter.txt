@@ -1,0 +1,56 @@
+# atlas/modules/module201_feature_independence/exporter.py
+"""
+Module 201 - Feature Independence Exporter
+"""
+
+import pandas as pd
+from pathlib import Path
+
+
+class FeatureIndependenceExporter:
+    """Exporter for feature independence results."""
+    
+    @staticmethod
+    def export_independent_matrix(df: pd.DataFrame, filepath: str):
+        """Export independent matrix to Parquet."""
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_parquet(path, index=False)
+    
+    @staticmethod
+    def export_dependency_matrix(df: pd.DataFrame, filepath: str):
+        """Export dependency matrix to CSV."""
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(path)
+    
+    @staticmethod
+    def export_clusters(df: pd.DataFrame, filepath: str):
+        """Export clusters to CSV."""
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(path, index=False)
+    
+    @staticmethod
+    def export_removed_features(features: list, filepath: str):
+        """Export removed features to CSV."""
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df = pd.DataFrame({'removed_features': features})
+        df.to_csv(path, index=False)
+    
+    @staticmethod
+    def export_independent_features(features: list, filepath: str):
+        """Export independent features to CSV."""
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df = pd.DataFrame({'independent_features': features})
+        df.to_csv(path, index=False)
+    
+    @staticmethod
+    def export_statistics(stats: dict, filepath: str):
+        """Export statistics to CSV."""
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df = pd.DataFrame([stats])
+        df.to_csv(path, index=False)

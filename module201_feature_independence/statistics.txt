@@ -1,0 +1,55 @@
+# atlas/modules/module201_feature_independence/statistics.py
+"""
+Module 201 - Feature Independence Statistics
+"""
+
+from dataclasses import dataclass, asdict
+import pandas as pd
+from .engine import FeatureIndependenceResult
+
+
+@dataclass
+class FeatureIndependenceStatistics:
+    """High-level statistics from feature independence analysis."""
+    total_features: int
+    selected_features: int
+    removed_features: int
+    total_clusters: int
+    largest_cluster: int
+    average_cluster_size: float
+    average_vif: float
+    max_vif: float
+    features_removed_percentage: float
+
+
+class FeatureIndependenceStatisticsEngine:
+    """Engine for generating high-level statistics."""
+    
+    METADATA = {
+        "module": 201,
+        "name": "Feature Independence",
+        "version": "1.0.0",
+        "description": "Computes feature independence and selects representatives"
+    }
+    
+    def analyze(self, result: FeatureIndependenceResult) -> FeatureIndependenceStatistics:
+        """Analyze results and generate high-level statistics."""
+        return FeatureIndependenceStatistics(
+            total_features=result.summary_statistics['total_features'],
+            selected_features=result.summary_statistics['selected_features'],
+            removed_features=result.summary_statistics['removed_features'],
+            total_clusters=result.summary_statistics['total_clusters'],
+            largest_cluster=result.summary_statistics['largest_cluster'],
+            average_cluster_size=result.summary_statistics['average_cluster_size'],
+            average_vif=result.summary_statistics['average_vif'],
+            max_vif=result.summary_statistics['max_vif'],
+            features_removed_percentage=result.summary_statistics['features_removed_percentage']
+        )
+    
+    def summary_dataframe(self, stats: FeatureIndependenceStatistics) -> pd.DataFrame:
+        """Convert statistics to DataFrame."""
+        return pd.DataFrame([asdict(stats)])
+    
+    def summary_dict(self, stats: FeatureIndependenceStatistics) -> dict:
+        """Convert statistics to dictionary."""
+        return asdict(stats)

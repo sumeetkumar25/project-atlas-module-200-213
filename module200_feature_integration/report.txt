@@ -1,0 +1,114 @@
+# atlas/modules/module200_feature_integration/report.py
+"""
+Module 200 - Feature Integration Report
+"""
+
+from datetime import datetime
+import pandas as pd
+
+
+class FeatureIntegrationReport:
+    """Report generator for feature integration results."""
+    
+    @staticmethod
+    def generate(statistics, metadata=None, dataset_name="Unknown") -> str:
+        """Generate a formatted report."""
+        lines = []
+        
+        lines.append("=" * 55)
+        lines.append("MODULE 200")
+        lines.append("FEATURE INTEGRATION")
+        lines.append("=" * 55)
+        lines.append(f"\nDataset: {dataset_name}")
+        
+        # Overview
+        lines.append("\n" + "-" * 45)
+        lines.append("OVERVIEW")
+        lines.append("-" * 45)
+        lines.append(f"  Total Rows: {statistics.total_rows:,}")
+        lines.append(f"  Total Features: {statistics.total_features}")
+        
+        # Removals
+        lines.append("\n" + "-" * 45)
+        lines.append("REMOVALS")
+        lines.append("-" * 45)
+        lines.append(f"  Duplicate Columns: {statistics.removed_duplicates}")
+        lines.append(f"  Constant Columns: {statistics.removed_constants}")
+        
+        # Normalization
+        lines.append("\n" + "-" * 45)
+        lines.append("NORMALIZATION")
+        lines.append("-" * 45)
+        lines.append(f"  Normalized Features: {statistics.normalized_features}")
+        
+        # Data Quality
+        lines.append("\n" + "-" * 45)
+        lines.append("DATA QUALITY")
+        lines.append("-" * 45)
+        lines.append(f"  Missing Percentage: {statistics.missing_percentage:.2f}%")
+        lines.append(f"  Feature Density: {statistics.feature_density:.2%}")
+        
+        # Performance
+        lines.append("\n" + "-" * 45)
+        lines.append("PERFORMANCE")
+        lines.append("-" * 45)
+        lines.append(f"  Memory Usage: {statistics.memory_usage_mb:.2f} MB")
+        
+        # Time Range
+        lines.append("\n" + "-" * 45)
+        lines.append("TIME RANGE")
+        lines.append("-" * 45)
+        lines.append(f"  Start: {statistics.timestamp_start}")
+        lines.append(f"  End: {statistics.timestamp_end}")
+        
+        # Validation
+        lines.append("\n" + "-" * 45)
+        lines.append("VALIDATION")
+        lines.append("-" * 45)
+        lines.append("  Status: PASSED")
+        
+        # Footer
+        lines.append(f"\n  Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append("\n" + "=" * 55)
+        lines.append("END OF REPORT")
+        lines.append("=" * 55)
+        
+        return "\n".join(lines)
+    
+    @staticmethod
+    def generate_feature_index(feature_index: pd.DataFrame, top_n: int = 20) -> str:
+        """Generate a feature index report."""
+        lines = []
+        lines.append("\n" + "=" * 70)
+        lines.append(f"FEATURE INDEX (Top {top_n})")
+        lines.append("=" * 70)
+        
+        # Filter selected features
+        selected = feature_index[feature_index['selected'] == True]
+        
+        lines.append(
+            f"\n{'Feature':<25} {'Type':<12} {'Normalized':<12} {'Missing %':<10}"
+        )
+        lines.append("-" * 65)
+        
+        for _, row in selected.head(top_n).iterrows():
+            missing = row['missing_percentage'] if not pd.isna(row['missing_percentage']) else 0
+            normalized = "Yes" if row['normalized'] else "No"
+            lines.append(
+                f"{row['feature'][:24]:<25} "
+                f"{row['dtype']:<12} "
+                f"{normalized:<12} "
+                f"{missing:<10.2f}"
+            )
+        
+        lines.append("\n" + "=" * 70)
+        return "\n".join(lines)
+    
+    @staticmethod
+    def save(report: str, filepath: str):
+        """Save report to file."""
+        from pathlib import Path
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(report)

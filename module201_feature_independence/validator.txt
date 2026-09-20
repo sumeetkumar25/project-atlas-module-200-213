@@ -1,0 +1,122 @@
+# atlas/modules/module201_feature_independence/validator.py
+"""
+Module 201 - Feature Independence Validator
+"""
+
+import numpy as np
+import pandas as pd
+from .engine import FeatureIndependenceResult
+from .statistics import FeatureIndependenceStatistics
+
+
+class FeatureIndependenceValidator:
+    """Validator for feature independence results."""
+    
+    def validate(
+        self,
+        result: FeatureIndependenceResult,
+        statistics: FeatureIndependenceStatistics
+    ) -> bool:
+        """Validate results and statistics."""
+        issues = []
+        warnings = []
+        
+        # Check independent matrix
+        if result.independent_matrix.empty:
+            issues.append("Independent matrix is empty")
+        else:
+            if 'timestamp' not in result.independent_matrix.columns:
+                issues.append("Missing timestamp column")
+            
+            # Check selected features are in matrix
+            for feature in result.independent_features:
+                if feature not in result.independent_matrix.columns:
+                    issues.append(f"Selected feature '{feature}' not in matrix")
+        
+        # Check dependency matrix
+        if result.dependency_matrix.empty:
+            issues.append("Dependency matrix is empty")
+        else:
+            # Check symmetry
+            if not np.allclose(result.dependency_matrix.values, 
+                              result.dependency_matrix.values.T, atol=1e-10):
+                issues.append("Dependency matrix is not symmetric")
+            
+            # Check diagonal is 1
+            if not np.allclose(np.diag(result.dependency_matrix.values), 1, atol=1e-10):
+                issues.append("Dependency matrix diagonal is not 1")
+        
+        # Check clusters
+        if result.feature_clusters.empty:
+            issues.append("Feature clusters is empty")
+        else:
+            # Check every feature in exactly one cluster
+            unique_features = result.feature_clusters['feature'].nunique()
+            total_features = len(result.feature_clusters)
+            if unique_features != total_features:
+                issues.append("Duplicate features in clusters")
+        
+        # Check removed and independent lists
+        total = len(result.independent_features) + len(result.removed_features)
+        if total != result.summary_statistics['total_features']:
+            issues.append(
+                f"Feature count mismatch: {total} vs {result.summary_statistics['total_features']}"
+            )
+        
+        # Check statistics match result
+        if statistics.total_features != result.summary_statistics['total_features']:
+            issues.append(
+                f"Total features mismatch: stats={statistics.total_features}, "
+                f"result={result.summary_statistics['total_features']}"
+            )
+        
+        if statistics.selected_features != len(result.independent_features):
+            issues.append(
+                f"Selected features mismatch: stats={statistics.selected_features}, "
+                f"result={len(result.independent_features)}"
+            )
+        
+        if statistics.removed_features != len(result.removed_features):
+            issues.append(
+                f"Removed features mismatch: stats={statistics.removed_features}, "
+                f"result={len(result.removed_features)}"
+            )
+        
+        # Warnings (non-fatal)
+        if statistics.features_removed_percentage > 70:
+            warnings.append(f"High removal percentage: {statistics.features_removed_percentage:.1f}%")
+        
+        if statistics.max_vif > 10:
+            warnings.append(f"High max VIF: {statistics.max_vif:.2f}")
+        
+        if warnings:
+            print("\n  WARNINGS:")
+            for warning in warnings:
+                print(f"    ⚠ {warning}")
+        
+        if issues:
+            raise ValueError(
+                f"Feature Independence validation failed with {len(issues)} issue(s):\n" +
+                "\n".join(f"  - {issue}" for issue in issues)
+            )
+        
+        return True
+
+
+def run_validation(result, statistics):
+    """Run validation with user-friendly output."""
+    validator = FeatureIndependenceValidator()
+    
+    print("\n" + "=" * 60)
+    print("FEATURE INDEPENDENCE VALIDATION")
+    print("=" * 60)
+    
+    try:
+        validator.validate(result, statistics)
+        print("\n  ✓ All validation checks passed")
+        print("=" * 60)
+        return True
+    except ValueError as e:
+        print(e)
+        print("=" * 60)
+        return False

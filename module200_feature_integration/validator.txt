@@ -1,0 +1,125 @@
+# atlas/modules/module200_feature_integration/validator.py
+"""
+Module 200 - Feature Integration Validator
+"""
+
+import numpy as np
+import pandas as pd
+from .engine import FeatureIntegrationResult
+from .statistics import FeatureIntegrationStatistics
+
+
+class FeatureIntegrationValidator:
+    """Validator for feature integration results."""
+    
+    def validate(
+        self,
+        result: FeatureIntegrationResult,
+        statistics: FeatureIntegrationStatistics
+    ) -> bool:
+        """Validate results and statistics."""
+        issues = []
+        warnings = []
+        
+        # Check integrated matrix
+        if result.integrated_matrix.empty:
+            issues.append("Integrated matrix is empty")
+        else:
+            # Check timestamp exists
+            if 'timestamp' not in result.integrated_matrix.columns:
+                issues.append("Missing timestamp column")
+            else:
+                # Check no duplicate timestamps
+                dup_count = result.integrated_matrix['timestamp'].duplicated().sum()
+                if dup_count > 0:
+                    warnings.append(f"Found {dup_count} duplicate timestamps")
+            
+            # Check no constant features
+            features = [c for c in result.integrated_matrix.columns if c != 'timestamp']
+            for feature in features:
+                if result.integrated_matrix[feature].nunique() <= 1:
+                    warnings.append(f"Constant feature found after removal: {feature}")
+            
+            # Check no infinite values
+            numeric_cols = result.integrated_matrix.select_dtypes(include=[np.number]).columns
+            for col in numeric_cols:
+                if np.isinf(result.integrated_matrix[col]).any():
+                    issues.append(f"Infinite values found in {col}")
+        
+        # Check feature index
+        if result.feature_index.empty:
+            issues.append("Feature index is empty")
+        else:
+            required_cols = ['feature', 'dtype', 'normalized']
+            missing = set(required_cols) - set(result.feature_index.columns)
+            if missing:
+                issues.append(f"Missing columns in feature index: {missing}")
+            
+            # Check no duplicate features in index
+            if result.feature_index['feature'].duplicated().any():
+                issues.append("Duplicate features in index")
+        
+        # Check statistics
+        if statistics.total_features <= 0:
+            issues.append(f"Invalid total features: {statistics.total_features}")
+        
+        if statistics.removed_duplicates < 0:
+            issues.append(f"Invalid removed duplicates: {statistics.removed_duplicates}")
+        
+        if statistics.removed_constants < 0:
+            issues.append(f"Invalid removed constants: {statistics.removed_constants}")
+        
+        if not (0 <= statistics.feature_density <= 1):
+            issues.append(f"Feature density outside [0,1]: {statistics.feature_density}")
+        
+        # Check statistics match result
+        if statistics.total_rows != len(result.integrated_matrix):
+            issues.append(
+                f"Total rows mismatch: stats={statistics.total_rows}, "
+                f"result={len(result.integrated_matrix)}"
+            )
+        
+        if statistics.total_features != len(result.feature_index):
+            issues.append(
+                f"Total features mismatch: stats={statistics.total_features}, "
+                f"result={len(result.feature_index)}"
+            )
+        
+        # Warnings (non-fatal)
+        if statistics.missing_percentage > 5:
+            warnings.append(f"High missing percentage: {statistics.missing_percentage:.1f}%")
+        
+        if statistics.normalized_features < statistics.total_features:
+            warnings.append(f"Not all features normalized: {statistics.normalized_features}/{statistics.total_features}")
+        
+        if warnings:
+            print("\n  WARNINGS:")
+            for warning in warnings:
+                print(f"    ⚠ {warning}")
+        
+        if issues:
+            raise ValueError(
+                f"Feature Integration validation failed with {len(issues)} issue(s):\n" +
+                "\n".join(f"  - {issue}" for issue in issues)
+            )
+        
+        return True
+
+
+def run_validation(result, statistics):
+    """Run validation with user-friendly output."""
+    validator = FeatureIntegrationValidator()
+    
+    print("\n" + "=" * 60)
+    print("FEATURE INTEGRATION VALIDATION")
+    print("=" * 60)
+    
+    try:
+        validator.validate(result, statistics)
+        print("\n  ✓ All validation checks passed")
+        print("=" * 60)
+        return True
+    except ValueError as e:
+        print(e)
+        print("=" * 60)
+        return False

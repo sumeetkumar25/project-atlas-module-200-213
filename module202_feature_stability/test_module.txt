@@ -1,0 +1,468 @@
+# atlas/modules/module202_feature_stability/test_module.py
+"""
+Module 202 - Integration Test
+
+Tests feature stability engine, statistics, validator, report, and pipeline.
+"""
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
+
+import numpy as np
+import pandas as pd
+import tempfile
+
+from atlas.modules.module202_feature_stability.engine import FeatureStabilityEngine
+from atlas.modules.module202_feature_stability.statistics import FeatureStabilityStatisticsEngine
+from atlas.modules.module202_feature_stability.validator import run_validation
+from atlas.modules.module202_feature_stability.module import FeatureStabilityResearch
+
+
+def create_test_matrix(n=500, n_features=10):
+    """Create a synthetic feature matrix for testing."""
+    np.random.seed(42)
+    
+    timestamps = pd.date_range('2020-01-01', periods=n, freq='1h')
+    
+    df = pd.DataFrame({'timestamp': timestamps})
+    
+    # Add close price for regime detection
+    close = 100 + np.cumsum(np.random.randn(n) * 0.5)
+    df['close'] = close
+    df['high'] = close + np.abs(np.random.randn(n) * 1.0)
+    df['low'] = close - np.abs(np.random.randn(n) * 1.0)
+    
+    # Stable feature
+    df['stable_feature'] = np.random.randn(n) * 10 + 50
+    
+    # Unstable feature (mean shifts)
+    unstable = np.random.randn(n) * 10 + 50
+    unstable[n//2:] += 20
+    df['unstable_feature'] = unstable
+    
+    # Drifting feature (trend)
+    df['drifting_feature'] = np.random.randn(n) * 5 + np.linspace(0, 10, n)
+    
+    # Constant feature
+    df['constant_feature'] = np.ones(n) * 5
+    
+    # More features
+    for i in range(5, n_features + 1):
+        df[f'feature_{i}'] = np.random.randn(n) * 10 + 50
+    
+    return df
+
+
+def test_engine_load():
+    """Test 1: Load independent matrix."""
+    print("\n" + "=" * 60)
+    print("TEST 1: Load Independent Matrix")
+    print("=" * 60)
+    
+    df = create_test_matrix()
+    engine = FeatureStabilityEngine()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        matrix_path = tmp_path / "independent_feature_matrix.parquet"
+        df.to_parquet(matrix_path, index=False)
+        
+        loaded_df = engine.load_independent_matrix(matrix_path)
+        
+        assert not loaded_df.empty
+        assert 'timestamp' in loaded_df.columns
+        assert len(loaded_df) == len(df)
+    
+    print("  ✓ Load test passed")
+    return True
+
+
+def test_engine_rolling_mean():
+    """Test 2: Rolling mean stability."""
+    print("\n" + "=" * 60)
+    print("TEST 2: Rolling Mean Stability")
+    print("=" * 60)
+    
+    engine = FeatureStabilityEngine(rolling_window=50)
+    
+    # Stable series
+    stable = pd.Series(np.random.randn(500) * 10 + 50)
+    stable_metrics = engine.compute_rolling_mean_stability(stable)
+    
+    # Unstable series (mean shifts)
+    unstable = pd.Series(np.random.randn(500) * 10 + 50)
+    unstable[250:] += 20
+    unstable_metrics = engine.compute_rolling_mean_stability(unstable)
+    
+    assert stable_metrics['mean_stability'] > unstable_metrics['mean_stability']
+    assert 0 <= stable_metrics['mean_stability'] <= 1
+    
+    print("  ✓ Rolling mean stability test passed")
+    return True
+
+
+def test_engine_rolling_variance():
+    """Test 3: Rolling variance stability."""
+    print("\n" + "=" * 60)
+    print("TEST 3: Rolling Variance Stability")
+    print("=" * 60)
+    
+    engine = FeatureStabilityEngine(rolling_window=50)
+    
+    # Stable variance
+    stable = pd.Series(np.random.randn(500) * 10 + 50)
+    stable_metrics = engine.compute_rolling_variance_stability(stable)
+    
+    # Unstable variance
+    unstable = pd.Series(np.random.randn(500) * (10 + np.linspace(0, 5, 500)) + 50)
+    unstable_metrics = engine.compute_rolling_variance_stability(unstable)
+    
+    assert stable_metrics['variance_stability'] > unstable_metrics['variance_stability']
+    assert 0 <= stable_metrics['variance_stability'] <= 1
+    
+    print("  ✓ Rolling variance stability test passed")
+    return True
+
+
+def test_engine_distribution_drift():
+    """Test 4: Distribution drift."""
+    print("\n" + "=" * 60)
+    print("TEST 4: Distribution Drift")
+    print("=" * 60)
+    
+    engine = FeatureStabilityEngine()
+    
+    # Same distribution
+    same = pd.Series(np.random.randn(500) * 10 + 50)
+    same_drift = engine.compute_distribution_drift(same)
+    
+    # Different distributions
+    first_half = np.random.randn(250) * 10 + 50
+    second_half = np.random.randn(250) * 20 + 50
+    different = pd.Series(np.concatenate([first_half, second_half]))
+    different_drift = engine.compute_distribution_drift(different)
+    
+    assert same_drift > different_drift
+    assert 0 <= same_drift <= 1
+    
+    print("  ✓ Distribution drift test passed")
+    return True
+
+
+def test_engine_regime_stability():
+    """Test 5: Regime stability."""
+    print("\n" + "=" * 60)
+    print("TEST 5: Regime Stability")
+    print("=" * 60)
+    
+    df = create_test_matrix()
+    engine = FeatureStabilityEngine()
+    
+    series = df['stable_feature']
+    regimes = engine.compute_volatility_regime(df)
+    
+    stability = engine.compute_regime_stability(series, regimes)
+    assert 0 <= stability <= 1
+    
+    print("  ✓ Regime stability test passed")
+    return True
+
+
+def test_engine_stationarity():
+    """Test 6: Stationarity tests."""
+    print("\n" + "=" * 60)
+    print("TEST 6: Stationarity")
+    print("=" * 60)
+    
+    engine = FeatureStabilityEngine()
+    
+    # Stationary series
+    stationary = pd.Series(np.random.randn(500) * 10 + 50)
+    stationarity = engine.compute_stationarity(stationary)
+    
+    # Non-stationary series
+    non_stationary = pd.Series(np.random.randn(500) * 5 + np.linspace(0, 50, 500))
+    non_stationarity = engine.compute_stationarity(non_stationary)
+    
+    assert stationarity['stationarity'] > non_stationarity['stationarity']
+    assert 0 <= stationarity['stationarity'] <= 1
+    
+    print("  ✓ Stationarity test passed")
+    return True
+
+
+def test_engine_entropy_stability():
+    """Test 7: Entropy stability."""
+    print("\n" + "=" * 60)
+    print("TEST 7: Entropy Stability")
+    print("=" * 60)
+    
+    engine = FeatureStabilityEngine(rolling_window=50)
+    
+    # Stable entropy
+    stable = pd.Series(np.random.randn(500) * 10 + 50)
+    stable_entropy = engine.compute_entropy_stability(stable)
+    
+    # Unstable entropy
+    unstable = pd.Series(np.random.randn(500) * 5 + np.sin(np.linspace(0, 20, 500)) * 20)
+    unstable_entropy = engine.compute_entropy_stability(unstable)
+    
+    assert 0 <= stable_entropy <= 1
+    
+    print("  ✓ Entropy stability test passed")
+    return True
+
+
+def test_engine_stability_score():
+    """Test 8: Stability score computation."""
+    print("\n" + "=" * 60)
+    print("TEST 8: Stability Score")
+    print("=" * 60)
+    
+    engine = FeatureStabilityEngine()
+    
+    # High stability metrics
+    high_metrics = {
+        'mean_stability': 0.95,
+        'variance_stability': 0.90,
+        'distribution_drift': 0.92,
+        'regime_stability': 0.88,
+        'trend_stability': 0.85,
+        'entropy_stability': 0.90,
+        'stationarity': 0.95,
+        'outlier_stability': 0.90,
+        'structural_stability': 0.85
+    }
+    high_score = engine.compute_stability_score(high_metrics)
+    assert high_score > 0.8
+    
+    # Low stability metrics
+    low_metrics = {
+        'mean_stability': 0.10,
+        'variance_stability': 0.15,
+        'distribution_drift': 0.10,
+        'regime_stability': 0.20,
+        'trend_stability': 0.15,
+        'entropy_stability': 0.10,
+        'stationarity': 0.10,
+        'outlier_stability': 0.10,
+        'structural_stability': 0.10
+    }
+    low_score = engine.compute_stability_score(low_metrics)
+    assert low_score < 0.4
+    
+    print("  ✓ Stability score test passed")
+    return True
+
+
+def test_engine_decisions():
+    """Test 9: Decision making."""
+    print("\n" + "=" * 60)
+    print("TEST 9: Decision Making")
+    print("=" * 60)
+    
+    engine = FeatureStabilityEngine(
+        pass_threshold=0.80,
+        warning_threshold=0.60
+    )
+    
+    assert engine.make_decision(0.90) == "KEEP"
+    assert engine.make_decision(0.80) == "KEEP"
+    assert engine.make_decision(0.70) == "WARNING"
+    assert engine.make_decision(0.60) == "WARNING"
+    assert engine.make_decision(0.50) == "REMOVE"
+    
+    print("  ✓ Decision making test passed")
+    return True
+
+
+def test_engine_compute():
+    """Test 10: Full engine computation."""
+    print("\n" + "=" * 60)
+    print("TEST 10: Full Engine Computation")
+    print("=" * 60)
+    
+    df = create_test_matrix()
+    engine = FeatureStabilityEngine(rolling_window=50)
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        matrix_path = tmp_path / "independent_feature_matrix.parquet"
+        output_dir = tmp_path / "output"
+        df.to_parquet(matrix_path, index=False)
+        
+        result = engine.compute(
+            matrix_path=matrix_path,
+            output_dir=output_dir
+        )
+        
+        assert not result.stable_matrix.empty
+        assert not result.feature_stability.empty
+        assert len(result.kept_features) > 0
+        assert result.summary_statistics['total_features'] > 0
+        
+        # Check outputs were saved
+        assert (output_dir / "stable_feature_matrix.parquet").exists()
+        assert (output_dir / "feature_stability.csv").exists()
+        assert (output_dir / "rolling_statistics.csv").exists()
+        assert (output_dir / "regime_statistics.csv").exists()
+        assert (output_dir / "removed_unstable_features.csv").exists()
+        assert (output_dir / "stability_summary.csv").exists()
+    
+    print("  ✓ Full engine test passed")
+    return True
+
+
+def test_statistics():
+    """Test 11: Statistics engine."""
+    print("\n" + "=" * 60)
+    print("TEST 11: Statistics Engine")
+    print("=" * 60)
+    
+    df = create_test_matrix()
+    engine = FeatureStabilityEngine(rolling_window=50)
+    stats_engine = FeatureStabilityStatisticsEngine()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        matrix_path = tmp_path / "independent_feature_matrix.parquet"
+        output_dir = tmp_path / "output"
+        df.to_parquet(matrix_path, index=False)
+        
+        result = engine.compute(
+            matrix_path=matrix_path,
+            output_dir=output_dir
+        )
+        
+        stats = stats_engine.analyze(result)
+        
+        assert stats.total_features == result.summary_statistics['total_features']
+        assert stats.kept_count == len(result.kept_features)
+        assert stats.removed_count == len(result.removed_features)
+    
+    print("  ✓ Statistics test passed")
+    return True
+
+
+def test_validator():
+    """Test 12: Validator."""
+    print("\n" + "=" * 60)
+    print("TEST 12: Validator")
+    print("=" * 60)
+    
+    df = create_test_matrix()
+    engine = FeatureStabilityEngine(rolling_window=50)
+    stats_engine = FeatureStabilityStatisticsEngine()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        matrix_path = tmp_path / "independent_feature_matrix.parquet"
+        output_dir = tmp_path / "output"
+        df.to_parquet(matrix_path, index=False)
+        
+        result = engine.compute(
+            matrix_path=matrix_path,
+            output_dir=output_dir
+        )
+        
+        stats = stats_engine.analyze(result)
+        
+        passed = run_validation(result, stats)
+        assert passed
+    
+    print("  ✓ Validator test passed")
+    return True
+
+
+def test_pipeline():
+    """Test 13: Full pipeline."""
+    print("\n" + "=" * 60)
+    print("TEST 13: Full Pipeline")
+    print("=" * 60)
+    
+    df = create_test_matrix()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        matrix_path = tmp_path / "independent_feature_matrix.parquet"
+        output_dir = tmp_path / "output"
+        df.to_parquet(matrix_path, index=False)
+        
+        research = FeatureStabilityResearch(rolling_window=50)
+        
+        result = research.run_stability(
+            matrix_path=matrix_path,
+            dataset_id="pipeline_test",
+            output_dir=output_dir
+        )
+        
+        assert result.status == "completed"
+        assert "stable_matrix" in result.artifacts
+        assert "feature_stability" in result.artifacts
+        assert "rolling_statistics" in result.artifacts
+        assert "regime_statistics" in result.artifacts
+        assert "removed_features" in result.artifacts
+        assert "stability_summary" in result.artifacts
+        assert "feature_stability_report" in result.artifacts
+        assert "stability_report" in result.artifacts
+        assert result.statistics.get("software_validation_passed") == True
+        
+        # Check outputs were saved
+        assert (output_dir / "stable_feature_matrix.parquet").exists()
+        assert (output_dir / "feature_stability.csv").exists()
+        assert (output_dir / "rolling_statistics.csv").exists()
+        assert (output_dir / "regime_statistics.csv").exists()
+        assert (output_dir / "removed_unstable_features.csv").exists()
+        assert (output_dir / "stability_summary.csv").exists()
+    
+    print("  ✓ Full pipeline test passed")
+    return True
+
+
+def main():
+    """Run all tests."""
+    print("\n" + "=" * 70)
+    print("PROJECT ATLAS - MODULE 202 INTEGRATION TEST")
+    print("Feature Stability")
+    print("=" * 70)
+    
+    results = {}
+    
+    results["load"] = test_engine_load()
+    results["rolling_mean"] = test_engine_rolling_mean()
+    results["rolling_variance"] = test_engine_rolling_variance()
+    results["distribution_drift"] = test_engine_distribution_drift()
+    results["regime_stability"] = test_engine_regime_stability()
+    results["stationarity"] = test_engine_stationarity()
+    results["entropy_stability"] = test_engine_entropy_stability()
+    results["stability_score"] = test_engine_stability_score()
+    results["decisions"] = test_engine_decisions()
+    results["full_engine"] = test_engine_compute()
+    results["statistics"] = test_statistics()
+    results["validator"] = test_validator()
+    results["pipeline"] = test_pipeline()
+    
+    print("\n" + "=" * 70)
+    print("RESULTS")
+    print("=" * 70)
+    
+    for name, ok in results.items():
+        print(f"  {'✓' if ok else '✗'} {name}")
+    
+    passed = sum(results.values())
+    total = len(results)
+    
+    print(f"\n  {passed}/{total} tests passed")
+    
+    if passed == total:
+        print("\n✓ Module 202 VALIDATED")
+        return 0
+    else:
+        print("\n⚠ Some tests failed")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,573 @@
+"""
+Module 201 - Feature Independence Engine
+
+Computes feature independence using multiple dependency metrics:
+  1. Pearson Correlation
+  2. Spearman Correlation
+  3. Mutual Information
+  4. Distance Correlation
+  5. Variance Inflation Factor (VIF)
+
+Output: Independent feature matrix, clusters, and representatives.
+"""
+
+import numpy as np
+import pandas as pd
+from dataclasses import dataclass
+from typing import Optional, Dict, Any, List, Tuple
+from scipy.cluster.hierarchy import linkage, fcluster
+from scipy.spatial.distance import squareform
+from sklearn.feature_selection import mutual_info_regression
+from sklearn.linear_model import LinearRegression
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+from joblib import Parallel, delayed
+from pathlib import Path
+import warnings
+warnings.filterwarnings('ignore')
+
+
+@dataclass
+class FeatureIndependenceResult:
+    """Results from feature independence analysis."""
+    independent_matrix: pd.DataFrame
+    dependency_matrix: pd.DataFrame
+    feature_clusters: pd.DataFrame
+    removed_features: List[str]
+    independent_features: List[str]
+    summary_statistics: Dict[str, Any]
+
+
+class FeatureIndependenceEngine:
+    """Core engine for feature independence analysis."""
+
+    # Default weights for dependency score
+    DEFAULT_DEPENDENCY_WEIGHTS = {
+        "pearson": 0.30,
+        "spearman": 0.25,
+        "mutual_information": 0.25,
+        "distance_correlation": 0.20
+    }
+
+    # Default cluster method
+    DEFAULT_CLUSTER_METHOD = "average"
+
+    # Default thresholds
+    DEFAULT_CLUSTER_THRESHOLD = 0.40
+    DEFAULT_VIF_THRESHOLD = 10.0
+
+    # Fill method for missing values
+    FILL_METHOD = "ffill"
+
+    def __init__(
+        self,
+        dependency_weights: Optional[Dict[str, float]] = None,
+        cluster_method: str = "average",
+        cluster_threshold: float = 0.40,
+        vif_threshold: float = 10.0,
+        n_jobs: int = -1,
+        random_state: int = 42,
+        timestamp_column: str = "timestamp",
+        quality_scores: Optional[pd.DataFrame] = None,
+        stability_scores: Optional[pd.DataFrame] = None,
+        entropy_scores: Optional[pd.DataFrame] = None,
+        predictive_scores: Optional[pd.DataFrame] = None
+    ):
+        """
+        Initialize the feature independence engine.
+        
+        Args:
+            dependency_weights: Dictionary of weights for dependency metrics
+            cluster_method: Linkage method ('ward', 'complete', 'average', 'single')
+            cluster_threshold: Distance threshold for clustering (0-1)
+            vif_threshold: VIF threshold for removing features
+            n_jobs: Number of parallel jobs (-1 = all cores)
+            random_state: Random seed for reproducibility
+            timestamp_column: Name of the timestamp column
+            quality_scores: DataFrame from Module 119 (feature quality)
+            stability_scores: DataFrame from Module 120 (feature stability)
+            entropy_scores: DataFrame from Module 109 (feature importance)
+            predictive_scores: DataFrame from Module 122 (predictive power)
+        """
+        self.dependency_weights = dependency_weights or self.DEFAULT_DEPENDENCY_WEIGHTS.copy()
+        self.cluster_method = cluster_method
+        self.cluster_threshold = cluster_threshold
+        self.vif_threshold = vif_threshold
+        self.n_jobs = n_jobs
+        self.random_state = random_state
+        self.timestamp_column = timestamp_column
+        self.quality_scores = quality_scores
+        self.stability_scores = stability_scores
+        self.entropy_scores = entropy_scores
+        self.predictive_scores = predictive_scores
+
+    def load_integrated_matrix(self, matrix_path: Path) -> pd.DataFrame:
+        """Load the integrated feature matrix."""
+        if not matrix_path.exists():
+            raise FileNotFoundError(f"Integrated matrix not found: {matrix_path}")
+        
+        if matrix_path.suffix == '.parquet':
+            df = pd.read_parquet(matrix_path)
+        else:
+            df = pd.read_csv(matrix_path)
+            if self.timestamp_column in df.columns:
+                df[self.timestamp_column] = pd.to_datetime(df[self.timestamp_column])
+        
+        return df
+
+    def load_normalization_params(self, params_path: Path) -> pd.DataFrame:
+        """Load normalization parameters."""
+        if params_path.exists():
+            return pd.read_csv(params_path)
+        return pd.DataFrame()
+
+    def get_feature_columns(self, df: pd.DataFrame) -> List[str]:
+        """Get numeric feature columns (exclude timestamp)."""
+        return [c for c in df.columns if c != self.timestamp_column]
+
+    def handle_missing_values(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Handle missing values in the feature matrix."""
+        return df.ffill().bfill()
+
+    def compute_pearson_matrix(self, df: pd.DataFrame, features: List[str]) -> pd.DataFrame:
+        """Compute Pearson correlation matrix."""
+        return df[features].corr(method='pearson')
+
+    def compute_spearman_matrix(self, df: pd.DataFrame, features: List[str]) -> pd.DataFrame:
+        """Compute Spearman correlation matrix."""
+        return df[features].corr(method='spearman')
+
+    def _mutual_information_pair(self, df: pd.DataFrame, f1: str, f2: str) -> float:
+        """Compute MI for a single pair."""
+        try:
+            x = df[[f1]]
+            y = df[f2]
+            mi = mutual_info_regression(x, y, random_state=self.random_state)[0]
+            return min(1.0, max(0.0, mi))
+        except:
+            return 0.0
+
+    def compute_mutual_information_matrix(
+        self,
+        df: pd.DataFrame,
+        features: List[str]
+    ) -> pd.DataFrame:
+        """Compute Mutual Information matrix with parallelization."""
+        n = len(features)
+        matrix = np.zeros((n, n))
+        
+        # Generate all unique pairs
+        pairs = [(i, j, features[i], features[j]) 
+                 for i in range(n) for j in range(i + 1, n)]
+        
+        # Compute MI for all pairs in parallel
+        results = Parallel(n_jobs=self.n_jobs)(
+            delayed(self._mutual_information_pair)(df, f1, f2)
+            for _, _, f1, f2 in pairs
+        )
+        
+        # Fill matrix
+        for (i, j, _, _), mi in zip(pairs, results):
+            matrix[i, j] = mi
+            matrix[j, i] = mi
+        
+        np.fill_diagonal(matrix, 1.0)
+        return pd.DataFrame(matrix, index=features, columns=features)
+
+    def _distance_correlation_pair(self, df: pd.DataFrame, f1: str, f2: str) -> float:
+        """Compute distance correlation for a single pair."""
+        def distance_correlation(x: np.ndarray, y: np.ndarray) -> float:
+            dx = np.abs(x[:, None] - x)
+            dy = np.abs(y[:, None] - y)
+            
+            def center_distance(d: np.ndarray) -> np.ndarray:
+                n = len(d)
+                row_mean = np.mean(d, axis=1, keepdims=True)
+                col_mean = np.mean(d, axis=0, keepdims=True)
+                total_mean = np.mean(d)
+                return d - row_mean - col_mean + total_mean
+            
+            A = center_distance(dx)
+            B = center_distance(dy)
+            
+            dcov2 = np.mean(A * B)
+            dvarx2 = np.mean(A * A)
+            dvar_y2 = np.mean(B * B)
+            
+            dcov2 = max(dcov2, 0.0)
+            dvarx2 = max(dvarx2, 1e-12)
+            dvar_y2 = max(dvar_y2, 1e-12)
+            
+            denom = np.sqrt(dvarx2 * dvar_y2)
+            
+            if denom < 1e-12:
+                return 0.0
+            
+            return np.sqrt(max(dcov2, 0.0) / denom)
+        
+        try:
+            x = df[f1].values
+            y = df[f2].values
+            dcorr = distance_correlation(x, y)
+            return min(1.0, max(0.0, dcorr))
+        except:
+            return 0.0
+
+    def compute_distance_correlation_matrix(
+        self,
+        df: pd.DataFrame,
+        features: List[str]
+    ) -> pd.DataFrame:
+        """Compute Distance Correlation matrix with parallelization."""
+        n = len(features)
+        matrix = np.zeros((n, n))
+        
+        # Generate all unique pairs
+        pairs = [(i, j, features[i], features[j]) 
+                 for i in range(n) for j in range(i + 1, n)]
+        
+        # Compute distance correlation for all pairs in parallel
+        results = Parallel(n_jobs=self.n_jobs)(
+            delayed(self._distance_correlation_pair)(df, f1, f2)
+            for _, _, f1, f2 in pairs
+        )
+        
+        # Fill matrix
+        for (i, j, _, _), dc in zip(pairs, results):
+            matrix[i, j] = dc
+            matrix[j, i] = dc
+        
+        np.fill_diagonal(matrix, 1.0)
+        return pd.DataFrame(matrix, index=features, columns=features)
+
+    def compute_vif(self, df: pd.DataFrame, features: List[str]) -> pd.DataFrame:
+        """Compute Variance Inflation Factor using statsmodels."""
+        vif_rows = []
+        X = df[features].values
+        
+        for i, feature in enumerate(features):
+            try:
+                vif = variance_inflation_factor(X, i)
+                vif_rows.append({'feature': feature, 'vif': float(max(1.0, vif))})
+            except:
+                vif_rows.append({'feature': feature, 'vif': 1.0})
+        
+        return pd.DataFrame(vif_rows)
+
+    def compute_dependency_score(
+        self,
+        pearson: pd.DataFrame,
+        spearman: pd.DataFrame,
+        mutual_info: pd.DataFrame,
+        distance_corr: pd.DataFrame,
+        features: List[str]
+    ) -> pd.DataFrame:
+        """Compute combined dependency score matrix."""
+        n = len(features)
+        matrix = np.zeros((n, n))
+        
+        for i in range(n):
+            for j in range(n):
+                if i == j:
+                    matrix[i, j] = 1.0
+                else:
+                    p = abs(pearson.iloc[i, j])
+                    s = abs(spearman.iloc[i, j])
+                    mi = mutual_info.iloc[i, j]
+                    dc = distance_corr.iloc[i, j]
+                    
+                    dependency = (
+                        self.dependency_weights.get('pearson', 0.30) * p +
+                        self.dependency_weights.get('spearman', 0.25) * s +
+                        self.dependency_weights.get('mutual_information', 0.25) * mi +
+                        self.dependency_weights.get('distance_correlation', 0.20) * dc
+                    )
+                    matrix[i, j] = np.clip(dependency, 0.0, 1.0)
+        
+        # Symmetrize
+        matrix = (matrix + matrix.T) / 2
+        np.fill_diagonal(matrix, 1.0)
+        
+        return pd.DataFrame(matrix, index=features, columns=features)
+
+    def cluster_features(
+        self,
+        dependency_matrix: pd.DataFrame,
+        features: List[str]
+    ) -> Tuple[pd.DataFrame, Dict[int, List[str]]]:
+        """Cluster features based on dependency distance."""
+        # Convert dependency to distance
+        distance = 1 - dependency_matrix.values
+        
+        # Ensure symmetry and valid diagonal
+        distance = (distance + distance.T) / 2
+        np.fill_diagonal(distance, 0)
+        distance = np.clip(distance, 0, 1)
+        
+        # Perform hierarchical clustering
+        condensed = squareform(distance)
+        Z = linkage(condensed, method=self.cluster_method)
+        cluster_labels = fcluster(Z, t=self.cluster_threshold, criterion='distance')
+        
+        # Create cluster assignments
+        cluster_df = pd.DataFrame({
+            'feature': features,
+            'cluster': cluster_labels
+        })
+        
+        # Create cluster dictionary
+        cluster_dict = {}
+        for cluster in np.unique(cluster_labels):
+            cluster_dict[int(cluster)] = cluster_df[cluster_df['cluster'] == cluster]['feature'].tolist()
+        
+        return cluster_df, cluster_dict
+
+    def compute_composite_score(
+        self,
+        feature: str,
+        quality_scores: Optional[pd.DataFrame],
+        stability_scores: Optional[pd.DataFrame],
+        entropy_scores: Optional[pd.DataFrame],
+        predictive_scores: Optional[pd.DataFrame],
+        vif_score: float
+    ) -> float:
+        """
+        Compute composite score for a feature using all available metrics.
+        
+        Score = 0.30 * Predictive + 0.25 * Stability + 0.20 * Quality + 0.15 * Entropy + 0.10 * (1 - VIF_norm)
+        """
+        # Get scores from each module (or use defaults)
+        predictive = 0.5
+        stability = 0.5
+        quality = 0.5
+        entropy = 0.5
+        
+        if predictive_scores is not None and feature in predictive_scores.index:
+            predictive = float(predictive_scores.loc[feature, 'predictive_score'] if 'predictive_score' in predictive_scores.columns else 0.5)
+        
+        if stability_scores is not None and feature in stability_scores.index:
+            stability = float(stability_scores.loc[feature, 'stability_score'] if 'stability_score' in stability_scores.columns else 0.5)
+        
+        if quality_scores is not None and feature in quality_scores.index:
+            quality = float(quality_scores.loc[feature, 'quality_score'] if 'quality_score' in quality_scores.columns else 0.5)
+        
+        if entropy_scores is not None and feature in entropy_scores.index:
+            entropy = float(entropy_scores.loc[feature, 'mutual_information'] if 'mutual_information' in entropy_scores.columns else 0.5)
+        
+        # Normalize VIF (lower is better)
+        vif_norm = max(0.0, min(1.0, 1.0 - (vif_score - 1) / 9))
+        
+        # Composite score
+        composite = (
+            0.30 * predictive +
+            0.25 * stability +
+            0.20 * quality +
+            0.15 * entropy +
+            0.10 * vif_norm
+        )
+        
+        return np.clip(composite, 0.0, 1.0)
+
+    def select_representatives(
+        self,
+        cluster_df: pd.DataFrame,
+        features: List[str],
+        vif_df: pd.DataFrame
+    ) -> Tuple[List[str], List[str]]:
+        """Select one representative per cluster using composite score."""
+        selected = []
+        removed = []
+        
+        # Create score lookup
+        vif_dict = dict(zip(vif_df['feature'], vif_df['vif']))
+        
+        for cluster in sorted(cluster_df['cluster'].unique()):
+            cluster_features = cluster_df[cluster_df['cluster'] == cluster]['feature'].tolist()
+            
+            if len(cluster_features) == 1:
+                selected.append(cluster_features[0])
+                continue
+            
+            # Compute composite score for each feature in cluster
+            scores = {}
+            for feature in cluster_features:
+                vif = vif_dict.get(feature, 1.0)
+                scores[feature] = self.compute_composite_score(
+                    feature,
+                    self.quality_scores,
+                    self.stability_scores,
+                    self.entropy_scores,
+                    self.predictive_scores,
+                    vif
+                )
+            
+            # Select feature with highest composite score
+            representative = max(scores, key=scores.get)
+            selected.append(representative)
+            
+            # Remove others
+            for f in cluster_features:
+                if f != representative:
+                    removed.append(f)
+        
+        return selected, removed
+
+    def compute_statistics(
+        self,
+        features: List[str],
+        selected: List[str],
+        removed: List[str],
+        cluster_df: pd.DataFrame,
+        vif_df: pd.DataFrame
+    ) -> Dict[str, Any]:
+        """Compute summary statistics."""
+        cluster_sizes = cluster_df.groupby('cluster').size()
+        largest_cluster = int(cluster_sizes.max()) if not cluster_sizes.empty else 0
+        avg_cluster_size = float(cluster_sizes.mean()) if not cluster_sizes.empty else 0
+        
+        avg_vif = vif_df['vif'].mean()
+        max_vif = vif_df['vif'].max()
+        
+        stats = {
+            'total_features': len(features),
+            'selected_features': len(selected),
+            'removed_features': len(removed),
+            'total_clusters': len(cluster_sizes),
+            'largest_cluster': largest_cluster,
+            'average_cluster_size': avg_cluster_size,
+            'average_vif': avg_vif,
+            'max_vif': max_vif,
+            'features_removed_percentage': len(removed) / len(features) * 100 if features else 0
+        }
+        
+        return stats
+
+    def save_outputs(
+        self,
+        df: pd.DataFrame,
+        selected: List[str],
+        removed: List[str],
+        dependency_matrix: pd.DataFrame,
+        cluster_df: pd.DataFrame,
+        stats: Dict[str, Any],
+        output_dir: Path
+    ) -> None:
+        """Save all outputs."""
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Independent matrix
+        independent_df = df[[self.timestamp_column] + selected]
+        matrix_path = output_dir / "independent_feature_matrix.parquet"
+        independent_df.to_parquet(matrix_path, index=False)
+        print(f"  Saved independent matrix to {matrix_path}")
+        
+        # Dependency matrix
+        dep_path = output_dir / "feature_dependency_matrix.csv"
+        dependency_matrix.to_csv(dep_path)
+        print(f"  Saved dependency matrix to {dep_path}")
+        
+        # Clusters
+        cluster_path = output_dir / "feature_clusters.csv"
+        cluster_df.to_csv(cluster_path, index=False)
+        print(f"  Saved clusters to {cluster_path}")
+        
+        # Removed features
+        removed_df = pd.DataFrame({'removed_features': removed})
+        removed_path = output_dir / "removed_features.csv"
+        removed_df.to_csv(removed_path, index=False)
+        print(f"  Saved removed features to {removed_path}")
+        
+        # Independent features
+        independent_df_list = pd.DataFrame({'independent_features': selected})
+        independent_path = output_dir / "independent_features.csv"
+        independent_df_list.to_csv(independent_path, index=False)
+        print(f"  Saved independent features to {independent_path}")
+        
+        # Statistics
+        stats_df = pd.DataFrame([stats])
+        stats_path = output_dir / "dependency_statistics.csv"
+        stats_df.to_csv(stats_path, index=False)
+        print(f"  Saved statistics to {stats_path}")
+
+    def compute(
+        self,
+        matrix_path: Path,
+        output_dir: Optional[Path] = None
+    ) -> FeatureIndependenceResult:
+        """Main computation method."""
+        print("\n  Computing Feature Independence...")
+        
+        if output_dir is None:
+            output_dir = Path("data/feature_store/independent")
+        
+        # Load integrated matrix
+        print(f"  Loading integrated matrix from: {matrix_path}")
+        df = self.load_integrated_matrix(matrix_path)
+        print(f"  Shape: {df.shape}")
+        
+        # Handle missing values
+        print("  Handling missing values...")
+        df = self.handle_missing_values(df)
+        
+        # Get features
+        features = self.get_feature_columns(df)
+        print(f"  Found {len(features)} features")
+        
+        if len(features) < 2:
+            raise ValueError("Need at least 2 features for independence analysis")
+        
+        # Compute matrices
+        print("  Computing Pearson correlation...")
+        pearson = self.compute_pearson_matrix(df, features)
+        
+        print("  Computing Spearman correlation...")
+        spearman = self.compute_spearman_matrix(df, features)
+        
+        print("  Computing Mutual Information (parallel)...")
+        mutual_info = self.compute_mutual_information_matrix(df, features)
+        
+        print("  Computing Distance Correlation (parallel)...")
+        distance_corr = self.compute_distance_correlation_matrix(df, features)
+        
+        # Compute VIF
+        print("  Computing VIF...")
+        vif_df = self.compute_vif(df, features)
+        
+        # Compute dependency score
+        print("  Computing dependency scores...")
+        dependency_matrix = self.compute_dependency_score(
+            pearson, spearman, mutual_info, distance_corr, features
+        )
+        
+        # Cluster features
+        print(f"  Clustering features (method={self.cluster_method})...")
+        cluster_df, cluster_dict = self.cluster_features(dependency_matrix, features)
+        print(f"    Found {len(cluster_dict)} clusters")
+        
+        # Select representatives using composite score
+        print("  Selecting representatives using composite scores...")
+        selected, removed = self.select_representatives(cluster_df, features, vif_df)
+        print(f"    Selected {len(selected)} features")
+        print(f"    Removed {len(removed)} features")
+        
+        # Compute statistics
+        stats = self.compute_statistics(features, selected, removed, cluster_df, vif_df)
+        
+        # Save outputs
+        print("\n  Saving outputs...")
+        self.save_outputs(df, selected, removed, dependency_matrix, cluster_df, stats, output_dir)
+        
+        print(f"\n  Independence Summary:")
+        print(f"    Total Features: {stats['total_features']}")
+        print(f"    Selected: {stats['selected_features']}")
+        print(f"    Removed: {stats['removed_features']}")
+        print(f"    Clusters: {stats['total_clusters']}")
+        print(f"    Features Removed: {stats['features_removed_percentage']:.1f}%")
+        
+        return FeatureIndependenceResult(
+            independent_matrix=df[[self.timestamp_column] + selected],
+            dependency_matrix=dependency_matrix,
+            feature_clusters=cluster_df,
+            removed_features=removed,
+            independent_features=selected,
+            summary_statistics=stats
+        )

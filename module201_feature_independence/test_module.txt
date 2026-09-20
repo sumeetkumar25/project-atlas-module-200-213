@@ -1,0 +1,381 @@
+# atlas/modules/module201_feature_independence/test_module.py
+"""
+Module 201 - Integration Test
+
+Tests feature independence engine, statistics, validator, report, and pipeline.
+"""
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
+
+import numpy as np
+import pandas as pd
+import tempfile
+
+from atlas.modules.module201_feature_independence.engine import FeatureIndependenceEngine
+from atlas.modules.module201_feature_independence.statistics import FeatureIndependenceStatisticsEngine
+from atlas.modules.module201_feature_independence.validator import run_validation
+from atlas.modules.module201_feature_independence.module import FeatureIndependenceResearch
+
+
+def create_test_matrix(n=200, n_features=20):
+    """Create a synthetic feature matrix for testing."""
+    np.random.seed(42)
+    
+    timestamps = pd.date_range('2020-01-01', periods=n, freq='1h')
+    
+    # Create base features
+    df = pd.DataFrame({'timestamp': timestamps})
+    
+    # Create correlated groups
+    # Group 1: Highly correlated
+    base1 = np.random.randn(n) * 10 + 50
+    df['feature1'] = base1 + np.random.randn(n) * 0.1
+    df['feature2'] = base1 * 0.8 + np.random.randn(n) * 0.2
+    df['feature3'] = base1 * 1.2 + np.random.randn(n) * 0.1
+    
+    # Group 2: Moderately correlated
+    base2 = np.random.randn(n) * 5 + 100
+    df['feature4'] = base2 + np.random.randn(n) * 0.5
+    df['feature5'] = base2 * 0.9 + np.random.randn(n) * 0.5
+    
+    # Group 3: Independent features
+    df['feature6'] = np.random.randn(n) * 10 + 50
+    df['feature7'] = np.random.randn(n) * 5 + 100
+    df['feature8'] = np.random.randn(n) * 20 + 1000
+    
+    # More features for larger test
+    for i in range(9, n_features + 1):
+        df[f'feature{i}'] = np.random.randn(n) * 10 + 50
+    
+    return df
+
+
+def test_engine_load():
+    """Test 1: Load integrated matrix."""
+    print("\n" + "=" * 60)
+    print("TEST 1: Load Integrated Matrix")
+    print("=" * 60)
+    
+    df = create_test_matrix()
+    engine = FeatureIndependenceEngine()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        matrix_path = tmp_path / "integrated_feature_matrix.parquet"
+        df.to_parquet(matrix_path, index=False)
+        
+        loaded_df = engine.load_integrated_matrix(matrix_path)
+        
+        assert not loaded_df.empty
+        assert 'timestamp' in loaded_df.columns
+        assert len(loaded_df) == len(df)
+    
+    print("  ✓ Load test passed")
+    return True
+
+
+def test_engine_pearson():
+    """Test 2: Pearson correlation."""
+    print("\n" + "=" * 60)
+    print("TEST 2: Pearson Correlation")
+    print("=" * 60)
+    
+    df = create_test_matrix(n=100, n_features=8)
+    engine = FeatureIndependenceEngine()
+    
+    features = engine.get_feature_columns(df)
+    pearson = engine.compute_pearson_matrix(df, features)
+    
+    assert not pearson.empty
+    assert pearson.shape == (len(features), len(features))
+    
+    # feature1 and feature2 should be highly correlated
+    assert pearson.loc['feature1', 'feature2'] > 0.8
+    
+    print("  ✓ Pearson test passed")
+    return True
+
+
+def test_engine_mutual_information():
+    """Test 3: Mutual Information matrix."""
+    print("\n" + "=" * 60)
+    print("TEST 3: Mutual Information")
+    print("=" * 60)
+    
+    df = create_test_matrix(n=100, n_features=8)
+    engine = FeatureIndependenceEngine()
+    
+    features = engine.get_feature_columns(df)
+    mi = engine.compute_mutual_information_matrix(df, features)
+    
+    assert not mi.empty
+    assert mi.shape == (len(features), len(features))
+    assert np.all(mi >= 0)
+    assert np.all(mi <= 1)
+    
+    print("  ✓ Mutual Information test passed")
+    return True
+
+
+def test_engine_vif():
+    """Test 4: VIF computation."""
+    print("\n" + "=" * 60)
+    print("TEST 4: VIF")
+    print("=" * 60)
+    
+    df = create_test_matrix(n=200, n_features=8)
+    engine = FeatureIndependenceEngine()
+    
+    features = engine.get_feature_columns(df)
+    vif_df = engine.compute_vif(df, features)
+    
+    assert not vif_df.empty
+    assert 'vif' in vif_df.columns
+    assert np.all(vif_df['vif'] >= 1)
+    
+    # Highly correlated features should have high VIF
+    vif1 = vif_df[vif_df['feature'] == 'feature1']['vif'].iloc[0]
+    assert vif1 > 1
+    
+    print("  ✓ VIF test passed")
+    return True
+
+
+def test_engine_dependency_score():
+    """Test 5: Dependency score matrix."""
+    print("\n" + "=" * 60)
+    print("TEST 5: Dependency Score")
+    print("=" * 60)
+    
+    df = create_test_matrix(n=100, n_features=8)
+    engine = FeatureIndependenceEngine()
+    
+    features = engine.get_feature_columns(df)
+    pearson = engine.compute_pearson_matrix(df, features)
+    spearman = engine.compute_spearman_matrix(df, features)
+    mi = engine.compute_mutual_information_matrix(df, features)
+    dc = engine.compute_distance_correlation_matrix(df, features)
+    
+    dependency = engine.compute_dependency_score(pearson, spearman, mi, dc, features)
+    
+    assert not dependency.empty
+    assert dependency.shape == (len(features), len(features))
+    assert np.all(dependency >= 0)
+    assert np.all(dependency <= 1)
+    
+    # Diagonal should be 1
+    assert np.allclose(np.diag(dependency.values), 1)
+    
+    print("  ✓ Dependency score test passed")
+    return True
+
+
+def test_engine_clustering():
+    """Test 6: Feature clustering."""
+    print("\n" + "=" * 60)
+    print("TEST 6: Feature Clustering")
+    print("=" * 60)
+    
+    df = create_test_matrix(n=100, n_features=8)
+    engine = FeatureIndependenceEngine()
+    
+    features = engine.get_feature_columns(df)
+    pearson = engine.compute_pearson_matrix(df, features)
+    spearman = engine.compute_spearman_matrix(df, features)
+    mi = engine.compute_mutual_information_matrix(df, features)
+    dc = engine.compute_distance_correlation_matrix(df, features)
+    
+    dependency = engine.compute_dependency_score(pearson, spearman, mi, dc, features)
+    cluster_df, cluster_dict = engine.cluster_features(dependency, features)
+    
+    assert not cluster_df.empty
+    assert len(cluster_dict) > 0
+    assert cluster_df['cluster'].nunique() == len(cluster_dict)
+    
+    print(f"  Found {len(cluster_dict)} clusters")
+    print("  ✓ Clustering test passed")
+    return True
+
+
+def test_engine_compute():
+    """Test 7: Full engine computation."""
+    print("\n" + "=" * 60)
+    print("TEST 7: Full Engine Computation")
+    print("=" * 60)
+    
+    df = create_test_matrix(n=100, n_features=8)
+    engine = FeatureIndependenceEngine()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        matrix_path = tmp_path / "integrated_feature_matrix.parquet"
+        output_dir = tmp_path / "output"
+        df.to_parquet(matrix_path, index=False)
+        
+        result = engine.compute(
+            matrix_path=matrix_path,
+            output_dir=output_dir
+        )
+        
+        assert not result.independent_matrix.empty
+        assert not result.dependency_matrix.empty
+        assert not result.feature_clusters.empty
+        assert len(result.independent_features) > 0
+        assert result.summary_statistics['total_features'] > 0
+        
+        # Check outputs were saved
+        assert (output_dir / "independent_feature_matrix.parquet").exists()
+        assert (output_dir / "feature_dependency_matrix.csv").exists()
+        assert (output_dir / "feature_clusters.csv").exists()
+    
+    print("  ✓ Full engine test passed")
+    return True
+
+
+def test_statistics():
+    """Test 8: Statistics engine."""
+    print("\n" + "=" * 60)
+    print("TEST 8: Statistics Engine")
+    print("=" * 60)
+    
+    df = create_test_matrix(n=100, n_features=8)
+    engine = FeatureIndependenceEngine()
+    stats_engine = FeatureIndependenceStatisticsEngine()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        matrix_path = tmp_path / "integrated_feature_matrix.parquet"
+        output_dir = tmp_path / "output"
+        df.to_parquet(matrix_path, index=False)
+        
+        result = engine.compute(
+            matrix_path=matrix_path,
+            output_dir=output_dir
+        )
+        
+        stats = stats_engine.analyze(result)
+        
+        assert stats.total_features == result.summary_statistics['total_features']
+        assert stats.selected_features == len(result.independent_features)
+        assert stats.removed_features == len(result.removed_features)
+    
+    print("  ✓ Statistics test passed")
+    return True
+
+
+def test_validator():
+    """Test 9: Validator."""
+    print("\n" + "=" * 60)
+    print("TEST 9: Validator")
+    print("=" * 60)
+    
+    df = create_test_matrix(n=100, n_features=8)
+    engine = FeatureIndependenceEngine()
+    stats_engine = FeatureIndependenceStatisticsEngine()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        matrix_path = tmp_path / "integrated_feature_matrix.parquet"
+        output_dir = tmp_path / "output"
+        df.to_parquet(matrix_path, index=False)
+        
+        result = engine.compute(
+            matrix_path=matrix_path,
+            output_dir=output_dir
+        )
+        
+        stats = stats_engine.analyze(result)
+        
+        passed = run_validation(result, stats)
+        assert passed
+    
+    print("  ✓ Validator test passed")
+    return True
+
+
+def test_pipeline():
+    """Test 10: Full pipeline."""
+    print("\n" + "=" * 60)
+    print("TEST 10: Full Pipeline")
+    print("=" * 60)
+    
+    df = create_test_matrix(n=100, n_features=8)
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        matrix_path = tmp_path / "integrated_feature_matrix.parquet"
+        output_dir = tmp_path / "output"
+        df.to_parquet(matrix_path, index=False)
+        
+        research = FeatureIndependenceResearch()
+        
+        result = research.run_independence(
+            matrix_path=matrix_path,
+            dataset_id="pipeline_test",
+            output_dir=output_dir
+        )
+        
+        assert result.status == "completed"
+        assert "independent_matrix" in result.artifacts
+        assert "dependency_matrix" in result.artifacts
+        assert "feature_clusters" in result.artifacts
+        assert "removed_features" in result.artifacts
+        assert "independent_features" in result.artifacts
+        assert "feature_independence_report" in result.artifacts
+        assert "cluster_report" in result.artifacts
+        assert result.statistics.get("software_validation_passed") == True
+        
+        # Check outputs were saved
+        assert (output_dir / "independent_feature_matrix.parquet").exists()
+        assert (output_dir / "feature_dependency_matrix.csv").exists()
+        assert (output_dir / "feature_clusters.csv").exists()
+    
+    print("  ✓ Full pipeline test passed")
+    return True
+
+
+def main():
+    """Run all tests."""
+    print("\n" + "=" * 70)
+    print("PROJECT ATLAS - MODULE 201 INTEGRATION TEST")
+    print("Feature Independence")
+    print("=" * 70)
+    
+    results = {}
+    
+    results["load"] = test_engine_load()
+    results["pearson"] = test_engine_pearson()
+    results["mutual_information"] = test_engine_mutual_information()
+    results["vif"] = test_engine_vif()
+    results["dependency_score"] = test_engine_dependency_score()
+    results["clustering"] = test_engine_clustering()
+    results["full_engine"] = test_engine_compute()
+    results["statistics"] = test_statistics()
+    results["validator"] = test_validator()
+    results["pipeline"] = test_pipeline()
+    
+    print("\n" + "=" * 70)
+    print("RESULTS")
+    print("=" * 70)
+    
+    for name, ok in results.items():
+        print(f"  {'✓' if ok else '✗'} {name}")
+    
+    passed = sum(results.values())
+    total = len(results)
+    
+    print(f"\n  {passed}/{total} tests passed")
+    
+    if passed == total:
+        print("\n✓ Module 201 VALIDATED")
+        return 0
+    else:
+        print("\n⚠ Some tests failed")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

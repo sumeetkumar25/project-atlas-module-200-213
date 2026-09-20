@@ -1,0 +1,416 @@
+"""
+Module 200 - Feature Integration Engine
+
+Loads the master feature matrix, validates, normalizes, and produces the integrated feature matrix.
+
+Responsibilities:
+  1. Load master_feature_matrix.parquet
+  2. Load feature_metadata.parquet
+  3. Validate feature names
+  4. Remove duplicate columns (scalable O(n) approach)
+  5. Remove constant columns
+  6. Normalize every numeric feature
+  7. Generate feature index
+  8. Save integrated matrix
+  9. Save normalization parameters for reproducibility
+"""
+
+import numpy as np
+import pandas as pd
+from dataclasses import dataclass
+from typing import Optional, Dict, Any, List, Tuple
+from pathlib import Path
+import warnings
+warnings.filterwarnings('ignore')
+
+
+@dataclass
+class FeatureIntegrationResult:
+    """Results from feature integration."""
+    integrated_matrix: pd.DataFrame
+    feature_index: pd.DataFrame
+    summary_statistics: Dict[str, Any]
+
+
+class FeatureIntegrationEngine:
+    """Core engine for feature integration."""
+
+    def __init__(
+        self,
+        timestamp_column: str = "timestamp",
+        remove_duplicates: bool = True,
+        remove_constant: bool = True,
+        normalize: bool = True
+    ):
+        """
+        Initialize the feature integration engine.
+        
+        Args:
+            timestamp_column: Name of the timestamp column
+            remove_duplicates: Whether to remove duplicate columns
+            remove_constant: Whether to remove constant columns
+            normalize: Whether to normalize features
+        """
+        self.timestamp_column = timestamp_column
+        self.remove_duplicates = remove_duplicates
+        self.remove_constant = remove_constant
+        self.normalize = normalize
+
+    def load_master_matrix(self, master_path: Path) -> pd.DataFrame:
+        """
+        Load the master feature matrix.
+        """
+        if not master_path.exists():
+            raise FileNotFoundError(f"Master matrix not found: {master_path}")
+        
+        if master_path.suffix == '.parquet':
+            df = pd.read_parquet(master_path)
+        else:
+            df = pd.read_csv(master_path)
+            if self.timestamp_column in df.columns:
+                df[self.timestamp_column] = pd.to_datetime(df[self.timestamp_column])
+        
+        return df
+
+    def load_metadata(self, metadata_path: Path) -> pd.DataFrame:
+        """
+        Load feature metadata.
+        """
+        if not metadata_path.exists():
+            raise FileNotFoundError(f"Metadata not found: {metadata_path}")
+        
+        if metadata_path.suffix == '.parquet':
+            df = pd.read_parquet(metadata_path)
+        else:
+            df = pd.read_csv(metadata_path)
+        
+        return df
+
+    def validate_features(self, df: pd.DataFrame, metadata: pd.DataFrame) -> pd.DataFrame:
+        """
+        Validate feature names against metadata.
+        """
+        # Check timestamp exists
+        if self.timestamp_column not in df.columns:
+            raise ValueError(f"Timestamp column '{self.timestamp_column}' not found")
+        
+        # Get feature columns
+        feature_cols = [c for c in df.columns if c != self.timestamp_column]
+        metadata_features = metadata['feature'].tolist()
+        
+        # Check for missing features in metadata
+        missing_in_metadata = set(feature_cols) - set(metadata_features)
+        if missing_in_metadata:
+            print(f"  Warning: {len(missing_in_metadata)} features missing from metadata")
+        
+        # Check for extra features in metadata
+        extra_in_df = set(metadata_features) - set(feature_cols)
+        if extra_in_df:
+            print(f"  Warning: {len(extra_in_df)} metadata features not in dataframe")
+        
+        return df
+
+    def remove_duplicate_columns(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
+        """
+        Remove duplicate columns using scalable O(n) approach.
+        
+        Uses pandas DataFrame.T.duplicated() for efficient duplicate detection.
+        
+        Returns:
+            (DataFrame with duplicates removed, list of removed columns)
+        """
+        if not self.remove_duplicates:
+            return df, []
+        
+        # Separate timestamp from features
+        timestamp_col = self.timestamp_column
+        feature_df = df.drop(columns=[timestamp_col])
+        
+        if feature_df.empty or len(feature_df.columns) < 2:
+            return df, []
+        
+        # Find duplicate columns (scalable O(n) approach)
+        duplicate_mask = feature_df.T.duplicated()
+        
+        # Get removed columns (all duplicates except first occurrence)
+        removed = feature_df.columns[duplicate_mask].tolist()
+        
+        # Keep only unique columns
+        feature_df = feature_df.loc[:, ~duplicate_mask]
+        
+        # Reconstruct DataFrame with timestamp
+        df = pd.concat([df[[timestamp_col]], feature_df], axis=1)
+        
+        return df, removed
+
+    def remove_constant_columns(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
+        """
+        Remove constant columns.
+        
+        Returns:
+            (DataFrame with constants removed, list of removed columns)
+        """
+        if not self.remove_constant:
+            return df, []
+        
+        removed_cols = []
+        features = [c for c in df.columns if c != self.timestamp_column]
+        
+        for col in features:
+            if col not in df.columns:
+                continue
+            if df[col].nunique() <= 1:
+                removed_cols.append(col)
+                df = df.drop(columns=[col])
+        
+        return df, removed_cols
+
+    def normalize_features(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Normalize numeric features using Z-score.
+        
+        Returns:
+            (DataFrame with normalized features, normalization parameters)
+        """
+        if not self.normalize:
+            return df, pd.DataFrame()
+        
+        features = [c for c in df.columns if c != self.timestamp_column]
+        norm_params = []
+        
+        for col in features:
+            series = df[col]
+            mean = series.mean()
+            std = series.std()
+            
+            if std > 1e-12:
+                df[col] = (series - mean) / std
+                normalized = True
+            else:
+                df[col] = 0.0
+                normalized = False
+            
+            norm_params.append({
+                'feature': col,
+                'mean': mean,
+                'std': std,
+                'normalized': normalized
+            })
+        
+        norm_df = pd.DataFrame(norm_params)
+        return df, norm_df
+
+    def build_feature_index(
+        self,
+        df: pd.DataFrame,
+        metadata: pd.DataFrame,
+        removed_duplicates: List[str],
+        removed_constants: List[str],
+        norm_params: pd.DataFrame
+    ) -> pd.DataFrame:
+        """
+        Build feature index DataFrame.
+        """
+        features = [c for c in df.columns if c != self.timestamp_column]
+        
+        index_rows = []
+        for feature in features:
+            # Get metadata
+            meta_row = metadata[metadata['feature'] == feature]
+            if not meta_row.empty:
+                dtype = meta_row['dtype'].iloc[0]
+                missing_pct = meta_row['null_percentage'].iloc[0]
+            else:
+                dtype = str(df[feature].dtype)
+                missing_pct = df[feature].isna().mean() * 100
+            
+            # Get normalization params
+            norm_row = norm_params[norm_params['feature'] == feature] if not norm_params.empty else pd.DataFrame()
+            if not norm_row.empty:
+                normalized = norm_row['normalized'].iloc[0]
+                mean = norm_row['mean'].iloc[0]
+                std = norm_row['std'].iloc[0]
+            else:
+                normalized = False
+                mean = None
+                std = None
+            
+            index_rows.append({
+                'feature': feature,
+                'dtype': dtype,
+                'missing_percentage': missing_pct,
+                'mean': mean,
+                'std': std,
+                'normalized': normalized,
+                'removed_duplicate': feature in removed_duplicates,
+                'removed_constant': feature in removed_constants,
+                'selected': True
+            })
+        
+        return pd.DataFrame(index_rows)
+
+    def save_integrated_matrix(self, df: pd.DataFrame, output_dir: Path) -> None:
+        """
+        Save the integrated feature matrix.
+        """
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Save integrated matrix
+        matrix_path = output_dir / "integrated_feature_matrix.parquet"
+        df.to_parquet(matrix_path, index=False)
+        print(f"  Saved integrated matrix to {matrix_path}")
+
+    def save_normalization_parameters(self, norm_params: pd.DataFrame, output_dir: Path) -> None:
+        """
+        Save normalization parameters for reproducibility.
+        
+        Later modules (paper trading, live trading, walk-forward) will use these
+        to apply the exact same normalization to new data.
+        """
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Save normalization parameters
+        norm_path = output_dir / "normalization_parameters.csv"
+        norm_params.to_csv(norm_path, index=False)
+        print(f"  Saved normalization parameters to {norm_path}")
+
+    def save_feature_index(self, feature_index: pd.DataFrame, output_dir: Path) -> None:
+        """
+        Save the feature index.
+        """
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        index_path = output_dir / "feature_index.csv"
+        feature_index.to_csv(index_path, index=False)
+        print(f"  Saved feature index to {index_path}")
+
+    def save_integration_summary(self, stats: Dict[str, Any], output_dir: Path) -> None:
+        """
+        Save the integration summary.
+        """
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        summary_path = output_dir / "integration_summary.csv"
+        summary_df = pd.DataFrame([stats])
+        summary_df.to_csv(summary_path, index=False)
+        print(f"  Saved integration summary to {summary_path}")
+
+    def compute_statistics(
+        self,
+        df: pd.DataFrame,
+        removed_duplicates: List[str],
+        removed_constants: List[str],
+        norm_params: pd.DataFrame
+    ) -> Dict[str, Any]:
+        """
+        Compute summary statistics.
+        """
+        total_features = len([c for c in df.columns if c != self.timestamp_column])
+        
+        # Count normalized features
+        if not norm_params.empty:
+            normalized_count = norm_params['normalized'].sum()
+        else:
+            normalized_count = 0
+        
+        # Memory usage
+        memory_usage = df.memory_usage(deep=True).sum() / (1024 * 1024)
+        
+        # Missing percentage
+        missing_pct = df.isna().mean().mean() * 100
+        
+        stats = {
+            'total_rows': len(df),
+            'total_features': total_features,
+            'removed_duplicates': len(removed_duplicates),
+            'removed_constants': len(removed_constants),
+            'normalized_features': int(normalized_count),
+            'memory_usage_mb': memory_usage,
+            'missing_percentage': missing_pct,
+            'feature_density': 1 - (missing_pct / 100),
+            'timestamp_start': df[self.timestamp_column].min(),
+            'timestamp_end': df[self.timestamp_column].max()
+        }
+        
+        return stats
+
+    def compute(
+        self,
+        master_path: Path,
+        metadata_path: Optional[Path] = None,
+        output_dir: Optional[Path] = None
+    ) -> FeatureIntegrationResult:
+        """
+        Main computation method.
+        """
+        print("\n  Computing Feature Integration...")
+        
+        # Set default output directory
+        if output_dir is None:
+            output_dir = Path("data/feature_store/master")
+        
+        # Load master matrix
+        print(f"  Loading master matrix from: {master_path}")
+        df = self.load_master_matrix(master_path)
+        print(f"  Master shape: {df.shape}")
+        
+        # Load metadata
+        if metadata_path is None:
+            metadata_path = master_path.parent / "feature_metadata.parquet"
+        
+        print(f"  Loading metadata from: {metadata_path}")
+        metadata = self.load_metadata(metadata_path)
+        print(f"  Metadata shape: {metadata.shape}")
+        
+        # Validate features
+        print("  Validating features...")
+        df = self.validate_features(df, metadata)
+        
+        # Remove duplicate columns (scalable O(n) approach)
+        print("  Removing duplicate columns...")
+        df, removed_duplicates = self.remove_duplicate_columns(df)
+        print(f"    Removed {len(removed_duplicates)} duplicate columns")
+        if removed_duplicates:
+            print(f"    Removed: {removed_duplicates[:5]}{'...' if len(removed_duplicates) > 5 else ''}")
+        
+        # Remove constant columns
+        print("  Removing constant columns...")
+        df, removed_constants = self.remove_constant_columns(df)
+        print(f"    Removed {len(removed_constants)} constant columns")
+        
+        # Normalize features
+        print("  Normalizing features...")
+        df, norm_params = self.normalize_features(df)
+        if not norm_params.empty:
+            normalized_count = norm_params['normalized'].sum()
+            print(f"    Normalized {normalized_count} features")
+        
+        # Build feature index
+        print("  Building feature index...")
+        feature_index = self.build_feature_index(
+            df, metadata, removed_duplicates, removed_constants, norm_params
+        )
+        print(f"    Index has {len(feature_index)} features")
+        
+        # Compute statistics
+        stats = self.compute_statistics(df, removed_duplicates, removed_constants, norm_params)
+        
+        # Save outputs
+        print("\n  Saving outputs...")
+        self.save_integrated_matrix(df, output_dir)
+        self.save_normalization_parameters(norm_params, output_dir)
+        self.save_feature_index(feature_index, output_dir)
+        self.save_integration_summary(stats, output_dir)
+        
+        print(f"\n  Integration Summary:")
+        print(f"    Features: {stats['total_features']}")
+        print(f"    Rows: {stats['total_rows']:,}")
+        print(f"    Removed Duplicates: {stats['removed_duplicates']}")
+        print(f"    Removed Constants: {stats['removed_constants']}")
+        print(f"    Normalized: {stats['normalized_features']}")
+        
+        return FeatureIntegrationResult(
+            integrated_matrix=df,
+            feature_index=feature_index,
+            summary_statistics=stats
+        )

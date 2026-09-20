@@ -1,0 +1,128 @@
+# atlas/modules/module203_feature_predictive_power/validator.py
+"""
+Module 203 - Feature Predictive Power Validator
+"""
+
+import numpy as np
+import pandas as pd
+from .engine import FeaturePredictivePowerResult
+from .statistics import FeaturePredictivePowerStatistics
+
+
+class FeaturePredictivePowerValidator:
+    """Validator for feature predictive power results."""
+
+    def __init__(self, timestamp_column: str = "timestamp"):
+        self.timestamp_column = timestamp_column
+
+    def validate(
+        self,
+        result: FeaturePredictivePowerResult,
+        statistics: FeaturePredictivePowerStatistics
+    ) -> bool:
+        """Validate results and statistics."""
+        issues = []
+        warnings = []
+        
+        # Check predictive matrix
+        if result.predictive_matrix.empty:
+            issues.append("Predictive matrix is empty")
+        else:
+            if self.timestamp_column not in result.predictive_matrix.columns:
+                issues.append("Missing timestamp column")
+        
+        # Check feature scores
+        if result.feature_scores.empty:
+            issues.append("Feature scores table is empty")
+        else:
+            required_cols = ['feature', 'predictive_score', 'decision']
+            missing = set(required_cols) - set(result.feature_scores.columns)
+            if missing:
+                issues.append(f"Missing columns in feature scores: {missing}")
+            
+            # Check scores are in [0, 1]
+            if 'predictive_score' in result.feature_scores.columns:
+                if not np.all((0 <= result.feature_scores['predictive_score']) & 
+                            (result.feature_scores['predictive_score'] <= 1)):
+                    issues.append("Predictive scores outside [0, 1] range")
+            
+            # Check decisions are valid
+            if 'decision' in result.feature_scores.columns:
+                valid_decisions = {'KEEP', 'WARNING', 'REMOVE'}
+                invalid = set(result.feature_scores['decision'].unique()) - valid_decisions
+                if invalid:
+                    issues.append(f"Invalid decisions found: {invalid}")
+        
+        # Check feature rankings
+        if result.feature_rankings.empty:
+            issues.append("Feature rankings is empty")
+        
+        # Check kept/removed lists
+        total = len(result.kept_features) + len(result.removed_features)
+        if total != result.summary_statistics['total_features']:
+            issues.append(
+                f"Feature count mismatch: {total} vs {result.summary_statistics['total_features']}"
+            )
+        
+        # Check no duplicates across lists
+        all_features = set(result.kept_features) | set(result.removed_features)
+        if len(all_features) != total:
+            issues.append("Features appear in multiple lists")
+        
+        # Check statistics match result
+        if statistics.total_features != result.summary_statistics['total_features']:
+            issues.append(
+                f"Total features mismatch: stats={statistics.total_features}, "
+                f"result={result.summary_statistics['total_features']}"
+            )
+        
+        if statistics.kept_count != len(result.kept_features):
+            issues.append(
+                f"Kept count mismatch: stats={statistics.kept_count}, "
+                f"result={len(result.kept_features)}"
+            )
+        
+        if statistics.removed_count != len(result.removed_features):
+            issues.append(
+                f"Removed count mismatch: stats={statistics.removed_count}, "
+                f"result={len(result.removed_features)}"
+            )
+        
+        # Warnings (non-fatal)
+        if statistics.kept_percentage < 30:
+            warnings.append(f"Low kept percentage: {statistics.kept_percentage:.1f}%")
+        
+        if statistics.average_predictive_score < 0.3:
+            warnings.append(f"Low average predictive score: {statistics.average_predictive_score:.3f}")
+        
+        if warnings:
+            print("\n  WARNINGS:")
+            for warning in warnings:
+                print(f"    ⚠ {warning}")
+        
+        if issues:
+            raise ValueError(
+                f"Feature Predictive Power validation failed with {len(issues)} issue(s):\n" +
+                "\n".join(f"  - {issue}" for issue in issues)
+            )
+        
+        return True
+
+
+def run_validation(result, statistics):
+    """Run validation with user-friendly output."""
+    validator = FeaturePredictivePowerValidator()
+    
+    print("\n" + "=" * 60)
+    print("FEATURE PREDICTIVE POWER VALIDATION")
+    print("=" * 60)
+    
+    try:
+        validator.validate(result, statistics)
+        print("\n  ✓ All validation checks passed")
+        print("=" * 60)
+        return True
+    except ValueError as e:
+        print(e)
+        print("=" * 60)
+        return False

@@ -1,0 +1,596 @@
+"""
+Module 202 - Feature Stability Engine
+
+Determines which features remain statistically stable across:
+  - Time
+  - Volatility regimes
+  - Bull/Bear/Ranging markets
+
+Output: Stable feature matrix and stability statistics.
+"""
+
+import numpy as np
+import pandas as pd
+from dataclasses import dataclass
+from typing import Optional, Dict, Any, List, Tuple
+from scipy import stats
+from scipy.stats import kstest, kruskal, f_oneway, norm
+from statsmodels.tsa.stattools import adfuller, kpss
+from statsmodels.stats.diagnostic import breaks_cusumolsresid
+from pathlib import Path
+import warnings
+warnings.filterwarnings('ignore')
+
+
+@dataclass
+class FeatureStabilityResult:
+    """Results from feature stability analysis."""
+    stable_matrix: pd.DataFrame
+    feature_stability: pd.DataFrame
+    rolling_statistics: pd.DataFrame
+    regime_statistics: pd.DataFrame
+    kept_features: List[str]
+    removed_features: List[str]
+    summary_statistics: Dict[str, Any]
+
+
+class FeatureStabilityEngine:
+    """Core engine for feature stability analysis."""
+
+    # Columns to ignore (not features)
+    IGNORE_COLS = {"timestamp", "date", "time", "index"}
+
+    # Stability thresholds
+    PASS_THRESHOLD = 0.80
+    WARNING_THRESHOLD = 0.60
+
+    # Window for rolling statistics
+    ROLLING_WINDOW = 500
+
+    # Outlier threshold
+    OUTLIER_THRESHOLD = 3.0
+
+    # Regime definitions
+    ATR_PERIOD = 14
+    TREND_EMA_PERIOD = 200
+    VOLATILITY_THRESHOLDS = (0.33, 0.67)
+
+    def __init__(
+        self,
+        pass_threshold: float = 0.80,
+        warning_threshold: float = 0.60,
+        rolling_window: int = 500,
+        outlier_threshold: float = 3.0,
+        price_column: str = "close",
+        timestamp_column: str = "timestamp"
+    ):
+        """
+        Initialize the feature stability engine.
+        
+        Args:
+            pass_threshold: Score above this threshold = KEEP
+            warning_threshold: Score above this threshold = WARNING
+            rolling_window: Window size for rolling statistics
+            outlier_threshold: Z-score threshold for outliers
+            price_column: Column name for price data
+            timestamp_column: Column name for timestamp
+        """
+        self.pass_threshold = pass_threshold
+        self.warning_threshold = warning_threshold
+        self.rolling_window = rolling_window
+        self.outlier_threshold = outlier_threshold
+        self.price_column = price_column
+        self.timestamp_column = timestamp_column
+
+    def load_independent_matrix(self, matrix_path: Path) -> pd.DataFrame:
+        """Load the independent feature matrix."""
+        if not matrix_path.exists():
+            raise FileNotFoundError(f"Independent matrix not found: {matrix_path}")
+        
+        if matrix_path.suffix == '.parquet':
+            df = pd.read_parquet(matrix_path)
+        else:
+            df = pd.read_csv(matrix_path)
+            if self.timestamp_column in df.columns:
+                df[self.timestamp_column] = pd.to_datetime(df[self.timestamp_column])
+        
+        return df
+
+    def get_feature_columns(self, df: pd.DataFrame) -> List[str]:
+        """Get feature columns (exclude timestamp and OHLCV)."""
+        return [c for c in df.columns if c not in self.IGNORE_COLS and c != self.timestamp_column]
+
+    def compute_volatility_regime(self, df: pd.DataFrame) -> pd.Series:
+        """Compute volatility regime using ATR percentile."""
+        if self.price_column not in df.columns:
+            return pd.Series('Medium Vol', index=df.index)
+        
+        close = df[self.price_column]
+        high = df['high'] if 'high' in df.columns else close
+        low = df['low'] if 'low' in df.columns else close
+        
+        tr1 = high - low
+        tr2 = abs(high - close.shift())
+        tr3 = abs(low - close.shift())
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        atr = tr.rolling(window=self.ATR_PERIOD).mean()
+        
+        atr_pct = atr.rank(pct=True)
+        atr_pct = atr_pct.fillna(0.5)
+        
+        regimes = pd.Series(index=df.index, dtype='object')
+        regimes[atr_pct <= self.VOLATILITY_THRESHOLDS[0]] = 'Low Vol'
+        regimes[(atr_pct > self.VOLATILITY_THRESHOLDS[0]) & (atr_pct <= self.VOLATILITY_THRESHOLDS[1])] = 'Medium Vol'
+        regimes[atr_pct > self.VOLATILITY_THRESHOLDS[1]] = 'High Vol'
+        regimes = regimes.fillna('Medium Vol')
+        
+        return regimes
+
+    def compute_trend_regime(self, df: pd.DataFrame) -> pd.Series:
+        """Compute trend regime using EMA200."""
+        if self.price_column not in df.columns:
+            return pd.Series('Sideways', index=df.index)
+        
+        close = df[self.price_column]
+        ema = close.ewm(span=self.TREND_EMA_PERIOD, adjust=False).mean()
+        
+        relative = (close - ema) / ema
+        threshold = 0.02
+        
+        regimes = pd.Series(index=df.index, dtype='object')
+        regimes[relative > threshold] = 'Bull'
+        regimes[relative < -threshold] = 'Bear'
+        regimes[(relative >= -threshold) & (relative <= threshold)] = 'Sideways'
+        regimes = regimes.fillna('Sideways')
+        
+        return regimes
+
+    def compute_rolling_mean_stability(self, series: pd.Series) -> Dict[str, float]:
+        """Compute rolling mean stability."""
+        rolling_mean = series.rolling(window=self.rolling_window).mean()
+        rolling_mean = rolling_mean.dropna()
+        
+        if len(rolling_mean) < 2:
+            return {'mean_stability': 0.0, 'mean_variance': 0.0}
+        
+        variance = np.var(rolling_mean)
+        # Normalize to [0, 1] (lower variance = higher stability)
+        # Use max variance of 100 as reference
+        stability = max(0.0, 1.0 - min(1.0, variance / 100.0))
+        
+        return {'mean_stability': stability, 'mean_variance': variance}
+
+    def compute_rolling_variance_stability(self, series: pd.Series) -> Dict[str, float]:
+        """Compute rolling variance stability."""
+        rolling_std = series.rolling(window=self.rolling_window).std()
+        rolling_std = rolling_std.dropna()
+        
+        if len(rolling_std) < 2:
+            return {'variance_stability': 0.0, 'variance_variance': 0.0}
+        
+        variance = np.var(rolling_std)
+        stability = max(0.0, 1.0 - min(1.0, variance / 100.0))
+        
+        return {'variance_stability': stability, 'variance_variance': variance}
+
+    def compute_distribution_drift(self, series: pd.Series) -> float:
+        """Compute distribution drift using KS test between quartiles."""
+        clean_series = series.dropna()
+        if len(clean_series) < 4:
+            return 0.0
+        
+        n = len(clean_series)
+        q1 = clean_series.iloc[:n//4]
+        q2 = clean_series.iloc[n//4:n//2]
+        q3 = clean_series.iloc[n//2:3*n//4]
+        q4 = clean_series.iloc[3*n//4:]
+        
+        ks_stats = []
+        
+        # Compare adjacent quartiles
+        for s1, s2 in [(q1, q2), (q2, q3), (q3, q4)]:
+            if len(s1) > 0 and len(s2) > 0:
+                ks_stat, p_value = kstest(s1, s2)
+                ks_stats.append(ks_stat)
+        
+        if not ks_stats:
+            return 0.0
+        
+        avg_ks = np.mean(ks_stats)
+        # Convert to stability (lower KS = more stable)
+        return max(0.0, 1.0 - min(1.0, avg_ks))
+
+    def compute_regime_stability(self, series: pd.Series, regimes: pd.Series) -> float:
+        """
+        Compute regime stability using Kruskal-Wallis test.
+        """
+        clean_series = series.dropna()
+        regimes_clean = regimes[clean_series.index]
+        
+        unique_regimes = regimes_clean.unique()
+        if len(unique_regimes) < 2:
+            return 0.0
+        
+        groups = []
+        for regime in unique_regimes:
+            mask = regimes_clean == regime
+            if np.sum(mask) > 0:
+                groups.append(clean_series[mask].values)
+        
+        if len(groups) < 2:
+            return 0.0
+        
+        try:
+            # Use Kruskal-Wallis (non-parametric)
+            h_stat, p_value = kruskal(*groups)
+            # Convert to stability (lower H-stat = more stable)
+            normalized_h = min(1.0, h_stat / 100.0)
+            return max(0.0, 1.0 - normalized_h)
+        except:
+            return 0.0
+
+    def compute_trend_stability(self, series: pd.Series, trends: pd.Series) -> float:
+        """
+        Compute trend stability across Bull/Bear/Sideways.
+        """
+        return self.compute_regime_stability(series, trends)
+
+    def compute_entropy_stability(self, series: pd.Series) -> float:
+        """
+        Compute entropy stability across rolling windows.
+        """
+        clean_series = series.dropna()
+        if len(clean_series) < self.rolling_window * 2:
+            return 0.0
+        
+        # Compute rolling entropy
+        entropies = []
+        n_windows = len(clean_series) // self.rolling_window
+        
+        for i in range(n_windows):
+            start = i * self.rolling_window
+            end = start + self.rolling_window
+            window_data = clean_series.iloc[start:end]
+            
+            hist, _ = np.histogram(window_data, bins=20)
+            hist = hist + 1
+            entropy = stats.entropy(hist)
+            entropies.append(entropy)
+        
+        if len(entropies) < 2:
+            return 0.0
+        
+        # Entropy stability = low variance of entropies
+        entropy_std = np.std(entropies)
+        max_entropy = np.log(20)
+        normalized_std = min(1.0, entropy_std / max_entropy)
+        
+        return max(0.0, 1.0 - normalized_std)
+
+    def compute_stationarity(self, series: pd.Series) -> Dict[str, float]:
+        """
+        Compute stationarity using ADF and KPSS tests.
+        """
+        clean_series = series.dropna()
+        if len(clean_series) < 30:
+            return {'adf_pvalue': 1.0, 'kpss_pvalue': 1.0, 'stationarity': 0.0}
+        
+        try:
+            # ADF test (null: non-stationary)
+            adf_stat, adf_pvalue, _, _, _, _ = adfuller(clean_series, autolag='AIC')
+        except:
+            adf_pvalue = 1.0
+        
+        try:
+            # KPSS test (null: stationary)
+            kpss_stat, kpss_pvalue, _, _ = kpss(clean_series, regression='c', nlags='auto')
+        except:
+            kpss_pvalue = 0.0
+        
+        # ADF: low p-value suggests stationarity (reject null)
+        # KPSS: high p-value suggests stationarity (fail to reject null)
+        adf_stationarity = 1.0 - min(1.0, adf_pvalue * 10)  # Normalize
+        kpss_stationarity = min(1.0, kpss_pvalue * 10)
+        
+        stationarity = (adf_stationarity + kpss_stationarity) / 2
+        
+        return {
+            'adf_pvalue': float(adf_pvalue),
+            'kpss_pvalue': float(kpss_pvalue),
+            'stationarity': float(np.clip(stationarity, 0.0, 1.0))
+        }
+
+    def compute_outlier_stability(self, series: pd.Series) -> float:
+        """
+        Compute outlier stability (low variance of outlier counts).
+        """
+        clean_series = series.dropna()
+        if len(clean_series) < self.rolling_window * 2:
+            return 0.0
+        
+        n_windows = len(clean_series) // self.rolling_window
+        outlier_counts = []
+        
+        for i in range(n_windows):
+            start = i * self.rolling_window
+            end = start + self.rolling_window
+            window_data = clean_series.iloc[start:end]
+            
+            z_scores = np.abs((window_data - window_data.mean()) / (window_data.std() + 1e-12))
+            outliers = np.sum(z_scores > self.outlier_threshold)
+            outlier_counts.append(outliers / len(window_data))
+        
+        if len(outlier_counts) < 2:
+            return 0.0
+        
+        # Lower variance of outlier percentages = more stable
+        outlier_std = np.std(outlier_counts)
+        return max(0.0, 1.0 - min(1.0, outlier_std * 10))
+
+    def compute_structural_breaks(self, series: pd.Series) -> float:
+        """
+        Detect structural breaks using CUSUM.
+        """
+        clean_series = series.dropna()
+        if len(clean_series) < 50:
+            return 1.0
+        
+        try:
+            # Use CUSUM on residuals
+            # Simplified: compare rolling mean stability
+            rolling_means = clean_series.rolling(window=self.rolling_window).mean().dropna()
+            
+            if len(rolling_means) < 2:
+                return 1.0
+            
+            # Count significant changes (breaks)
+            diff = np.diff(rolling_means)
+            threshold = 2 * np.std(diff)
+            breaks = np.sum(np.abs(diff) > threshold)
+            
+            # Normalize: fewer breaks = more stable
+            max_breaks = len(rolling_means) // 10
+            normalized_breaks = min(1.0, breaks / max_breaks)
+            
+            return max(0.0, 1.0 - normalized_breaks)
+        except:
+            return 0.5
+
+    def compute_stability_score(self, metrics: Dict[str, float]) -> float:
+        """
+        Compute overall stability score.
+        """
+        weights = {
+            'mean_stability': 0.15,
+            'variance_stability': 0.15,
+            'distribution_drift': 0.20,
+            'regime_stability': 0.15,
+            'trend_stability': 0.10,
+            'entropy_stability': 0.10,
+            'stationarity': 0.10,
+            'outlier_stability': 0.05
+        }
+        
+        score = 0.0
+        for metric, weight in weights.items():
+            score += weight * metrics.get(metric, 0.0)
+        
+        return np.clip(score, 0.0, 1.0)
+
+    def make_decision(self, score: float) -> str:
+        """Make KEEP/WARNING/REMOVE decision."""
+        if score >= self.pass_threshold:
+            return "KEEP"
+        elif score >= self.warning_threshold:
+            return "WARNING"
+        else:
+            return "REMOVE"
+
+    def compute_statistics(
+        self,
+        feature_stability: pd.DataFrame,
+        kept_features: List[str],
+        removed_features: List[str]
+    ) -> Dict[str, Any]:
+        """Compute summary statistics."""
+        total = len(feature_stability)
+        scores = feature_stability['stability_score']
+        
+        stats = {
+            'total_features': total,
+            'kept_count': len(kept_features),
+            'removed_count': len(removed_features),
+            'kept_percentage': len(kept_features) / total * 100 if total > 0 else 0,
+            'removed_percentage': len(removed_features) / total * 100 if total > 0 else 0,
+            'average_stability': float(scores.mean()),
+            'median_stability': float(scores.median()),
+            'min_stability': float(scores.min()),
+            'max_stability': float(scores.max()),
+            'best_feature': feature_stability.iloc[0]['feature'] if not feature_stability.empty else None,
+            'worst_feature': feature_stability.iloc[-1]['feature'] if not feature_stability.empty else None,
+            'average_adf_pvalue': float(feature_stability['adf_pvalue'].mean()) if not feature_stability.empty else 0,
+            'average_kpss_pvalue': float(feature_stability['kpss_pvalue'].mean()) if not feature_stability.empty else 0,
+            'average_structural_breaks': float(feature_stability['structural_stability'].mean()) if not feature_stability.empty else 0
+        }
+        
+        return stats
+
+    def save_outputs(
+        self,
+        df: pd.DataFrame,
+        kept_features: List[str],
+        removed_features: List[str],
+        feature_stability: pd.DataFrame,
+        rolling_stats: pd.DataFrame,
+        regime_stats: pd.DataFrame,
+        stats: Dict[str, Any],
+        output_dir: Path
+    ) -> None:
+        """Save all outputs."""
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Stable matrix
+        stable_df = df[[self.timestamp_column] + kept_features]
+        matrix_path = output_dir / "stable_feature_matrix.parquet"
+        stable_df.to_parquet(matrix_path, index=False)
+        print(f"  Saved stable matrix to {matrix_path}")
+        
+        # Feature stability
+        stability_path = output_dir / "feature_stability.csv"
+        feature_stability.to_csv(stability_path, index=False)
+        print(f"  Saved feature stability to {stability_path}")
+        
+        # Rolling statistics
+        rolling_path = output_dir / "rolling_statistics.csv"
+        rolling_stats.to_csv(rolling_path, index=False)
+        print(f"  Saved rolling statistics to {rolling_path}")
+        
+        # Regime statistics
+        regime_path = output_dir / "regime_statistics.csv"
+        regime_stats.to_csv(regime_path, index=False)
+        print(f"  Saved regime statistics to {regime_path}")
+        
+        # Removed features
+        removed_df = pd.DataFrame({'removed_features': removed_features})
+        removed_path = output_dir / "removed_unstable_features.csv"
+        removed_df.to_csv(removed_path, index=False)
+        print(f"  Saved removed features to {removed_path}")
+        
+        # Summary
+        summary_df = pd.DataFrame([stats])
+        summary_path = output_dir / "stability_summary.csv"
+        summary_df.to_csv(summary_path, index=False)
+        print(f"  Saved summary to {summary_path}")
+
+    def compute(self, matrix_path: Path, output_dir: Optional[Path] = None) -> FeatureStabilityResult:
+        """Main computation method."""
+        print("\n  Computing Feature Stability...")
+        
+        if output_dir is None:
+            output_dir = Path("data/feature_store/stable")
+        
+        # Load independent matrix
+        print(f"  Loading independent matrix from: {matrix_path}")
+        df = self.load_independent_matrix(matrix_path)
+        print(f"  Shape: {df.shape}")
+        
+        # Get features
+        features = self.get_feature_columns(df)
+        print(f"  Found {len(features)} features")
+        
+        if not features:
+            raise ValueError("No features found for stability analysis")
+        
+        # Compute regimes
+        print("  Computing volatility regimes...")
+        vol_regimes = self.compute_volatility_regime(df)
+        
+        print("  Computing trend regimes...")
+        trend_regimes = self.compute_trend_regime(df)
+        
+        # Compute stability metrics for each feature
+        rows = []
+        kept = []
+        removed = []
+        
+        for feature in features:
+            series = df[feature]
+            
+            # Rolling mean stability
+            mean_metrics = self.compute_rolling_mean_stability(series)
+            
+            # Rolling variance stability
+            var_metrics = self.compute_rolling_variance_stability(series)
+            
+            # Distribution drift
+            distribution_drift = self.compute_distribution_drift(series)
+            
+            # Regime stability
+            regime_stability = self.compute_regime_stability(series, vol_regimes)
+            
+            # Trend stability
+            trend_stability = self.compute_trend_stability(series, trend_regimes)
+            
+            # Entropy stability
+            entropy_stability = self.compute_entropy_stability(series)
+            
+            # Stationarity
+            stationarity_metrics = self.compute_stationarity(series)
+            
+            # Outlier stability
+            outlier_stability = self.compute_outlier_stability(series)
+            
+            # Structural breaks
+            structural_stability = self.compute_structural_breaks(series)
+            
+            # Compile metrics
+            metrics = {
+                'mean_stability': mean_metrics['mean_stability'],
+                'variance_stability': var_metrics['variance_stability'],
+                'distribution_drift': distribution_drift,
+                'regime_stability': regime_stability,
+                'trend_stability': trend_stability,
+                'entropy_stability': entropy_stability,
+                'stationarity': stationarity_metrics['stationarity'],
+                'outlier_stability': outlier_stability,
+                'structural_stability': structural_stability
+            }
+            
+            # Compute overall stability score
+            stability_score = self.compute_stability_score(metrics)
+            decision = self.make_decision(stability_score)
+            
+            if decision in ["KEEP", "WARNING"]:
+                kept.append(feature)
+            else:
+                removed.append(feature)
+            
+            rows.append({
+                'feature': feature,
+                'mean_stability': mean_metrics['mean_stability'],
+                'variance_stability': var_metrics['variance_stability'],
+                'distribution_drift': distribution_drift,
+                'regime_stability': regime_stability,
+                'trend_stability': trend_stability,
+                'entropy_stability': entropy_stability,
+                'stationarity': stationarity_metrics['stationarity'],
+                'outlier_stability': outlier_stability,
+                'structural_stability': structural_stability,
+                'adf_pvalue': stationarity_metrics['adf_pvalue'],
+                'kpss_pvalue': stationarity_metrics['kpss_pvalue'],
+                'stability_score': stability_score,
+                'decision': decision
+            })
+        
+        # Create DataFrames
+        feature_stability = pd.DataFrame(rows)
+        feature_stability = feature_stability.sort_values('stability_score', ascending=False).reset_index(drop=True)
+        
+        # Rolling statistics summary
+        rolling_stats = feature_stability[['feature', 'mean_stability', 'variance_stability', 'entropy_stability']].copy()
+        
+        # Regime statistics summary
+        regime_stats = feature_stability[['feature', 'regime_stability', 'trend_stability', 'stationarity']].copy()
+        
+        # Compute statistics
+        stats = self.compute_statistics(feature_stability, kept, removed)
+        
+        # Save outputs
+        print("\n  Saving outputs...")
+        self.save_outputs(df, kept, removed, feature_stability, rolling_stats, regime_stats, stats, output_dir)
+        
+        print(f"\n  Stability Summary:")
+        print(f"    Total Features: {stats['total_features']}")
+        print(f"    Kept: {stats['kept_count']}")
+        print(f"    Removed: {stats['removed_count']}")
+        print(f"    Average Stability: {stats['average_stability']:.3f}")
+        
+        return FeatureStabilityResult(
+            stable_matrix=df[[self.timestamp_column] + kept],
+            feature_stability=feature_stability,
+            rolling_statistics=rolling_stats,
+            regime_statistics=regime_stats,
+            kept_features=kept,
+            removed_features=removed,
+            summary_statistics=stats
+        )

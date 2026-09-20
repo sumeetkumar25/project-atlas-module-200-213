@@ -1,0 +1,9 @@
+# atlas/modules/module201_feature_independence/__init__.py
+"""
+Module 201
+Feature Independence
+"""
+
+from .module import FeatureIndependenceResearch
+
+__all__ = ["FeatureIndependenceResearch"]

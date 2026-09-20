@@ -1,0 +1,48 @@
+# atlas/modules/module203_feature_predictive_power/exporter.py
+"""
+Module 203 - Feature Predictive Power Exporter
+"""
+
+import pandas as pd
+from pathlib import Path
+
+
+class FeaturePredictivePowerExporter:
+    """Exporter for feature predictive power results."""
+    
+    @staticmethod
+    def export_predictive_matrix(df: pd.DataFrame, filepath: str):
+        """Export predictive matrix to Parquet."""
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_parquet(path, index=False)
+    
+    @staticmethod
+    def export_feature_scores(df: pd.DataFrame, filepath: str):
+        """Export feature scores to CSV."""
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(path, index=False)
+    
+    @staticmethod
+    def export_feature_rankings(df: pd.DataFrame, filepath: str):
+        """Export feature rankings to CSV."""
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(path, index=False)
+    
+    @staticmethod
+    def export_removed_features(features: list, filepath: str):
+        """Export removed features to CSV."""
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df = pd.DataFrame({'removed_features': features})
+        df.to_csv(path, index=False)
+    
+    @staticmethod
+    def export_statistics(stats: dict, filepath: str):
+        """Export statistics to CSV."""
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df = pd.DataFrame([stats])
+        df.to_csv(path, index=False)

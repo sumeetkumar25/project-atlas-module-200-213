@@ -1,0 +1,123 @@
+"""
+Module 202 - Feature Stability Validator
+"""
+
+import numpy as np
+import pandas as pd
+from .engine import FeatureStabilityResult
+from .statistics import FeatureStabilityStatistics
+
+
+class FeatureStabilityValidator:
+    """Validator for feature stability results."""
+
+    def __init__(self, timestamp_column: str = "timestamp"):
+        self.timestamp_column = timestamp_column
+
+    def validate(
+        self,
+        result: FeatureStabilityResult,
+        statistics: FeatureStabilityStatistics
+    ) -> bool:
+        """Validate results and statistics."""
+        issues = []
+        warnings = []
+        
+        # Check stable matrix
+        if result.stable_matrix.empty:
+            issues.append("Stable matrix is empty")
+        else:
+            if self.timestamp_column not in result.stable_matrix.columns:
+                issues.append("Missing timestamp column")
+        
+        # Check feature stability table
+        if result.feature_stability.empty:
+            issues.append("Feature stability table is empty")
+        else:
+            required_cols = ['feature', 'stability_score', 'decision']
+            missing = set(required_cols) - set(result.feature_stability.columns)
+            if missing:
+                issues.append(f"Missing columns in feature stability: {missing}")
+            
+            # Check scores are in [0, 1]
+            if 'stability_score' in result.feature_stability.columns:
+                if not np.all((0 <= result.feature_stability['stability_score']) & 
+                            (result.feature_stability['stability_score'] <= 1)):
+                    issues.append("Stability scores outside [0, 1] range")
+            
+            # Check decisions are valid
+            if 'decision' in result.feature_stability.columns:
+                valid_decisions = {'KEEP', 'WARNING', 'REMOVE'}
+                invalid = set(result.feature_stability['decision'].unique()) - valid_decisions
+                if invalid:
+                    issues.append(f"Invalid decisions found: {invalid}")
+        
+        # Check kept/removed lists
+        total = len(result.kept_features) + len(result.removed_features)
+        if total != result.summary_statistics['total_features']:
+            issues.append(
+                f"Feature count mismatch: {total} vs {result.summary_statistics['total_features']}"
+            )
+        
+        # Check no duplicates across lists
+        all_features = set(result.kept_features) | set(result.removed_features)
+        if len(all_features) != total:
+            issues.append("Features appear in multiple lists")
+        
+        # Check statistics match result
+        if statistics.total_features != result.summary_statistics['total_features']:
+            issues.append(
+                f"Total features mismatch: stats={statistics.total_features}, "
+                f"result={result.summary_statistics['total_features']}"
+            )
+        
+        if statistics.kept_count != len(result.kept_features):
+            issues.append(
+                f"Kept count mismatch: stats={statistics.kept_count}, "
+                f"result={len(result.kept_features)}"
+            )
+        
+        if statistics.removed_count != len(result.removed_features):
+            issues.append(
+                f"Removed count mismatch: stats={statistics.removed_count}, "
+                f"result={len(result.removed_features)}"
+            )
+        
+        # Warnings (non-fatal)
+        if statistics.kept_percentage < 30:
+            warnings.append(f"Low kept percentage: {statistics.kept_percentage:.1f}%")
+        
+        if statistics.average_stability < 0.5:
+            warnings.append(f"Low average stability: {statistics.average_stability:.3f}")
+        
+        if warnings:
+            print("\n  WARNINGS:")
+            for warning in warnings:
+                print(f"    ⚠ {warning}")
+        
+        if issues:
+            raise ValueError(
+                f"Feature Stability validation failed with {len(issues)} issue(s):\n" +
+                "\n".join(f"  - {issue}" for issue in issues)
+            )
+        
+        return True
+
+
+def run_validation(result, statistics):
+    """Run validation with user-friendly output."""
+    validator = FeatureStabilityValidator()
+    
+    print("\n" + "=" * 60)
+    print("FEATURE STABILITY VALIDATION")
+    print("=" * 60)
+    
+    try:
+        validator.validate(result, statistics)
+        print("\n  ✓ All validation checks passed")
+        print("=" * 60)
+        return True
+    except ValueError as e:
+        print(e)
+        print("=" * 60)
+        return False

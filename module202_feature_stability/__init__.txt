@@ -1,0 +1,9 @@
+# atlas/modules/module202_feature_stability/__init__.py
+"""
+Module 202
+Feature Stability
+"""
+
+from .module import FeatureStabilityResearch
+
+__all__ = ["FeatureStabilityResearch"]
