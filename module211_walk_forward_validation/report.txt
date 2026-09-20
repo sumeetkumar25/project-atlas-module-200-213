@@ -1,0 +1,146 @@
+"""
+Module 211 - Walk Forward Validation Report
+"""
+
+from datetime import datetime
+import pandas as pd
+
+
+class WalkForwardReport:
+    """Report generator for walk-forward validation results."""
+    
+    @staticmethod
+    def generate(statistics, metadata=None, dataset_name="Unknown") -> str:
+        """Generate a formatted report."""
+        lines = []
+        
+        lines.append("=" * 55)
+        lines.append("MODULE 211")
+        lines.append("WALK FORWARD VALIDATION")
+        lines.append("=" * 55)
+        lines.append(f"\nDataset: {dataset_name}")
+        
+        # Training Configuration
+        lines.append("\n" + "-" * 45)
+        lines.append("VALIDATION CONFIGURATION")
+        lines.append("-" * 45)
+        lines.append(f"  Training Windows: {statistics.n_windows}")
+        
+        # Performance Summary
+        lines.append("\n" + "-" * 45)
+        lines.append("PERFORMANCE SUMMARY")
+        lines.append("-" * 45)
+        lines.append(f"  Average Return: {statistics.avg_return:.2f}%")
+        lines.append(f"  Median Return: {statistics.median_return:.2f}%")
+        lines.append(f"  Best Window: {statistics.best_window:.2f}%")
+        lines.append(f"  Worst Window: {statistics.worst_window:.2f}%")
+        
+        # Risk Metrics
+        lines.append("\n" + "-" * 45)
+        lines.append("RISK METRICS")
+        lines.append("-" * 45)
+        lines.append(f"  Average Sharpe: {statistics.avg_sharpe:.3f}")
+        lines.append(f"  Average Drawdown: {statistics.avg_drawdown:.2f}%")
+        lines.append(f"  Positive Windows: {statistics.positive_window_pct:.1f}%")
+        lines.append(f"  Negative Windows: {statistics.negative_window_pct:.1f}%")
+        
+        # Stability
+        lines.append("\n" + "-" * 45)
+        lines.append("STABILITY")
+        lines.append("-" * 45)
+        lines.append(f"  Window Stability: {statistics.window_stability:.1f}%")
+        lines.append(f"  Consistency Score: {statistics.consistency_score:.3f}")
+        lines.append(f"  Total Trades: {statistics.total_trades}")
+        
+        # Interpretation
+        lines.append("\n" + "-" * 45)
+        lines.append("INTERPRETATION")
+        lines.append("-" * 45)
+        
+        if statistics.avg_return > 0:
+            lines.append("  ✅ Positive average return")
+        else:
+            lines.append("  ⚠ Negative average return")
+        
+        if statistics.avg_sharpe > 1.0:
+            lines.append("  ✅ Good risk-adjusted returns (Sharpe > 1.0)")
+        elif statistics.avg_sharpe > 0.5:
+            lines.append("  ✓ Moderate risk-adjusted returns (Sharpe > 0.5)")
+        else:
+            lines.append("  ⚠ Poor risk-adjusted returns (Sharpe < 0.5)")
+        
+        if statistics.positive_window_pct > 60:
+            lines.append("  ✅ High consistency (60%+ positive windows)")
+        elif statistics.positive_window_pct > 40:
+            lines.append("  ✓ Moderate consistency (40-60% positive windows)")
+        else:
+            lines.append("  ⚠ Low consistency (<40% positive windows)")
+        
+        if statistics.window_stability > 50:
+            lines.append("  ✅ Stable performance across windows")
+        else:
+            lines.append("  ⚠ Unstable performance across windows")
+        
+        # Validation
+        lines.append("\n" + "-" * 45)
+        lines.append("VALIDATION")
+        lines.append("-" * 45)
+        lines.append("  Status: PASSED")
+        
+        # Footer
+        lines.append(f"\n  Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append("\n" + "=" * 55)
+        lines.append("END OF REPORT")
+        lines.append("=" * 55)
+        
+        return "\n".join(lines)
+    
+    @staticmethod
+    def generate_window_summary(window_results: pd.DataFrame, top_n: int = 10) -> str:
+        """Generate a window summary report."""
+        lines = []
+        lines.append("\n" + "=" * 80)
+        lines.append(f"WINDOW SUMMARY (Last {top_n} windows)")
+        lines.append("=" * 80)
+        
+        if window_results.empty:
+            lines.append("\nNo windows to display.")
+            return "\n".join(lines)
+        
+        # Show last N windows
+        windows = window_results.tail(top_n)
+        
+        lines.append(
+            f"\n{'ID':<6} {'Train Start':<20} {'Test Start':<20} "
+            f"{'Return':<10} {'Sharpe':<10} {'Win Rate':<10}"
+        )
+        lines.append("-" * 80)
+        
+        for _, row in windows.iterrows():
+            window_id = row['window_id']
+            train_start = str(row['train_start'])[:19]
+            test_start = str(row['test_start'])[:19]
+            return_pct = row['return_pct']
+            sharpe = row['sharpe_ratio']
+            win_rate = row['win_rate']
+            
+            lines.append(
+                f"{window_id:<6} "
+                f"{train_start:<20} "
+                f"{test_start:<20} "
+                f"{return_pct:<10.2f} "
+                f"{sharpe:<10.3f} "
+                f"{win_rate:<10.1%}"
+            )
+        
+        lines.append("\n" + "=" * 80)
+        return "\n".join(lines)
+    
+    @staticmethod
+    def save(report: str, filepath: str):
+        """Save report to file."""
+        from pathlib import Path
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(report)

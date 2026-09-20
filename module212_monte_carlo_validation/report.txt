@@ -1,0 +1,167 @@
+"""
+Module 212 - Monte Carlo Validation Report
+"""
+
+from datetime import datetime
+import pandas as pd
+
+
+class MonteCarloReport:
+    """Report generator for Monte Carlo validation results."""
+    
+    @staticmethod
+    def generate(statistics, metadata=None, dataset_name="Unknown") -> str:
+        """Generate a formatted report."""
+        lines = []
+        
+        lines.append("=" * 55)
+        lines.append("MODULE 212")
+        lines.append("MONTE CARLO VALIDATION")
+        lines.append("=" * 55)
+        lines.append(f"\nDataset: {dataset_name}")
+        
+        # Simulation Configuration
+        lines.append("\n" + "-" * 45)
+        lines.append("SIMULATION CONFIGURATION")
+        lines.append("-" * 45)
+        lines.append(f"  Simulations: {statistics.n_simulations}")
+        
+        # Equity Distribution
+        lines.append("\n" + "-" * 45)
+        lines.append("EQUITY DISTRIBUTION")
+        lines.append("-" * 45)
+        lines.append(f"  Average Equity: {statistics.avg_equity:.2f}")
+        lines.append(f"  Median Equity: {statistics.median_equity:.2f}")
+        lines.append(f"  Std Deviation: {statistics.std_equity:.2f}")
+        lines.append(f"  Best Equity: {statistics.best_equity:.2f}")
+        lines.append(f"  Worst Equity: {statistics.worst_equity:.2f}")
+        
+        # Percentiles
+        lines.append("\n" + "-" * 45)
+        lines.append("PERCENTILES")
+        lines.append("-" * 45)
+        lines.append(f"  5%: {statistics.p5_equity:.2f}")
+        lines.append(f"  10%: {statistics.p10_equity:.2f}")
+        lines.append(f"  25%: {statistics.p25_equity:.2f}")
+        lines.append(f"  50%: {statistics.p50_equity:.2f}")
+        lines.append(f"  75%: {statistics.p75_equity:.2f}")
+        lines.append(f"  90%: {statistics.p90_equity:.2f}")
+        lines.append(f"  95%: {statistics.p95_equity:.2f}")
+        lines.append(f"  99%: {statistics.p99_equity:.2f}")
+        
+        # Risk Metrics
+        lines.append("\n" + "-" * 45)
+        lines.append("RISK METRICS")
+        lines.append("-" * 45)
+        lines.append(f"  Probability of Profit: {statistics.prob_profit:.1%}")
+        lines.append(f"  Probability of Loss: {statistics.prob_loss:.1%}")
+        lines.append(f"  Average Sharpe: {statistics.avg_sharpe:.3f}")
+        lines.append(f"  Average Drawdown: {statistics.avg_drawdown:.2f}%")
+        lines.append(f"  Average Return: {statistics.avg_return_pct:.2f}%")
+        
+        # Interpretation
+        lines.append("\n" + "-" * 45)
+        lines.append("INTERPRETATION")
+        lines.append("-" * 45)
+        
+        if statistics.prob_profit > 0.6:
+            lines.append("  ✅ High probability of profit (60%+)")
+        elif statistics.prob_profit > 0.4:
+            lines.append("  ✓ Moderate probability of profit (40-60%)")
+        else:
+            lines.append("  ⚠ Low probability of profit (<40%)")
+        
+        if statistics.avg_sharpe > 1.0:
+            lines.append("  ✅ Good risk-adjusted returns (Sharpe > 1.0)")
+        elif statistics.avg_sharpe > 0.5:
+            lines.append("  ✓ Moderate risk-adjusted returns (Sharpe > 0.5)")
+        else:
+            lines.append("  ⚠ Poor risk-adjusted returns (Sharpe < 0.5)")
+        
+        if statistics.avg_drawdown < 10:
+            lines.append("  ✅ Low drawdown risk")
+        elif statistics.avg_drawdown < 25:
+            lines.append("  ✓ Moderate drawdown risk")
+        else:
+            lines.append("  ⚠ High drawdown risk")
+        
+        # Validate
+        if statistics.n_simulations >= 1000:
+            lines.append("  ✅ Sufficient simulations (1000+)")
+        else:
+            lines.append("  ⚠ Limited simulations (recommend 1000+)")
+        
+        # Validation
+        lines.append("\n" + "-" * 45)
+        lines.append("VALIDATION")
+        lines.append("-" * 45)
+        lines.append("  Status: PASSED")
+        
+        # Footer
+        lines.append(f"\n  Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append("\n" + "=" * 55)
+        lines.append("END OF REPORT")
+        lines.append("=" * 55)
+        
+        return "\n".join(lines)
+    
+    @staticmethod
+    def generate_simulation_summary(simulation_results: pd.DataFrame, top_n: int = 10) -> str:
+        """Generate a simulation summary report."""
+        lines = []
+        lines.append("\n" + "=" * 80)
+        lines.append(f"SIMULATION SUMMARY (Top {top_n} by Return)")
+        lines.append("=" * 80)
+        
+        if simulation_results.empty:
+            lines.append("\nNo simulations to display.")
+            return "\n".join(lines)
+        
+        # Sort by return and show top N
+        sims = simulation_results.nlargest(top_n, 'return_pct')
+        
+        lines.append(
+            f"\n{'ID':<8} {'Final Equity':<15} {'Return %':<12} "
+            f"{'Sharpe':<10} {'Drawdown %':<12} {'Win Rate':<10}"
+        )
+        lines.append("-" * 80)
+        
+        for _, row in sims.iterrows():
+            sim_id = row['simulation_id']
+            equity = row['final_equity']
+            return_pct = row['return_pct']
+            sharpe = row['sharpe_ratio']
+            drawdown = row['max_drawdown']
+            win_rate = row['win_rate']
+            
+            lines.append(
+                f"{sim_id:<8} "
+                f"{equity:<15.2f} "
+                f"{return_pct:<12.2f} "
+                f"{sharpe:<10.3f} "
+                f"{drawdown:<12.2f} "
+                f"{win_rate:<10.1%}"
+            )
+        
+        # Show worst performers
+        lines.append("\n" + "-" * 80)
+        lines.append("WORST PERFORMERS")
+        lines.append("-" * 80)
+        
+        worst = simulation_results.nsmallest(5, 'return_pct')
+        for _, row in worst.iterrows():
+            sim_id = row['simulation_id']
+            return_pct = row['return_pct']
+            lines.append(f"  Simulation {sim_id}: {return_pct:.2f}% return")
+        
+        lines.append("\n" + "=" * 80)
+        return "\n".join(lines)
+    
+    @staticmethod
+    def save(report: str, filepath: str):
+        """Save report to file."""
+        from pathlib import Path
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(report)

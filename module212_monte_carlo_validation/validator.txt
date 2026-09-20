@@ -1,0 +1,119 @@
+"""
+Module 212 - Monte Carlo Validation Validator
+"""
+
+import pandas as pd
+import numpy as np
+from .engine import MonteCarloResult
+from .statistics import MonteCarloStatistics
+
+
+class MonteCarloValidator:
+    """Validator for Monte Carlo validation results."""
+    
+    def validate(
+        self,
+        result: MonteCarloResult,
+        statistics: MonteCarloStatistics
+    ) -> bool:
+        """Validate results and statistics."""
+        issues = []
+        warnings = []
+        
+        # Check simulation results
+        if result.simulation_results.empty:
+            warnings.append("Simulation results is empty")
+        
+        # Check equity curves
+        if result.equity_curves.empty:
+            warnings.append("Equity curves is empty")
+        
+        # Check simulation results
+        if not result.simulation_results.empty:
+            # Check for NaNs
+            critical_cols = ['final_equity', 'return_pct', 'sharpe_ratio', 'max_drawdown']
+            for col in critical_cols:
+                if col in result.simulation_results.columns:
+                    if result.simulation_results[col].isna().any():
+                        issues.append(f"NaNs found in {col}")
+            
+            # Check valid simulation IDs
+            if 'simulation_id' in result.simulation_results.columns:
+                if result.simulation_results['simulation_id'].duplicated().any():
+                    issues.append("Duplicate simulation IDs found")
+                
+                # Check sequential IDs
+                expected = list(range(len(result.simulation_results)))
+                actual = result.simulation_results['simulation_id'].tolist()
+                if sorted(actual) != expected:
+                    issues.append("Simulation IDs are not sequential")
+            
+            # Check equity values are positive
+            if 'final_equity' in result.simulation_results.columns:
+                if (result.simulation_results['final_equity'] <= 0).any():
+                    warnings.append("Some simulations ended with zero or negative equity")
+        
+        # Check equity curves
+        if not result.equity_curves.empty:
+            # Check no missing equity
+            if 'equity' in result.equity_curves.columns:
+                if result.equity_curves['equity'].isna().any():
+                    issues.append("Missing equity values found")
+                
+                # Check equity is not NaN at start
+                for sim_id in result.equity_curves['simulation_id'].unique():
+                    sim_data = result.equity_curves[result.equity_curves['simulation_id'] == sim_id]
+                    if sim_data['equity'].iloc[0] <= 0:
+                        warnings.append(f"Simulation {sim_id} starts with zero or negative equity")
+        
+        # Check statistics
+        if statistics.n_simulations == 0:
+            warnings.append("No simulations processed")
+        
+        if statistics.avg_sharpe < -1:
+            warnings.append(f"Very low average Sharpe: {statistics.avg_sharpe:.3f}")
+        
+        if statistics.prob_profit < 0.3:
+            warnings.append(f"Low probability of profit: {statistics.prob_profit:.1%}")
+        
+        if statistics.avg_drawdown > 50:
+            warnings.append(f"High average drawdown: {statistics.avg_drawdown:.1f}%")
+        
+        # Warnings (non-fatal)
+        if statistics.n_simulations < 100:
+            warnings.append(f"Low number of simulations: {statistics.n_simulations} (recommend 1000+)")
+        
+        if statistics.prob_profit < 0.5:
+            warnings.append(f"Less than 50% probability of profit: {statistics.prob_profit:.1%}")
+        
+        if warnings:
+            print("\n  WARNINGS:")
+            for warning in warnings:
+                print(f"    ⚠ {warning}")
+        
+        if issues:
+            raise ValueError(
+                f"Monte Carlo Validation failed with {len(issues)} issue(s):\n" +
+                "\n".join(f"  - {issue}" for issue in issues)
+            )
+        
+        return True
+
+
+def run_validation(result: MonteCarloResult, statistics: MonteCarloStatistics) -> bool:
+    """Run validation with user-friendly output."""
+    validator = MonteCarloValidator()
+    
+    print("\n" + "=" * 60)
+    print("MONTE CARLO VALIDATION")
+    print("=" * 60)
+    
+    try:
+        validator.validate(result, statistics)
+        print("\n  ✓ All validation checks passed")
+        print("=" * 60)
+        return True
+    except ValueError as e:
+        print(e)
+        print("=" * 60)
+        return False

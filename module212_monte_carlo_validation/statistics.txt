@@ -1,0 +1,76 @@
+"""
+Module 212 - Monte Carlo Validation Statistics
+"""
+
+from dataclasses import dataclass, asdict
+import pandas as pd
+from .engine import MonteCarloResult
+
+
+@dataclass
+class MonteCarloStatistics:
+    """High-level statistics from Monte Carlo validation."""
+    n_simulations: int
+    avg_equity: float
+    median_equity: float
+    std_equity: float
+    p5_equity: float
+    p10_equity: float
+    p25_equity: float
+    p50_equity: float
+    p75_equity: float
+    p90_equity: float
+    p95_equity: float
+    p99_equity: float
+    worst_equity: float
+    best_equity: float
+    prob_loss: float
+    prob_profit: float
+    avg_drawdown: float
+    avg_sharpe: float
+    avg_return_pct: float
+
+
+class MonteCarloStatisticsEngine:
+    """Engine for generating high-level statistics."""
+    
+    METADATA = {
+        "module": 212,
+        "name": "Monte Carlo Validation",
+        "version": "1.0.0",
+        "description": "Validates trading system robustness through Monte Carlo simulation"
+    }
+    
+    def analyze(self, result: MonteCarloResult) -> MonteCarloStatistics:
+        """Analyze results and generate high-level statistics."""
+        stats = result.summary_statistics
+        
+        return MonteCarloStatistics(
+            n_simulations=stats.get('n_simulations', 0),
+            avg_equity=stats.get('avg_equity', 0.0),
+            median_equity=stats.get('median_equity', 0.0),
+            std_equity=stats.get('std_equity', 0.0),
+            p5_equity=stats.get('p5_equity', 0.0),
+            p10_equity=stats.get('p10_equity', 0.0),
+            p25_equity=stats.get('p25_equity', 0.0),
+            p50_equity=stats.get('p50_equity', 0.0),
+            p75_equity=stats.get('p75_equity', 0.0),
+            p90_equity=stats.get('p90_equity', 0.0),
+            p95_equity=stats.get('p95_equity', 0.0),
+            p99_equity=stats.get('p99_equity', 0.0),
+            worst_equity=stats.get('worst_equity', 0.0),
+            best_equity=stats.get('best_equity', 0.0),
+            prob_loss=stats.get('prob_loss', 0.0),
+            prob_profit=stats.get('prob_profit', 0.0),
+            avg_drawdown=stats.get('avg_drawdown', 0.0),
+            avg_sharpe=stats.get('avg_sharpe', 0.0),
+            avg_return_pct=stats.get('avg_return_pct', 0.0)
+        )
+    
+    def summary_dataframe(self, stats: MonteCarloStatistics) -> pd.DataFrame:
+        """Convert statistics to DataFrame."""
+        return pd.DataFrame([asdict(stats)])
+    
+    def summary_dict(self, stats: MonteCarloStatistics) -> dict:
+        """Convert statistics to dictionary."""
+        return asdict(stats)

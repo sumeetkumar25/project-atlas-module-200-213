@@ -1,0 +1,62 @@
+"""
+Module 211 - Walk Forward Validation Statistics
+"""
+
+from dataclasses import dataclass, asdict
+import pandas as pd
+from .engine import WalkForwardResult
+
+
+@dataclass
+class WalkForwardStatistics:
+    """High-level statistics from walk-forward validation."""
+    n_windows: int
+    avg_return: float
+    median_return: float
+    best_window: float
+    worst_window: float
+    avg_sharpe: float
+    avg_drawdown: float
+    window_stability: float
+    positive_window_pct: float
+    negative_window_pct: float
+    consistency_score: float
+    total_trades: int
+
+
+class WalkForwardStatisticsEngine:
+    """Engine for generating high-level statistics."""
+    
+    METADATA = {
+        "module": 211,
+        "name": "Walk Forward Validation",
+        "version": "1.0.0",
+        "description": "Validates trading system robustness on unseen data"
+    }
+    
+    def analyze(self, result: WalkForwardResult) -> WalkForwardStatistics:
+        """Analyze results and generate high-level statistics."""
+        stats = result.summary_statistics
+        
+        return WalkForwardStatistics(
+            n_windows=stats.get('n_windows', 0),
+            avg_return=stats.get('avg_return', 0.0),
+            median_return=stats.get('median_return', 0.0),
+            best_window=stats.get('best_window', 0.0),
+            worst_window=stats.get('worst_window', 0.0),
+            avg_sharpe=stats.get('avg_sharpe', 0.0),
+            avg_drawdown=stats.get('avg_drawdown', 0.0),
+            window_stability=stats.get('window_stability', 0.0),
+            positive_window_pct=stats.get('positive_window_pct', 0.0),
+            negative_window_pct=stats.get('negative_window_pct', 0.0),
+            consistency_score=stats.get('consistency_score', 0.0),
+            total_trades=stats.get('total_trades', 0)
+        )
+    
+    def summary_dataframe(self, stats: WalkForwardStatistics) -> pd.DataFrame:
+        """Convert statistics to DataFrame."""
+        return pd.DataFrame([asdict(stats)])
+    
+    def summary_dict(self, stats: WalkForwardStatistics) -> dict:
+        """Convert statistics to dictionary."""
+        return asdict(stats)

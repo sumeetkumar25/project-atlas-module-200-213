@@ -1,0 +1,270 @@
+# atlas/modules/module211_walk_forward_validation/module.py
+"""
+Module 211
+Walk Forward Validation
+
+Validates trading system robustness on unseen data through walk-forward analysis.
+
+Pipeline: load execution data → generate windows → for each window:
+          train → test → compute metrics → store results
+          → aggregate statistics → export results
+"""
+
+from typing import Optional, Dict, Any
+import pandas as pd
+from pathlib import Path
+
+from atlas.core.base_research_module import BaseResearchModule
+from atlas.framework.registry import AtlasRegistry
+
+from .engine import WalkForwardEngine, WalkForwardConfig
+from .statistics import WalkForwardStatisticsEngine
+from .validator import run_validation
+from .report import WalkForwardReport
+from .exporter import WalkForwardExporter
+
+
+class WalkForwardValidation(BaseResearchModule):
+    """Main research module for walk-forward validation."""
+    
+    MODULE_OUTPUT = "module211"
+    METADATA = WalkForwardStatisticsEngine.METADATA
+    
+    def __init__(
+        self,
+        registry: Optional[AtlasRegistry] = None,
+        train_window_bars: int = 10000,
+        test_window_bars: int = 2500,
+        step_size: int = 2500,
+        minimum_trades: int = 30,
+        overlap: bool = False,
+        max_windows: Optional[int] = None,
+        timestamp_column: str = "timestamp",
+        price_column: str = "close",
+        trade_id_column: str = "trade_id",
+        entry_time_column: str = "entry_time",
+        exit_time_column: str = "exit_time"
+    ):
+        """
+        Initialize the walk-forward validation module.
+        
+        Args:
+            registry: Optional Atlas registry
+            train_window_bars: Number of bars for training window
+            test_window_bars: Number of bars for testing window
+            step_size: Step size between windows
+            minimum_trades: Minimum trades required in test window
+            overlap: Whether windows can overlap
+            max_windows: Maximum number of windows to process
+            timestamp_column: Name of the timestamp column
+            price_column: Name of the price column
+            trade_id_column: Name of the trade ID column
+            entry_time_column: Name of the entry time column
+            exit_time_column: Name of the exit time column
+        """
+        super().__init__(
+            module_name="Walk Forward Validation",
+            module_version=self.METADATA["version"],
+        )
+        
+        self.registry = registry or AtlasRegistry()
+        
+        self.config = WalkForwardConfig(
+            train_window_bars=train_window_bars,
+            test_window_bars=test_window_bars,
+            step_size=step_size,
+            minimum_trades=minimum_trades,
+            overlap=overlap,
+            max_windows=max_windows
+        )
+        
+        self.engine = WalkForwardEngine(
+            config=self.config,
+            timestamp_column=timestamp_column,
+            price_column=price_column,
+            trade_id_column=trade_id_column,
+            entry_time_column=entry_time_column,
+            exit_time_column=exit_time_column
+        )
+        self.stats_engine = WalkForwardStatisticsEngine()
+        self.result_data = None
+        self.statistics = None
+        self.window_report = None
+        self._output_dir = None
+        self._paths = None
+
+    def _register_pipeline_steps(self):
+        """Register pipeline steps."""
+        self.pipeline_steps = [
+            ("walk_forward_validation", self._run_validation),
+            ("statistics", self._compute_statistics),
+            ("validate", self._validate),
+            ("export", self._export_results),
+        ]
+    
+    def _prepare_data(self) -> Dict[str, Any]:
+        """Prepare data."""
+        if self._paths is None:
+            raise ValueError("File paths not provided. Use run_validation() method.")
+        return self._paths
+    
+    def _run_validation(self) -> Dict[str, Any]:
+        """Step 1: Run walk-forward validation."""
+        self.logger.info("Step 1: Running walk-forward validation")
+        
+        prepared = self._prepare_data()
+        
+        self.result_data = self.engine.compute(
+            execution_trade_log_path=prepared["execution_trade_log"],
+            output_dir=self._output_dir
+        )
+        
+        self.logger.metric(
+            "Windows",
+            str(len(self.result_data.window_results))
+        )
+        self.logger.metric(
+            "Total Trades",
+            str(self.result_data.summary_statistics.get("total_trades", 0))
+        )
+        self.logger.metric(
+            "Average Return",
+            f"{self.result_data.summary_statistics.get('avg_return', 0):.2f}%"
+        )
+        self.logger.metric(
+            "Positive Windows",
+            f"{self.result_data.summary_statistics.get('positive_window_pct', 0):.1f}%"
+        )
+        self.logger.success("Walk-forward validation complete")
+        
+        # Generate window summary
+        self.window_report = WalkForwardReport.generate_window_summary(
+            self.result_data.window_results,
+            top_n=20
+        )
+        
+        return {
+            "windows": len(self.result_data.window_results),
+            "total_trades": self.result_data.summary_statistics.get("total_trades", 0),
+            "avg_return": self.result_data.summary_statistics.get("avg_return", 0),
+            "positive_windows": self.result_data.summary_statistics.get("positive_window_pct", 0)
+        }
+    
+    def _compute_statistics(self) -> Dict[str, Any]:
+        """Step 2: Computing statistics."""
+        self.logger.info("Step 2: Computing statistics")
+        self.statistics = self.stats_engine.analyze(self.result_data)
+        
+        self.logger.metric(
+            "Avg Sharpe",
+            f"{self.statistics.avg_sharpe:.3f}"
+        )
+        self.logger.metric(
+            "Avg Drawdown",
+            f"{self.statistics.avg_drawdown:.2f}%"
+        )
+        self.logger.metric(
+            "Consistency Score",
+            f"{self.statistics.consistency_score:.3f}"
+        )
+        self.logger.success("Statistics computed")
+        
+        return self.stats_engine.summary_dict(self.statistics)
+    
+    def _validate(self) -> Dict[str, Any]:
+        """Step 3: Validation."""
+        self.logger.info("Step 3: Validation")
+        passed = run_validation(self.result_data, self.statistics)
+        self.logger.success("Validation complete")
+        return {"software_validation_passed": passed}
+    
+    def _export_results(self) -> Dict[str, Any]:
+        """Step 4: Export."""
+        self.logger.info("Step 4: Export")
+        
+        # Register DataFrames as artifacts
+        self.result.artifacts["window_results"] = self.result_data.window_results
+        self.result.artifacts["equity_curves"] = self.result_data.equity_curves
+        
+        # Store summary
+        stats_df = pd.DataFrame([self.result_data.summary_statistics])
+        self.result.artifacts["walk_forward_statistics"] = stats_df
+        
+        # Generate and register reports
+        main_report = WalkForwardReport.generate(
+            self.statistics,
+            metadata=self.METADATA,
+            dataset_name=self.result.dataset_identifier,
+        )
+        
+        # -------------------------------------------------
+        # Save report to disk
+        # -------------------------------------------------
+        report_path = self._output_dir / "walk_forward_report.txt"
+        
+        WalkForwardExporter.export_report(
+            main_report,
+            report_path
+        )
+        
+        self.result.artifacts["walk_forward_report"] = main_report
+        self.result.artifacts["window_summary"] = self.window_report
+        
+        self.logger.metric("Artifacts", str(len(self.result.artifacts)))
+        self.logger.success("Export complete")
+        
+        return {
+            "export_status": "complete",
+            "artifact_count": len(self.result.artifacts),
+            "windows": len(self.result_data.window_results)
+        }
+    
+    def compute(self) -> Dict[str, Any]:
+        """Run the full computation pipeline."""
+        self.logger.section("Walk Forward Validation Pipeline")
+        results = self.execute_pipeline()
+        self.result.status = "completed"
+        self.logger.success("Module 211 complete")
+        return results
+    
+    def run(self, filepath: str, output_dir=None):
+        """Run module on file."""
+        self._output_dir = Path(output_dir) if output_dir else None
+        return super().run(filepath, output_dir)
+    
+    def run_dataframe(self, df, dataset_id="in_memory", output_dir=None):
+        """Run module on a single DataFrame."""
+        self._output_dir = Path(output_dir) if output_dir else None
+        return super().run_dataframe(df, dataset_id, output_dir)
+    
+    def run_validation(
+        self,
+        execution_trade_log_path: Path,
+        dataset_id: str = "walk_forward_validation",
+        output_dir: Optional[Path] = None
+    ) -> Any:
+        """
+        Run the walk-forward validation.
+        
+        Args:
+            execution_trade_log_path: Path to executed_trade_log.parquet from Module 210
+            dataset_id: Identifier for the dataset
+            output_dir: Output directory for results
+        """
+        self._paths = {
+            "execution_trade_log": execution_trade_log_path
+        }
+        self._output_dir = Path(output_dir) if output_dir else Path("data/feature_store/walk_forward")
+        
+        # Create a dummy DataFrame to satisfy BaseResearchModule
+        dummy = pd.DataFrame(
+            {
+                "timestamp": [pd.Timestamp("2000-01-01")]
+            }
+        )
+        
+        return super().run_dataframe(
+            dummy,
+            dataset_id=dataset_id,
+            output_dir=self._output_dir
+        )

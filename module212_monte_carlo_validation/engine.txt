@@ -1,0 +1,404 @@
+"""
+Module 212 - Monte Carlo Validation Engine
+
+Validates trading system robustness through Monte Carlo simulation.
+
+Pipeline:
+  Load Trade Log → For Each Simulation:
+    Shuffle Trades → Compute Equity Curve → Compute Metrics
+  → Aggregate Statistics → Export Results
+
+Output: Simulation results, equity curves, and risk statistics.
+"""
+
+import numpy as np
+import pandas as pd
+from dataclasses import dataclass, field
+from typing import Optional, Dict, Any, List, Tuple
+from pathlib import Path
+from datetime import datetime
+import warnings
+warnings.filterwarnings('ignore')
+
+
+@dataclass
+class MonteCarloConfig:
+    """Configuration for Monte Carlo validation."""
+    simulations: int = 1000
+    bootstrap: bool = False
+    random_seed: int = 42
+    initial_capital: float = 10000.0
+
+
+@dataclass
+class SimulationResult:
+    """Results from a single Monte Carlo simulation."""
+    simulation_id: int
+    final_equity: float
+    net_profit: float
+    return_pct: float
+    max_drawdown: float
+    sharpe_ratio: float
+    profit_factor: float
+    win_rate: float
+    equity_curve: Optional[pd.DataFrame] = None
+
+
+@dataclass
+class MonteCarloResult:
+    """Results from Monte Carlo validation."""
+    simulation_results: pd.DataFrame
+    equity_curves: pd.DataFrame
+    summary_statistics: Dict[str, Any]
+
+
+class MonteCarloEngine:
+    """Core engine for Monte Carlo validation."""
+
+    def __init__(
+        self,
+        config: Optional[MonteCarloConfig] = None
+    ):
+        """
+        Initialize the Monte Carlo validation engine.
+        
+        Args:
+            config: MonteCarloConfig with validation parameters
+        """
+        self.config = config or MonteCarloConfig()
+        
+        # Set random seed for reproducibility
+        if self.config.random_seed is not None:
+            np.random.seed(self.config.random_seed)
+
+    def load_trade_log(self, filepath: Path) -> pd.DataFrame:
+        """Load executed trade log from Module 210."""
+        if not filepath.exists():
+            raise FileNotFoundError(f"Trade log not found: {filepath}")
+        
+        if filepath.suffix == '.parquet':
+            df = pd.read_parquet(filepath)
+        else:
+            df = pd.read_csv(filepath)
+        
+        # Ensure datetime columns
+        if 'entry_time' in df.columns:
+            df['entry_time'] = pd.to_datetime(df['entry_time'])
+        if 'exit_time' in df.columns:
+            df['exit_time'] = pd.to_datetime(df['exit_time'])
+        
+        return df
+
+    def shuffle_trades(self, trade_log: pd.DataFrame) -> pd.DataFrame:
+        """
+        Shuffle trades for Monte Carlo simulation.
+        
+        If bootstrap=False: Random permutation (no replacement)
+        If bootstrap=True: Sampling with replacement
+        """
+        return trade_log.sample(
+            frac=1.0,
+            replace=self.config.bootstrap,
+            random_state=None
+        ).reset_index(drop=True)
+
+    def compute_returns(self, shuffled_trades: pd.DataFrame) -> pd.Series:
+        """
+        Compute returns from shuffled trades.
+        
+        Uses net_pnl or realized_pnl from Module 210.
+        """
+        # Try to find the PnL column
+        if 'net_pnl' in shuffled_trades.columns:
+            returns = shuffled_trades['net_pnl']
+        elif 'realized_pnl' in shuffled_trades.columns:
+            returns = shuffled_trades['realized_pnl']
+        elif 'total_pnl' in shuffled_trades.columns:
+            returns = shuffled_trades['total_pnl']
+        else:
+            # Compute from trade data if available
+            if 'exit_price' in shuffled_trades.columns and 'entry_price' in shuffled_trades.columns:
+                pnl = (shuffled_trades['exit_price'] - shuffled_trades['entry_price']) * shuffled_trades['executed_size']
+                direction_multiplier = shuffled_trades['direction'].map({'LONG': 1, 'SHORT': -1})
+                returns = pnl * direction_multiplier
+            else:
+                raise ValueError("No PnL column found in trade log")
+        
+        return returns
+
+    def compute_equity_curve(self, returns: pd.Series) -> pd.DataFrame:
+        """Build equity curve from returns."""
+        equity = returns.cumsum() + self.config.initial_capital
+        
+        # Ensure equity starts at initial capital
+        equity = pd.concat([
+            pd.Series([self.config.initial_capital]),
+            equity
+        ]).reset_index(drop=True)
+        
+        equity_curve = pd.DataFrame({
+            "trade": range(len(equity)),
+            "equity": equity
+        })
+        
+        return equity_curve
+
+    def compute_drawdown(self, equity_curve: pd.DataFrame) -> Tuple[float, pd.Series]:
+        """Compute maximum drawdown and drawdown series."""
+        equity = equity_curve['equity']
+        running_max = equity.expanding().max()
+        drawdown = (equity - running_max)
+        max_drawdown = abs(drawdown.min())
+        return max_drawdown, drawdown
+
+    def compute_sharpe_ratio(self, returns: pd.Series) -> float:
+        """Compute annualized Sharpe ratio."""
+        if returns.std() > 0:
+            sharpe = (returns.mean() / returns.std()) * np.sqrt(252)
+        else:
+            sharpe = 0.0
+        return sharpe
+
+    def compute_profit_factor(self, returns: pd.Series) -> float:
+        """Compute profit factor."""
+        gross_profit = returns[returns > 0].sum()
+        gross_loss = abs(returns[returns < 0].sum())
+        
+        if gross_loss > 0:
+            profit_factor = gross_profit / gross_loss
+        else:
+            profit_factor = np.inf
+        
+        return profit_factor
+
+    def compute_win_rate(self, returns: pd.Series) -> float:
+        """Compute win rate."""
+        return (returns > 0).mean()
+
+    def run_single_simulation(
+        self,
+        trade_log: pd.DataFrame,
+        simulation_id: int
+    ) -> SimulationResult:
+        """
+        Run a single Monte Carlo simulation.
+        
+        Args:
+            trade_log: Original trade log
+            simulation_id: ID for this simulation
+        
+        Returns:
+            SimulationResult with all metrics
+        """
+        # Shuffle trades
+        shuffled = self.shuffle_trades(trade_log)
+        
+        # Compute returns
+        returns = self.compute_returns(shuffled)
+        
+        # Build equity curve
+        equity_curve = self.compute_equity_curve(returns)
+        
+        # Compute metrics
+        final_equity = equity_curve['equity'].iloc[-1]
+        net_profit = final_equity - self.config.initial_capital
+        return_pct = (net_profit / self.config.initial_capital) * 100
+        
+        max_drawdown, drawdown_series = self.compute_drawdown(equity_curve)
+        sharpe_ratio = self.compute_sharpe_ratio(returns)
+        profit_factor = self.compute_profit_factor(returns)
+        win_rate = self.compute_win_rate(returns)
+        
+        # Create equity curve with drawdown
+        equity_curve['peak'] = equity_curve['equity'].cummax()
+        equity_curve['drawdown'] = drawdown_series
+        equity_curve['simulation_id'] = simulation_id
+        
+        return SimulationResult(
+            simulation_id=simulation_id,
+            final_equity=final_equity,
+            net_profit=net_profit,
+            return_pct=return_pct,
+            max_drawdown=max_drawdown,
+            sharpe_ratio=sharpe_ratio,
+            profit_factor=profit_factor,
+            win_rate=win_rate,
+            equity_curve=equity_curve
+        )
+
+    def run_validation(self, trade_log: pd.DataFrame) -> MonteCarloResult:
+        """
+        Run complete Monte Carlo validation.
+        
+        Args:
+            trade_log: Trade log from Module 210
+        
+        Returns:
+            MonteCarloResult with all simulations and statistics
+        """
+        print("\n  Running Monte Carlo Validation...")
+        print(f"  Simulations: {self.config.simulations}")
+        print(f"  Bootstrap: {self.config.bootstrap}")
+        print(f"  Initial Capital: {self.config.initial_capital:.2f}")
+        
+        if len(trade_log) == 0:
+            raise ValueError("Trade log is empty")
+        
+        # Run simulations
+        simulation_results = []
+        all_equity_curves = []
+        
+        for i in range(self.config.simulations):
+            result = self.run_single_simulation(trade_log, i)
+            
+            # Store result (without equity curve for DataFrame)
+            result_dict = {
+                'simulation_id': result.simulation_id,
+                'final_equity': result.final_equity,
+                'net_profit': result.net_profit,
+                'return_pct': result.return_pct,
+                'max_drawdown': result.max_drawdown,
+                'sharpe_ratio': result.sharpe_ratio,
+                'profit_factor': result.profit_factor,
+                'win_rate': result.win_rate
+            }
+            simulation_results.append(result_dict)
+            
+            # Store equity curve
+            if result.equity_curve is not None:
+                all_equity_curves.append(result.equity_curve)
+            
+            # Progress update
+            if (i + 1) % 100 == 0:
+                print(f"  Completed {i + 1}/{self.config.simulations} simulations")
+        
+        # Create DataFrames
+        simulation_results_df = pd.DataFrame(simulation_results)
+        equity_curves_df = pd.concat(all_equity_curves, ignore_index=True) if all_equity_curves else pd.DataFrame()
+        
+        print(f"  Completed {len(simulation_results_df)} simulations")
+        
+        return MonteCarloResult(
+            simulation_results=simulation_results_df,
+            equity_curves=equity_curves_df,
+            summary_statistics={}
+        )
+
+    def compute_summary_statistics(self, simulation_results: pd.DataFrame) -> Dict[str, Any]:
+        """
+        Compute summary statistics from simulation results.
+        """
+        if simulation_results.empty:
+            return {
+                'n_simulations': 0,
+                'avg_equity': 0.0,
+                'median_equity': 0.0,
+                'std_equity': 0.0,
+                'p5_equity': 0.0,
+                'p10_equity': 0.0,
+                'p25_equity': 0.0,
+                'p50_equity': 0.0,
+                'p75_equity': 0.0,
+                'p90_equity': 0.0,
+                'p95_equity': 0.0,
+                'p99_equity': 0.0,
+                'worst_equity': 0.0,
+                'best_equity': 0.0,
+                'prob_loss': 0.0,
+                'prob_profit': 0.0,
+                'avg_drawdown': 0.0,
+                'avg_sharpe': 0.0,
+                'avg_return_pct': 0.0
+            }
+        
+        final_equity = simulation_results['final_equity']
+        
+        stats = {
+            'n_simulations': len(simulation_results),
+            'avg_equity': float(final_equity.mean()),
+            'median_equity': float(final_equity.median()),
+            'std_equity': float(final_equity.std()),
+            'p5_equity': float(final_equity.quantile(0.05)),
+            'p10_equity': float(final_equity.quantile(0.10)),
+            'p25_equity': float(final_equity.quantile(0.25)),
+            'p50_equity': float(final_equity.quantile(0.50)),
+            'p75_equity': float(final_equity.quantile(0.75)),
+            'p90_equity': float(final_equity.quantile(0.90)),
+            'p95_equity': float(final_equity.quantile(0.95)),
+            'p99_equity': float(final_equity.quantile(0.99)),
+            'worst_equity': float(final_equity.min()),
+            'best_equity': float(final_equity.max()),
+            'prob_loss': float((simulation_results['net_profit'] < 0).mean()),
+            'prob_profit': float((simulation_results['net_profit'] > 0).mean()),
+            'avg_drawdown': float(simulation_results['max_drawdown'].mean()),
+            'avg_sharpe': float(simulation_results['sharpe_ratio'].mean()),
+            'avg_return_pct': float(simulation_results['return_pct'].mean())
+        }
+        
+        return stats
+
+    def save_outputs(
+        self,
+        result: MonteCarloResult,
+        output_dir: Path
+    ) -> None:
+        """Save all outputs."""
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Simulation results
+        sim_path = output_dir / "simulation_results.csv"
+        result.simulation_results.to_csv(sim_path, index=False)
+        print(f"  Saved simulation results to {sim_path}")
+        
+        # Equity curves
+        if not result.equity_curves.empty:
+            equity_path = output_dir / "equity_curves.parquet"
+            result.equity_curves.to_parquet(equity_path, index=False)
+            print(f"  Saved equity curves to {equity_path}")
+        
+        # Statistics
+        stats_df = pd.DataFrame([result.summary_statistics])
+        stats_path = output_dir / "risk_statistics.csv"
+        stats_df.to_csv(stats_path, index=False)
+        print(f"  Saved risk statistics to {stats_path}")
+
+    def compute(
+        self,
+        trade_log_path: Path,
+        output_dir: Optional[Path] = None
+    ) -> MonteCarloResult:
+        """
+        Main computation method.
+        """
+        if output_dir is None:
+            output_dir = Path("D:/delta_bot/Project_Atlas/outputs")
+        
+        # Load trade log
+        print(f"  Loading trade log from: {trade_log_path}")
+        trade_log = self.load_trade_log(trade_log_path)
+        print(f"  Loaded {len(trade_log)} trades")
+        
+        # Run validation
+        result = self.run_validation(trade_log)
+        
+        # Compute summary statistics
+        print("  Computing summary statistics...")
+        result.summary_statistics = self.compute_summary_statistics(result.simulation_results)
+        
+        # Save outputs
+        print("\n  Saving outputs...")
+        self.save_outputs(result, output_dir)
+        
+        # Print summary
+        print(f"\n  Monte Carlo Summary:")
+        print(f"    Simulations: {result.summary_statistics['n_simulations']}")
+        print(f"    Average Final Equity: {result.summary_statistics['avg_equity']:.2f}")
+        print(f"    Median Final Equity: {result.summary_statistics['median_equity']:.2f}")
+        print(f"    Best Equity: {result.summary_statistics['best_equity']:.2f}")
+        print(f"    Worst Equity: {result.summary_statistics['worst_equity']:.2f}")
+        print(f"    Probability of Profit: {result.summary_statistics['prob_profit']:.1%}")
+        print(f"    Probability of Loss: {result.summary_statistics['prob_loss']:.1%}")
+        print(f"    Average Sharpe: {result.summary_statistics['avg_sharpe']:.3f}")
+        print(f"    Average Drawdown: {result.summary_statistics['avg_drawdown']:.2f}%")
+        
+        return result

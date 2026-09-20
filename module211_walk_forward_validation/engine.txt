@@ -1,0 +1,461 @@
+"""
+Module 211 - Walk Forward Validation Engine
+
+Validates trading system robustness on unseen data through walk-forward analysis.
+
+Pipeline:
+  Load Execution Data → Generate Windows → For Each Window:
+    Train → Test → Compute Metrics → Store Results
+  → Aggregate Statistics → Export Results
+
+Output: Window results, equity curves, and summary statistics.
+"""
+
+import numpy as np
+import pandas as pd
+from dataclasses import dataclass, field
+from typing import Optional, Dict, Any, List, Tuple
+from pathlib import Path
+from datetime import datetime
+import warnings
+warnings.filterwarnings('ignore')
+
+
+@dataclass
+class WalkForwardConfig:
+    """Configuration for walk-forward validation."""
+    train_window_bars: int = 10000
+    test_window_bars: int = 2500
+    step_size: int = 2500
+    minimum_trades: int = 30
+    overlap: bool = False
+    max_windows: Optional[int] = None
+
+
+@dataclass
+class WindowResult:
+    """Results from a single walk-forward window."""
+    window_id: int
+    train_start: datetime
+    train_end: datetime
+    test_start: datetime
+    test_end: datetime
+    n_train_trades: int
+    n_test_trades: int
+    net_profit: float
+    return_pct: float
+    win_rate: float
+    sharpe_ratio: float
+    max_drawdown: float
+    profit_factor: float
+    avg_trade: float
+    total_commission: float
+    total_slippage: float
+    equity_curve: Optional[pd.DataFrame] = None
+
+
+@dataclass
+class WalkForwardResult:
+    """Results from walk-forward validation."""
+    window_results: pd.DataFrame
+    equity_curves: pd.DataFrame
+    summary_statistics: Dict[str, Any]
+
+
+class WalkForwardEngine:
+    """Core engine for walk-forward validation."""
+
+    def __init__(
+        self,
+        config: Optional[WalkForwardConfig] = None,
+        timestamp_column: str = "timestamp",
+        price_column: str = "close",
+        trade_id_column: str = "trade_id",
+        entry_time_column: str = "entry_time",
+        exit_time_column: str = "exit_time"
+    ):
+        """
+        Initialize the walk-forward validation engine.
+        
+        Args:
+            config: WalkForwardConfig with validation parameters
+            timestamp_column: Name of the timestamp column
+            price_column: Name of the price column
+            trade_id_column: Name of the trade ID column
+            entry_time_column: Name of the entry time column
+            exit_time_column: Name of the exit time column
+        """
+        self.config = config or WalkForwardConfig()
+        self.timestamp_column = timestamp_column
+        self.price_column = price_column
+        self.trade_id_column = trade_id_column
+        self.entry_time_column = entry_time_column
+        self.exit_time_column = exit_time_column
+
+    def load_execution_data(self, filepath: Path) -> pd.DataFrame:
+        """Load executed trade log from Module 210."""
+        if not filepath.exists():
+            raise FileNotFoundError(f"Execution data not found: {filepath}")
+        
+        if filepath.suffix == '.parquet':
+            df = pd.read_parquet(filepath)
+        else:
+            df = pd.read_csv(filepath)
+            if self.timestamp_column in df.columns:
+                df[self.timestamp_column] = pd.to_datetime(df[self.timestamp_column])
+            if self.entry_time_column in df.columns:
+                df[self.entry_time_column] = pd.to_datetime(df[self.entry_time_column])
+            if self.exit_time_column in df.columns:
+                df[self.exit_time_column] = pd.to_datetime(df[self.exit_time_column])
+        
+        return df
+
+    def generate_windows(self, data: pd.DataFrame) -> List[Tuple[int, int, int, int]]:
+        """
+        Generate walk-forward windows.
+        
+        Returns:
+            List of (train_start_idx, train_end_idx, test_start_idx, test_end_idx)
+        """
+        n = len(data)
+        train_size = self.config.train_window_bars
+        test_size = self.config.test_window_bars
+        step = self.config.step_size
+        
+        windows = []
+        train_start = 0
+        
+        window_id = 0
+        
+        while True:
+            train_end = train_start + train_size
+            test_start = train_end
+            test_end = min(test_start + test_size, n)
+            
+            # Check if we have enough data
+            if test_start >= n or test_end <= test_start:
+                break
+            
+            # Check minimum data requirements
+            if train_end - train_start < train_size * 0.5:
+                break
+            
+            windows.append((train_start, train_end, test_start, test_end))
+            
+            # Move window forward
+            if self.config.overlap:
+                train_start += step // 2
+            else:
+                train_start += step
+            
+            # Check max windows
+            if self.config.max_windows and len(windows) >= self.config.max_windows:
+                break
+        
+        return windows
+
+    def compute_window_metrics(
+        self,
+        train_trades: pd.DataFrame,
+        test_trades: pd.DataFrame,
+        window_id: int,
+        train_start: datetime,
+        train_end: datetime,
+        test_start: datetime,
+        test_end: datetime
+    ) -> WindowResult:
+        """
+        Compute metrics for a single window.
+        """
+        # Training metrics
+        n_train = len(train_trades)
+        n_test = len(test_trades)
+        
+        # Skip if not enough trades
+        if n_test < self.config.minimum_trades:
+            return None
+        
+        # Test period metrics
+        test_pnl = test_trades['exit_price'] - test_trades['entry_price']
+        test_pnl = test_pnl * test_trades['executed_size']
+        
+        # Apply direction
+        direction_multiplier = test_trades['direction'].map({'LONG': 1, 'SHORT': -1})
+        test_pnl = test_pnl * direction_multiplier
+        
+        # Net profit
+        net_profit = test_pnl.sum()
+        
+        # Return percentage (assuming initial capital of 10000)
+        initial_capital = 10000.0
+        return_pct = (net_profit / initial_capital) * 100
+        
+        # Win rate
+        winning_trades = test_pnl > 0
+        win_rate = winning_trades.mean() if n_test > 0 else 0.0
+        
+        # Sharpe ratio (assuming risk-free rate of 0)
+        if n_test > 1 and test_pnl.std() > 0:
+            sharpe_ratio = (test_pnl.mean() / test_pnl.std()) * np.sqrt(252)
+        else:
+            sharpe_ratio = 0.0
+        
+        # Max drawdown
+        cumulative_pnl = test_pnl.cumsum()
+        running_max = cumulative_pnl.expanding().max()
+        drawdown = (cumulative_pnl - running_max) / initial_capital * 100
+        max_drawdown = abs(drawdown.min()) if not drawdown.empty else 0.0
+        
+        # Profit factor
+        gross_profit = test_pnl[test_pnl > 0].sum()
+        gross_loss = abs(test_pnl[test_pnl < 0].sum())
+        profit_factor = gross_profit / gross_loss if gross_loss > 0 else np.inf
+        
+        # Average trade
+        avg_trade = test_pnl.mean() if n_test > 0 else 0.0
+        
+        # Total commission and slippage
+        total_commission = test_trades['total_commission'].sum() if 'total_commission' in test_trades.columns else 0.0
+        total_slippage = test_trades['total_slippage'].sum() if 'total_slippage' in test_trades.columns else 0.0
+        
+        # Equity curve for test period
+        equity_curve = pd.DataFrame({
+            'timestamp': test_trades[self.exit_time_column],
+            'equity': cumulative_pnl + initial_capital,
+            'peak': running_max + initial_capital,
+            'drawdown': drawdown,
+            'window_id': window_id
+        })
+        
+        return WindowResult(
+            window_id=window_id,
+            train_start=train_start,
+            train_end=train_end,
+            test_start=test_start,
+            test_end=test_end,
+            n_train_trades=n_train,
+            n_test_trades=n_test,
+            net_profit=net_profit,
+            return_pct=return_pct,
+            win_rate=win_rate,
+            sharpe_ratio=sharpe_ratio,
+            max_drawdown=max_drawdown,
+            profit_factor=profit_factor,
+            avg_trade=avg_trade,
+            total_commission=total_commission,
+            total_slippage=total_slippage,
+            equity_curve=equity_curve
+        )
+
+    def run_validation(self, trade_log: pd.DataFrame) -> WalkForwardResult:
+        """
+        Run complete walk-forward validation.
+        """
+        print("\n  Running Walk-Forward Validation...")
+        print(f"  Train Window: {self.config.train_window_bars} bars")
+        print(f"  Test Window: {self.config.test_window_bars} bars")
+        print(f"  Step Size: {self.config.step_size} bars")
+        print(f"  Minimum Trades: {self.config.minimum_trades}")
+        
+        # Sort by exit time
+        if self.exit_time_column in trade_log.columns:
+            trade_log = trade_log.sort_values(self.exit_time_column)
+        elif self.entry_time_column in trade_log.columns:
+            trade_log = trade_log.sort_values(self.entry_time_column)
+        
+        # Generate windows based on timestamps
+        timestamps = trade_log[self.exit_time_column].values
+        n = len(trade_log)
+        
+        windows = self.generate_windows(trade_log)
+        print(f"  Generated {len(windows)} windows")
+        
+        window_results = []
+        all_equity_curves = []
+        
+        for train_start, train_end, test_start, test_end in windows:
+            # Split data
+            train_trades = trade_log.iloc[train_start:train_end]
+            test_trades = trade_log.iloc[test_start:test_end]
+            
+            # Get timestamps for window
+            train_start_ts = trade_log.iloc[train_start][self.exit_time_column]
+            train_end_ts = trade_log.iloc[train_end - 1][self.exit_time_column]
+            test_start_ts = trade_log.iloc[test_start][self.exit_time_column]
+            test_end_ts = trade_log.iloc[test_end - 1][self.exit_time_column]
+            
+            # Compute metrics
+            result = self.compute_window_metrics(
+                train_trades=train_trades,
+                test_trades=test_trades,
+                window_id=len(window_results),
+                train_start=train_start_ts,
+                train_end=train_end_ts,
+                test_start=test_start_ts,
+                test_end=test_end_ts
+            )
+            
+            if result is not None:
+                # Store equity curve
+                if result.equity_curve is not None and not result.equity_curve.empty:
+                    all_equity_curves.append(result.equity_curve)
+                
+                # Store result (without equity curve for DataFrame)
+                result_dict = {
+                    'window_id': result.window_id,
+                    'train_start': result.train_start,
+                    'train_end': result.train_end,
+                    'test_start': result.test_start,
+                    'test_end': result.test_end,
+                    'n_train_trades': result.n_train_trades,
+                    'n_test_trades': result.n_test_trades,
+                    'net_profit': result.net_profit,
+                    'return_pct': result.return_pct,
+                    'win_rate': result.win_rate,
+                    'sharpe_ratio': result.sharpe_ratio,
+                    'max_drawdown': result.max_drawdown,
+                    'profit_factor': result.profit_factor,
+                    'avg_trade': result.avg_trade,
+                    'total_commission': result.total_commission,
+                    'total_slippage': result.total_slippage
+                }
+                window_results.append(result_dict)
+        
+        # Create DataFrames
+        window_results_df = pd.DataFrame(window_results)
+        equity_curves_df = pd.concat(all_equity_curves, ignore_index=True) if all_equity_curves else pd.DataFrame()
+        
+        print(f"  Completed {len(window_results_df)} valid windows")
+        
+        return WalkForwardResult(
+            window_results=window_results_df,
+            equity_curves=equity_curves_df,
+            summary_statistics={}
+        )
+
+    def compute_summary_statistics(self, window_results: pd.DataFrame) -> Dict[str, Any]:
+        """
+        Compute summary statistics from window results.
+        """
+        if window_results.empty:
+            return {
+                'n_windows': 0,
+                'avg_return': 0.0,
+                'median_return': 0.0,
+                'best_window': 0.0,
+                'worst_window': 0.0,
+                'avg_sharpe': 0.0,
+                'avg_drawdown': 0.0,
+                'window_stability': 0.0,
+                'positive_window_pct': 0.0,
+                'negative_window_pct': 0.0,
+                'consistency_score': 0.0,
+                'total_trades': 0
+            }
+        
+        returns = window_results['return_pct']
+        
+        # Average and median return
+        avg_return = returns.mean()
+        median_return = returns.median()
+        
+        # Best and worst window
+        best_window = returns.max()
+        worst_window = returns.min()
+        
+        # Average Sharpe
+        avg_sharpe = window_results['sharpe_ratio'].mean()
+        
+        # Average drawdown
+        avg_drawdown = window_results['max_drawdown'].mean()
+        
+        # Window stability (percentage of windows with positive return)
+        positive_windows = (returns > 0).sum()
+        n_windows = len(window_results)
+        positive_window_pct = (positive_windows / n_windows) * 100
+        negative_window_pct = 100 - positive_window_pct
+        
+        # Consistency score (Sharpe * Win Rate)
+        avg_win_rate = window_results['win_rate'].mean()
+        consistency_score = avg_sharpe * avg_win_rate
+        
+        # Total trades
+        total_trades = window_results['n_test_trades'].sum()
+        
+        return {
+            'n_windows': n_windows,
+            'avg_return': avg_return,
+            'median_return': median_return,
+            'best_window': best_window,
+            'worst_window': worst_window,
+            'avg_sharpe': avg_sharpe,
+            'avg_drawdown': avg_drawdown,
+            'window_stability': positive_window_pct,
+            'positive_window_pct': positive_window_pct,
+            'negative_window_pct': negative_window_pct,
+            'consistency_score': consistency_score,
+            'total_trades': int(total_trades)
+        }
+
+    def save_outputs(
+        self,
+        result: WalkForwardResult,
+        output_dir: Path
+    ) -> None:
+        """Save all outputs."""
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Window results
+        window_path = output_dir / "window_results.csv"
+        result.window_results.to_csv(window_path, index=False)
+        print(f"  Saved window results to {window_path}")
+        
+        # Equity curves
+        if not result.equity_curves.empty:
+            equity_path = output_dir / "equity_curves.parquet"
+            result.equity_curves.to_parquet(equity_path, index=False)
+            print(f"  Saved equity curves to {equity_path}")
+        
+        # Statistics
+        stats_df = pd.DataFrame([result.summary_statistics])
+        stats_path = output_dir / "walk_forward_statistics.csv"
+        stats_df.to_csv(stats_path, index=False)
+        print(f"  Saved walk-forward statistics to {stats_path}")
+
+    def compute(
+        self,
+        execution_trade_log_path: Path,
+        output_dir: Optional[Path] = None
+    ) -> WalkForwardResult:
+        """
+        Main computation method.
+        """
+        if output_dir is None:
+            output_dir = Path("data/feature_store/walk_forward")
+        
+        # Load execution data
+        print(f"  Loading execution data from: {execution_trade_log_path}")
+        trade_log = self.load_execution_data(execution_trade_log_path)
+        print(f"  Loaded {len(trade_log)} trades")
+        
+        # Run validation
+        result = self.run_validation(trade_log)
+        
+        # Compute summary statistics
+        print("  Computing summary statistics...")
+        result.summary_statistics = self.compute_summary_statistics(result.window_results)
+        
+        # Save outputs
+        print("\n  Saving outputs...")
+        self.save_outputs(result, output_dir)
+        
+        # Print summary
+        print(f"\n  Walk-Forward Summary:")
+        print(f"    Windows: {result.summary_statistics['n_windows']}")
+        print(f"    Average Return: {result.summary_statistics['avg_return']:.2f}%")
+        print(f"    Best Window: {result.summary_statistics['best_window']:.2f}%")
+        print(f"    Worst Window: {result.summary_statistics['worst_window']:.2f}%")
+        print(f"    Avg Sharpe: {result.summary_statistics['avg_sharpe']:.3f}")
+        print(f"    Positive Windows: {result.summary_statistics['positive_window_pct']:.1f}%")
+        
+        return result

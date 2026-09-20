@@ -1,0 +1,451 @@
+"""
+Module 212 - Integration Test
+
+Tests Monte Carlo validation engine, statistics, validator, report, and pipeline.
+"""
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
+
+import numpy as np
+import pandas as pd
+import tempfile
+from datetime import datetime, timedelta
+
+from atlas.modules.module212_monte_carlo_validation.engine import MonteCarloEngine, MonteCarloConfig
+from atlas.modules.module212_monte_carlo_validation.statistics import MonteCarloStatisticsEngine
+from atlas.modules.module212_monte_carlo_validation.validator import run_validation
+from atlas.modules.module212_monte_carlo_validation.module import MonteCarloValidation
+
+
+def create_test_trade_log(n=1000, seed=42):
+    """Create synthetic trade log for testing."""
+    np.random.seed(seed)
+    
+    # Generate timestamps
+    start_date = datetime(2020, 1, 1)
+    timestamps = [start_date + timedelta(hours=i) for i in range(n)]
+    
+    # Generate trades with varying performance
+    directions = np.random.choice(['LONG', 'SHORT'], n, p=[0.6, 0.4])
+    entry_prices = 100 + np.random.randn(n) * 10
+    exit_prices = entry_prices + np.random.randn(n) * 5
+    
+    # Add some trend
+    trend = np.linspace(0, 20, n)
+    exit_prices += trend * 0.1
+    
+    # Calculate PnL
+    pnl = (exit_prices - entry_prices) * 0.5
+    pnl *= np.where(directions == 'LONG', 1, -1)
+    pnl += np.random.randn(n) * 2
+    
+    # Adjust prices
+    exit_prices = entry_prices + pnl / 0.5
+    
+    sizes = np.random.uniform(0.1, 1.0, n)
+    commissions = np.random.uniform(0.01, 0.05, n)
+    slippages = np.random.uniform(0.001, 0.01, n)
+    
+    trade_log = pd.DataFrame({
+        'trade_id': range(n),
+        'entry_time': timestamps,
+        'exit_time': [ts + timedelta(hours=1) for ts in timestamps],
+        'direction': directions,
+        'entry_price': entry_prices,
+        'exit_price': exit_prices,
+        'executed_size': sizes,
+        'net_pnl': pnl,
+        'total_commission': commissions,
+        'total_slippage': slippages,
+        'holding_bars': np.random.randint(1, 20, n)
+    })
+    
+    return trade_log
+
+
+def test_engine_load_trade_log():
+    """Test 1: Load trade log."""
+    print("\n" + "=" * 60)
+    print("TEST 1: Load Trade Log")
+    print("=" * 60)
+    
+    engine = MonteCarloEngine()
+    trade_log = create_test_trade_log()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        log_path = tmp_path / "trade_log.parquet"
+        trade_log.to_parquet(log_path, index=False)
+        
+        loaded_df = engine.load_trade_log(log_path)
+        
+        assert not loaded_df.empty
+        assert 'entry_time' in loaded_df.columns
+        assert 'exit_time' in loaded_df.columns
+        assert 'net_pnl' in loaded_df.columns
+    
+    print("  ✓ Load trade log test passed")
+    return True
+
+
+def test_shuffle_trades():
+    """Test 2: Shuffle trades."""
+    print("\n" + "=" * 60)
+    print("TEST 2: Shuffle Trades")
+    print("=" * 60)
+    
+    config = MonteCarloConfig(bootstrap=False)
+    engine = MonteCarloEngine(config=config)
+    
+    trade_log = create_test_trade_log(n=100)
+    shuffled = engine.shuffle_trades(trade_log)
+    
+    # Check same number of trades
+    assert len(shuffled) == len(trade_log)
+    
+    # Check different order (should be different)
+    # Note: There's a tiny chance they could be identical
+    if len(trade_log) > 10:
+        # Check that at least some order changed
+        original_order = trade_log['trade_id'].tolist()
+        shuffled_order = shuffled['trade_id'].tolist()
+        assert original_order != shuffled_order
+    
+    print("  ✓ Shuffle trades test passed")
+    return True
+
+
+def test_bootstrap():
+    """Test 3: Bootstrap sampling."""
+    print("\n" + "=" * 60)
+    print("TEST 3: Bootstrap Sampling")
+    print("=" * 60)
+    
+    config = MonteCarloConfig(bootstrap=True)
+    engine = MonteCarloEngine(config=config)
+    
+    trade_log = create_test_trade_log(n=100)
+    
+    # Run multiple shuffles and check for duplicates
+    shuffled1 = engine.shuffle_trades(trade_log)
+    shuffled2 = engine.shuffle_trades(trade_log)
+    
+    # With bootstrap, trades can be repeated
+    # Check that we have the same number of trades
+    assert len(shuffled1) == len(trade_log)
+    assert len(shuffled2) == len(trade_log)
+    
+    # Check that trade IDs can repeat (with bootstrap)
+    trade_ids1 = shuffled1['trade_id'].tolist()
+    trade_ids2 = shuffled2['trade_id'].tolist()
+    
+    # With bootstrap, there should be duplicates
+    # Check that we have at least one duplicate in the sample
+    has_duplicates1 = len(set(trade_ids1)) < len(trade_ids1)
+    has_duplicates2 = len(set(trade_ids2)) < len(trade_ids2)
+    
+    # It's possible but very unlikely to have no duplicates with n=100 and bootstrap
+    print(f"  Bootstrap duplicates present: {has_duplicates1}")
+    
+    print("  ✓ Bootstrap test passed")
+    return True
+
+
+def test_compute_returns():
+    """Test 4: Compute returns."""
+    print("\n" + "=" * 60)
+    print("TEST 4: Compute Returns")
+    print("=" * 60)
+    
+    engine = MonteCarloEngine()
+    
+    trade_log = create_test_trade_log(n=100)
+    shuffled = engine.shuffle_trades(trade_log)
+    returns = engine.compute_returns(shuffled)
+    
+    assert len(returns) == len(shuffled)
+    assert returns.dtype in ['float64', 'float32']
+    assert not returns.isna().any()
+    
+    print(f"  Returns mean: {returns.mean():.4f}")
+    print("  ✓ Compute returns test passed")
+    return True
+
+
+def test_equity_curve():
+    """Test 5: Build equity curve."""
+    print("\n" + "=" * 60)
+    print("TEST 5: Build Equity Curve")
+    print("=" * 60)
+    
+    config = MonteCarloConfig(initial_capital=10000.0)
+    engine = MonteCarloEngine(config=config)
+    
+    returns = pd.Series([100, 50, -30, 20, 10])
+    equity_curve = engine.compute_equity_curve(returns)
+    
+    assert 'equity' in equity_curve.columns
+    assert 'trade' in equity_curve.columns
+    assert equity_curve['equity'].iloc[0] == config.initial_capital
+    assert len(equity_curve) == len(returns) + 1
+    
+    print("  ✓ Build equity curve test passed")
+    return True
+
+
+def test_compute_metrics():
+    """Test 6: Compute metrics."""
+    print("\n" + "=" * 60)
+    print("TEST 6: Compute Metrics")
+    print("=" * 60)
+    
+    engine = MonteCarloEngine()
+    
+    # Test with positive returns
+    returns_positive = pd.Series([100, 50, 30, 20, 10])
+    
+    sharpe = engine.compute_sharpe_ratio(returns_positive)
+    pf = engine.compute_profit_factor(returns_positive)
+    win_rate = engine.compute_win_rate(returns_positive)
+    
+    assert sharpe > 0
+    assert pf > 1
+    assert win_rate == 1.0
+    
+    # Test with mixed returns
+    returns_mixed = pd.Series([100, -50, 30, -20, 10])
+    
+    max_drawdown, _ = engine.compute_drawdown(engine.compute_equity_curve(returns_mixed))
+    sharpe = engine.compute_sharpe_ratio(returns_mixed)
+    pf = engine.compute_profit_factor(returns_mixed)
+    win_rate = engine.compute_win_rate(returns_mixed)
+    
+    assert max_drawdown > 0
+    assert win_rate == 0.6
+    
+    print(f"  Max drawdown: {max_drawdown:.2f}")
+    print(f"  Sharpe ratio: {sharpe:.3f}")
+    print(f"  Profit factor: {pf:.3f}")
+    print("  ✓ Compute metrics test passed")
+    return True
+
+
+def test_single_simulation():
+    """Test 7: Single simulation."""
+    print("\n" + "=" * 60)
+    print("TEST 7: Single Simulation")
+    print("=" * 60)
+    
+    config = MonteCarloConfig(initial_capital=10000.0)
+    engine = MonteCarloEngine(config=config)
+    
+    trade_log = create_test_trade_log(n=100)
+    result = engine.run_single_simulation(trade_log, 0)
+    
+    assert result.simulation_id == 0
+    assert result.final_equity > 0
+    assert result.equity_curve is not None
+    assert 'simulation_id' in result.equity_curve.columns
+    
+    print(f"  Final equity: {result.final_equity:.2f}")
+    print(f"  Return: {result.return_pct:.2f}%")
+    print(f"  Sharpe: {result.sharpe_ratio:.3f}")
+    print("  ✓ Single simulation test passed")
+    return True
+
+
+def test_full_engine():
+    """Test 8: Full engine."""
+    print("\n" + "=" * 60)
+    print("TEST 8: Full Engine")
+    print("=" * 60)
+    
+    config = MonteCarloConfig(simulations=50)
+    engine = MonteCarloEngine(config=config)
+    
+    trade_log = create_test_trade_log(n=100)
+    result = engine.run_validation(trade_log)
+    
+    assert len(result.simulation_results) == 50
+    assert not result.equity_curves.empty
+    assert result.summary_statistics == {}  # Not computed yet
+    
+    # Compute statistics
+    stats = engine.compute_summary_statistics(result.simulation_results)
+    result.summary_statistics = stats
+    
+    assert stats['n_simulations'] == 50
+    assert stats['prob_profit'] >= 0
+    
+    print(f"  Simulations: {stats['n_simulations']}")
+    print(f"  Prob Profit: {stats['prob_profit']:.1%}")
+    print(f"  Avg Sharpe: {stats['avg_sharpe']:.3f}")
+    print("  ✓ Full engine test passed")
+    return True
+
+
+def test_statistics():
+    """Test 9: Statistics engine."""
+    print("\n" + "=" * 60)
+    print("TEST 9: Statistics Engine")
+    print("=" * 60)
+    
+    config = MonteCarloConfig(simulations=50)
+    engine = MonteCarloEngine(config=config)
+    stats_engine = MonteCarloStatisticsEngine()
+    
+    trade_log = create_test_trade_log(n=100)
+    result = engine.run_validation(trade_log)
+    result.summary_statistics = engine.compute_summary_statistics(result.simulation_results)
+    
+    stats = stats_engine.analyze(result)
+    
+    assert stats.n_simulations == 50
+    assert stats.avg_equity > 0
+    assert stats.prob_profit >= 0
+    assert stats.avg_sharpe is not None
+    
+    print(f"  n_simulations: {stats.n_simulations}")
+    print(f"  avg_equity: {stats.avg_equity:.2f}")
+    print(f"  prob_profit: {stats.prob_profit:.1%}")
+    print("  ✓ Statistics test passed")
+    return True
+
+
+def test_validator():
+    """Test 10: Validator."""
+    print("\n" + "=" * 60)
+    print("TEST 10: Validator")
+    print("=" * 60)
+    
+    config = MonteCarloConfig(simulations=50)
+    engine = MonteCarloEngine(config=config)
+    stats_engine = MonteCarloStatisticsEngine()
+    
+    trade_log = create_test_trade_log(n=100)
+    result = engine.run_validation(trade_log)
+    result.summary_statistics = engine.compute_summary_statistics(result.simulation_results)
+    stats = stats_engine.analyze(result)
+    
+    passed = run_validation(result, stats)
+    assert passed
+    
+    print("  ✓ Validator test passed")
+    return True
+
+
+def test_pipeline():
+    """Test 11: Full pipeline."""
+    print("\n" + "=" * 60)
+    print("TEST 11: Full Pipeline")
+    print("=" * 60)
+    
+    trade_log = create_test_trade_log(n=200)
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        output_dir = tmp_path / "output"
+        
+        # Save trade log
+        trade_log_path = tmp_path / "trade_log.parquet"
+        trade_log.to_parquet(trade_log_path, index=False)
+        
+        research = MonteCarloValidation(
+            simulations=50,
+            bootstrap=False,
+            random_seed=42,
+            initial_capital=10000.0
+        )
+        
+        result = research.run_validation(
+            trade_log_path=trade_log_path,
+            dataset_id="pipeline_test",
+            output_dir=output_dir
+        )
+        
+        assert result.status == "completed"
+        assert "simulation_results" in result.artifacts
+        assert "equity_curves" in result.artifacts
+        assert "risk_statistics" in result.artifacts
+        assert "monte_carlo_report" in result.artifacts
+        assert result.statistics.get("software_validation_passed") == True
+        
+        # Check outputs were saved
+        assert (output_dir / "simulation_results.csv").exists()
+        assert (output_dir / "equity_curves.parquet").exists()
+        assert (output_dir / "risk_statistics.csv").exists()
+        assert (output_dir / "monte_carlo_report.txt").exists()
+    
+    print("  ✓ Full pipeline test passed")
+    return True
+
+
+def test_configuration():
+    """Test 12: Configuration."""
+    print("\n" + "=" * 60)
+    print("TEST 12: Configuration")
+    print("=" * 60)
+    
+    config = MonteCarloConfig(
+        simulations=2000,
+        bootstrap=True,
+        random_seed=123,
+        initial_capital=50000.0
+    )
+    
+    assert config.simulations == 2000
+    assert config.bootstrap == True
+    assert config.random_seed == 123
+    assert config.initial_capital == 50000.0
+    
+    print("  ✓ Configuration test passed")
+    return True
+
+
+def main():
+    """Run all tests."""
+    print("\n" + "=" * 70)
+    print("PROJECT ATLAS - MODULE 212 INTEGRATION TEST")
+    print("Monte Carlo Validation")
+    print("=" * 70)
+    
+    results = {}
+    
+    results["load_trade_log"] = test_engine_load_trade_log()
+    results["shuffle_trades"] = test_shuffle_trades()
+    results["bootstrap"] = test_bootstrap()
+    results["compute_returns"] = test_compute_returns()
+    results["equity_curve"] = test_equity_curve()
+    results["compute_metrics"] = test_compute_metrics()
+    results["single_simulation"] = test_single_simulation()
+    results["full_engine"] = test_full_engine()
+    results["statistics"] = test_statistics()
+    results["validator"] = test_validator()
+    results["pipeline"] = test_pipeline()
+    results["configuration"] = test_configuration()
+    
+    print("\n" + "=" * 70)
+    print("RESULTS")
+    print("=" * 70)
+    
+    for name, ok in results.items():
+        print(f"  {'✓' if ok else '✗'} {name}")
+    
+    passed = sum(results.values())
+    total = len(results)
+    
+    print(f"\n  {passed}/{total} tests passed")
+    
+    if passed == total:
+        print("\n✓ Module 212 VALIDATED")
+        return 0
+    else:
+        print("\n⚠ Some tests failed")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

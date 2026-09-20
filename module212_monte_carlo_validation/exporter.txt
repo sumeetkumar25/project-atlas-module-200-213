@@ -1,0 +1,39 @@
+"""
+Module 212 - Monte Carlo Validation Exporter
+"""
+
+import pandas as pd
+from pathlib import Path
+
+
+class MonteCarloExporter:
+    """Exporter for Monte Carlo validation results."""
+    
+    @staticmethod
+    def export_simulation_results(df: pd.DataFrame, filepath: str):
+        """Export simulation results to CSV."""
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(path, index=False)
+    
+    @staticmethod
+    def export_equity_curves(df: pd.DataFrame, filepath: str):
+        """Export equity curves to Parquet."""
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_parquet(path, index=False)
+    
+    @staticmethod
+    def export_risk_statistics(df: pd.DataFrame, filepath: str):
+        """Export risk statistics to CSV."""
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(path, index=False)
+    
+    @staticmethod
+    def export_report(report: str, filepath: str):
+        """Export report to text file."""
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(report)
