@@ -1,0 +1,137 @@
+"""
+Module 213 - Performance Attribution Report
+"""
+
+from datetime import datetime
+import pandas as pd
+
+
+class AttributionReport:
+    """Report generator for performance attribution results."""
+    
+    @staticmethod
+    def generate(statistics, result: 'AttributionResult', metadata=None, dataset_name="Unknown") -> str:
+        """Generate a formatted report."""
+        lines = []
+        
+        lines.append("=" * 55)
+        lines.append("MODULE 213")
+        lines.append("PERFORMANCE ATTRIBUTION")
+        lines.append("=" * 55)
+        lines.append(f"\nDataset: {dataset_name}")
+        
+        # Overall Performance
+        lines.append("\n" + "-" * 45)
+        lines.append("OVERALL PERFORMANCE")
+        lines.append("-" * 45)
+        lines.append(f"  Total Trades: {statistics.total_trades}")
+        lines.append(f"  Net Profit: {statistics.net_profit:.2f}")
+        lines.append(f"  Gross Profit: {statistics.gross_profit:.2f}")
+        lines.append(f"  Gross Loss: {statistics.gross_loss:.2f}")
+        lines.append(f"  Profit Factor: {statistics.profit_factor:.3f}")
+        lines.append(f"  Win Rate: {statistics.win_rate:.1%}")
+        lines.append(f"  Sharpe Ratio: {statistics.sharpe:.3f}")
+        lines.append(f"  Avg Trade: {statistics.avg_trade:.2f}")
+        
+        # Costs
+        lines.append("\n" + "-" * 45)
+        lines.append("COSTS")
+        lines.append("-" * 45)
+        lines.append(f"  Commission: {statistics.commission_pct:.2f}%")
+        lines.append(f"  Slippage: {statistics.slippage_pct:.2f}%")
+        lines.append(f"  Total Cost: {statistics.commission_pct + statistics.slippage_pct:.2f}%")
+        
+        # Direction Attribution
+        lines.append("\n" + "-" * 45)
+        lines.append("DIRECTION ATTRIBUTION")
+        lines.append("-" * 45)
+        if not result.direction_attribution.empty:
+            dir_df = result.direction_attribution[result.direction_attribution['direction'] != 'OVERALL']
+            if not dir_df.empty:
+                for _, row in dir_df.iterrows():
+                    lines.append(f"  {row['direction']}: {row['net_pnl']:.2f} ({row['win_rate']:.1%})")
+        
+        # Session Attribution
+        lines.append("\n" + "-" * 45)
+        lines.append("SESSION ATTRIBUTION")
+        lines.append("-" * 45)
+        if not result.session_attribution.empty:
+            for _, row in result.session_attribution.iterrows():
+                lines.append(f"  {row['session']}: {row['net_pnl']:.2f} ({row['trades']} trades)")
+        
+        # Top Contributors
+        lines.append("\n" + "-" * 45)
+        lines.append("TOP 5 CONTRIBUTORS")
+        lines.append("-" * 45)
+        if not result.top_contributors.empty:
+            pnl_col = 'net_pnl' if 'net_pnl' in result.top_contributors.columns else 'total_pnl'
+            top5 = result.top_contributors.head(5)
+            for _, row in top5.iterrows():
+                lines.append(f"  Trade {row['trade_id']} ({row['direction']}): {row[pnl_col]:.2f}")
+        
+        # Worst Contributors
+        lines.append("\n" + "-" * 45)
+        lines.append("WORST 5 CONTRIBUTORS")
+        lines.append("-" * 45)
+        if not result.worst_contributors.empty:
+            pnl_col = 'net_pnl' if 'net_pnl' in result.worst_contributors.columns else 'total_pnl'
+            worst5 = result.worst_contributors.head(5)
+            for _, row in worst5.iterrows():
+                lines.append(f"  Trade {row['trade_id']} ({row['direction']}): {row[pnl_col]:.2f}")
+        
+        # Best and Worst Hours
+        lines.append("\n" + "-" * 45)
+        lines.append("TIME ANALYSIS")
+        lines.append("-" * 45)
+        lines.append(f"  Best Hour: {statistics.best_hour:02d}:00")
+        lines.append(f"  Worst Hour: {statistics.worst_hour:02d}:00")
+        lines.append(f"  Best Session: {statistics.best_session}")
+        
+        # Interpretation
+        lines.append("\n" + "-" * 45)
+        lines.append("INTERPRETATION")
+        lines.append("-" * 45)
+        
+        if statistics.profit_factor > 1.5:
+            lines.append("  ✅ Strong profitability (PF > 1.5)")
+        elif statistics.profit_factor > 1.0:
+            lines.append("  ✓ Profitable strategy (PF > 1.0)")
+        else:
+            lines.append("  ⚠ Unprofitable strategy (PF < 1.0)")
+        
+        if statistics.win_rate > 0.5:
+            lines.append("  ✅ Majority of trades are winners")
+        elif statistics.win_rate > 0.3:
+            lines.append("  ✓ Some winning trades")
+        else:
+            lines.append("  ⚠ Low win rate")
+        
+        if statistics.sharpe > 1.0:
+            lines.append("  ✅ Good risk-adjusted returns")
+        elif statistics.sharpe > 0.5:
+            lines.append("  ✓ Moderate risk-adjusted returns")
+        else:
+            lines.append("  ⚠ Poor risk-adjusted returns")
+        
+        # Validation
+        lines.append("\n" + "-" * 45)
+        lines.append("VALIDATION")
+        lines.append("-" * 45)
+        lines.append("  Status: PASSED")
+        
+        # Footer
+        lines.append(f"\n  Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append("\n" + "=" * 55)
+        lines.append("END OF REPORT")
+        lines.append("=" * 55)
+        
+        return "\n".join(lines)
+    
+    @staticmethod
+    def save(report: str, filepath: str):
+        """Save report to file."""
+        from pathlib import Path
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(report)

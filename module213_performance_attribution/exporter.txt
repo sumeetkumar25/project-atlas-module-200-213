@@ -1,0 +1,25 @@
+"""
+Module 213 - Performance Attribution Exporter
+"""
+
+import pandas as pd
+from pathlib import Path
+
+
+class AttributionExporter:
+    """Exporter for performance attribution results."""
+    
+    @staticmethod
+    def export_summary(df: pd.DataFrame, filepath: str):
+        """Export summary to CSV."""
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(path, index=False)
+    
+    @staticmethod
+    def export_report(report: str, filepath: str):
+        """Export report to text file."""
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(report)

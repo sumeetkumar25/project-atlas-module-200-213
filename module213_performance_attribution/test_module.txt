@@ -1,0 +1,500 @@
+"""
+Module 213 - Integration Test
+
+Tests performance attribution engine, statistics, validator, report, and pipeline.
+"""
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
+
+import numpy as np
+import pandas as pd
+import tempfile
+from datetime import datetime, timedelta
+
+from atlas.modules.module213_performance_attribution.engine import PerformanceAttributionEngine, AttributionConfig
+from atlas.modules.module213_performance_attribution.statistics import AttributionStatisticsEngine
+from atlas.modules.module213_performance_attribution.validator import run_validation
+from atlas.modules.module213_performance_attribution.module import PerformanceAttribution
+
+
+def create_test_trade_log(n=500, seed=42):
+    """Create synthetic trade log for testing."""
+    np.random.seed(seed)
+    
+    # Generate timestamps
+    start_date = datetime(2020, 1, 1)
+    timestamps = [start_date + timedelta(hours=i) for i in range(n)]
+    
+    # Generate trades with varying performance
+    directions = np.random.choice(['LONG', 'SHORT'], n, p=[0.6, 0.4])
+    entry_prices = 100 + np.random.randn(n) * 10
+    exit_prices = entry_prices + np.random.randn(n) * 5
+    
+    # Add some trend
+    trend = np.linspace(0, 20, n)
+    exit_prices += trend * 0.1
+    
+    # Calculate PnL
+    pnl = (exit_prices - entry_prices) * 0.5
+    pnl *= np.where(directions == 'LONG', 1, -1)
+    pnl += np.random.randn(n) * 2
+    
+    # Adjust prices
+    exit_prices = entry_prices + pnl / 0.5
+    
+    sizes = np.random.uniform(0.1, 1.0, n)
+    commissions = np.random.uniform(0.01, 0.05, n)
+    slippages = np.random.uniform(0.001, 0.01, n)
+    holding_bars = np.random.randint(1, 30, n)
+    
+    # Add volatility percentile
+    volatility_percentile = np.random.uniform(0, 1, n)
+    
+    # Add market regime
+    regimes = np.random.choice(['Trending', 'Range', 'Expansion', 'Compression'], n)
+    
+    trade_log = pd.DataFrame({
+        'trade_id': range(n),
+        'entry_time': timestamps,
+        'exit_time': [
+            ts + timedelta(hours=int(i))
+            for ts, i in zip(timestamps, holding_bars)
+        ],
+        'direction': directions,
+        'entry_price': entry_prices,
+        'exit_price': exit_prices,
+        'executed_size': sizes,
+        'net_pnl': pnl,
+        'total_commission': commissions,
+        'total_slippage': slippages,
+        'holding_bars': holding_bars,
+        'volatility_percentile': volatility_percentile,
+        'market_regime': regimes
+    })
+    
+    return trade_log
+
+
+def test_engine_load_trade_log():
+    """Test 1: Load trade log."""
+    print("\n" + "=" * 60)
+    print("TEST 1: Load Trade Log")
+    print("=" * 60)
+    
+    engine = PerformanceAttributionEngine()
+    trade_log = create_test_trade_log()
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        log_path = tmp_path / "trade_log.parquet"
+        trade_log.to_parquet(log_path, index=False)
+        
+        loaded_df = engine.load_trade_log(log_path)
+        
+        assert not loaded_df.empty
+        assert 'entry_time' in loaded_df.columns
+        assert 'exit_time' in loaded_df.columns
+        assert 'net_pnl' in loaded_df.columns
+    
+    print("  ✓ Load trade log test passed")
+    return True
+
+
+def test_compute_metrics():
+    """Test 2: Compute metrics."""
+    print("\n" + "=" * 60)
+    print("TEST 2: Compute Metrics")
+    print("=" * 60)
+    
+    engine = PerformanceAttributionEngine()
+    
+    df = create_test_trade_log(n=100)
+    metrics = engine.compute_metrics(df)
+    
+    assert metrics['trades'] == 100
+    assert 'net_pnl' in metrics
+    assert 'win_rate' in metrics
+    assert 'profit_factor' in metrics
+    
+    print(f"  Trades: {metrics['trades']}")
+    print(f"  Net PnL: {metrics['net_pnl']:.2f}")
+    print(f"  Win Rate: {metrics['win_rate']:.1%}")
+    print("  ✓ Compute metrics test passed")
+    return True
+
+
+def test_attribute_direction():
+    """Test 3: Direction attribution."""
+    print("\n" + "=" * 60)
+    print("TEST 3: Direction Attribution")
+    print("=" * 60)
+    
+    engine = PerformanceAttributionEngine()
+    df = create_test_trade_log(n=200)
+    result = engine.attribute_direction(df)
+    
+    assert not result.empty
+    assert 'direction' in result.columns
+    assert 'OVERALL' in result['direction'].values
+    assert 'LONG' in result['direction'].values
+    assert 'SHORT' in result['direction'].values
+    
+    print(f"  Directions: {result['direction'].tolist()}")
+    print("  ✓ Direction attribution test passed")
+    return True
+
+
+def test_attribute_session():
+    """Test 4: Session attribution."""
+    print("\n" + "=" * 60)
+    print("TEST 4: Session Attribution")
+    print("=" * 60)
+    
+    engine = PerformanceAttributionEngine()
+    df = create_test_trade_log(n=200)
+    result = engine.attribute_session(df)
+    
+    assert not result.empty
+    assert 'session' in result.columns
+    
+    print(f"  Sessions: {result['session'].tolist()}")
+    print("  ✓ Session attribution test passed")
+    return True
+
+
+def test_attribute_hour():
+    """Test 5: Hour attribution."""
+    print("\n" + "=" * 60)
+    print("TEST 5: Hour Attribution")
+    print("=" * 60)
+    
+    engine = PerformanceAttributionEngine()
+    df = create_test_trade_log(n=200)
+    result = engine.attribute_hour(df)
+    
+    assert not result.empty
+    assert 'hour' in result.columns
+    assert len(result) <= 24
+    
+    print(f"  Unique hours: {len(result)}")
+    print("  ✓ Hour attribution test passed")
+    return True
+
+
+def test_attribute_day():
+    """Test 6: Day attribution."""
+    print("\n" + "=" * 60)
+    print("TEST 6: Day Attribution")
+    print("=" * 60)
+    
+    engine = PerformanceAttributionEngine()
+    df = create_test_trade_log(n=200)
+    result = engine.attribute_day(df)
+    
+    assert not result.empty
+    assert 'day' in result.columns
+    assert len(result) <= 7
+    
+    print(f"  Unique days: {len(result)}")
+    print("  ✓ Day attribution test passed")
+    return True
+
+
+def test_attribute_holding_time():
+    """Test 7: Holding time attribution."""
+    print("\n" + "=" * 60)
+    print("TEST 7: Holding Time Attribution")
+    print("=" * 60)
+    
+    engine = PerformanceAttributionEngine()
+    df = create_test_trade_log(n=200)
+    result = engine.attribute_holding_time(df)
+    
+    assert not result.empty
+    assert 'holding_bin' in result.columns
+    
+    print(f"  Holding bins: {result['holding_bin'].tolist()}")
+    print("  ✓ Holding time attribution test passed")
+    return True
+
+
+def test_attribute_size():
+    """Test 8: Size attribution."""
+    print("\n" + "=" * 60)
+    print("TEST 8: Size Attribution")
+    print("=" * 60)
+    
+    engine = PerformanceAttributionEngine()
+    df = create_test_trade_log(n=200)
+    result = engine.attribute_size(df)
+    
+    assert not result.empty
+    assert 'size_bin' in result.columns
+    
+    print(f"  Size bins: {result['size_bin'].tolist()}")
+    print("  ✓ Size attribution test passed")
+    return True
+
+
+def test_attribute_volatility():
+    """Test 9: Volatility attribution."""
+    print("\n" + "=" * 60)
+    print("TEST 9: Volatility Attribution")
+    print("=" * 60)
+    
+    engine = PerformanceAttributionEngine()
+    df = create_test_trade_log(n=200)
+    result = engine.attribute_volatility(df)
+    
+    assert not result.empty
+    assert 'volatility_bin' in result.columns
+    
+    print(f"  Volatility bins: {result['volatility_bin'].tolist()}")
+    print("  ✓ Volatility attribution test passed")
+    return True
+
+
+def test_attribute_regime():
+    """Test 10: Regime attribution."""
+    print("\n" + "=" * 60)
+    print("TEST 10: Regime Attribution")
+    print("=" * 60)
+    
+    engine = PerformanceAttributionEngine()
+    df = create_test_trade_log(n=200)
+    result = engine.attribute_regime(df)
+    
+    assert not result.empty
+    assert 'regime' in result.columns
+    
+    print(f"  Regimes: {result['regime'].tolist()}")
+    print("  ✓ Regime attribution test passed")
+    return True
+
+
+def test_attribute_commission():
+    """Test 11: Commission attribution."""
+    print("\n" + "=" * 60)
+    print("TEST 11: Commission Attribution")
+    print("=" * 60)
+    
+    engine = PerformanceAttributionEngine()
+    df = create_test_trade_log(n=200)
+    result = engine.attribute_commission(df)
+    
+    assert not result.empty
+    assert 'metric' in result.columns
+    assert 'value' in result.columns
+    
+    print(f"  Metrics: {result['metric'].tolist()}")
+    print("  ✓ Commission attribution test passed")
+    return True
+
+
+def test_attribute_slippage():
+    """Test 12: Slippage attribution."""
+    print("\n" + "=" * 60)
+    print("TEST 12: Slippage Attribution")
+    print("=" * 60)
+    
+    engine = PerformanceAttributionEngine()
+    df = create_test_trade_log(n=200)
+    result = engine.attribute_slippage(df)
+    
+    assert not result.empty
+    assert 'metric' in result.columns
+    assert 'value' in result.columns
+    
+    print(f"  Metrics: {result['metric'].tolist()}")
+    print("  ✓ Slippage attribution test passed")
+    return True
+
+
+def test_full_engine():
+    """Test 13: Full engine."""
+    print("\n" + "=" * 60)
+    print("TEST 13: Full Engine")
+    print("=" * 60)
+    
+    engine = PerformanceAttributionEngine()
+    df = create_test_trade_log(n=200)
+    result = engine.compute_attribution(df)
+    
+    assert not result.overall_summary.empty
+    assert not result.direction_attribution.empty
+    assert not result.session_attribution.empty
+    assert not result.hour_attribution.empty
+    assert not result.day_attribution.empty
+    assert not result.holding_time_attribution.empty
+    assert not result.size_attribution.empty
+    assert not result.volatility_attribution.empty
+    assert not result.regime_attribution.empty
+    assert not result.commission_attribution.empty
+    assert not result.slippage_attribution.empty
+    
+    print(f"  Overall trades: {result.overall_summary.iloc[0]['trades']}")
+    print("  ✓ Full engine test passed")
+    return True
+
+
+def test_statistics():
+    """Test 14: Statistics engine."""
+    print("\n" + "=" * 60)
+    print("TEST 14: Statistics Engine")
+    print("=" * 60)
+    
+    engine = PerformanceAttributionEngine()
+    stats_engine = AttributionStatisticsEngine()
+    
+    df = create_test_trade_log(n=200)
+    result = engine.compute_attribution(df)
+    stats = stats_engine.analyze(result)
+    
+    assert stats.total_trades > 0
+    assert stats.profit_factor is not None
+    assert stats.win_rate is not None
+    
+    print(f"  Trades: {stats.total_trades}")
+    print(f"  Profit Factor: {stats.profit_factor:.3f}")
+    print(f"  Win Rate: {stats.win_rate:.1%}")
+    print("  ✓ Statistics test passed")
+    return True
+
+
+def test_validator():
+    """Test 15: Validator."""
+    print("\n" + "=" * 60)
+    print("TEST 15: Validator")
+    print("=" * 60)
+    
+    engine = PerformanceAttributionEngine()
+    stats_engine = AttributionStatisticsEngine()
+    
+    df = create_test_trade_log(n=200)
+    result = engine.compute_attribution(df)
+    stats = stats_engine.analyze(result)
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Save outputs to pass validation
+        engine.save_outputs(result, Path(tmpdir))
+        passed = run_validation(result, stats, tmpdir)
+        assert passed
+    
+    print("  ✓ Validator test passed")
+    return True
+
+
+def test_pipeline():
+    """Test 16: Full pipeline."""
+    print("\n" + "=" * 60)
+    print("TEST 16: Full Pipeline")
+    print("=" * 60)
+    
+    df = create_test_trade_log(n=200)
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        output_dir = tmp_path / "output"
+        
+        # Save trade log
+        trade_log_path = tmp_path / "trade_log.parquet"
+        df.to_parquet(trade_log_path, index=False)
+        
+        research = PerformanceAttribution()
+        
+        result = research.run_attribution(
+            trade_log_path=trade_log_path,
+            dataset_id="pipeline_test",
+            output_dir=output_dir
+        )
+        
+        assert result.status == "completed"
+        assert "overall_summary" in result.artifacts
+        assert "direction_attribution" in result.artifacts
+        assert "performance_attribution_report" in result.artifacts
+        assert result.statistics.get("software_validation_passed") == True
+        
+        # Check outputs were saved
+        assert (output_dir / "performance_summary.csv").exists()
+        assert (output_dir / "performance_by_direction.csv").exists()
+        assert (output_dir / "performance_by_session.csv").exists()
+        assert (output_dir / "performance_by_hour.csv").exists()
+        assert (output_dir / "performance_by_day.csv").exists()
+        assert (output_dir / "performance_attribution_report.txt").exists()
+    
+    print("  ✓ Full pipeline test passed")
+    return True
+
+
+def test_configuration():
+    """Test 17: Configuration."""
+    print("\n" + "=" * 60)
+    print("TEST 17: Configuration")
+    print("=" * 60)
+    
+    config = AttributionConfig(
+        holding_bins=[1, 3, 5, 10, 20],
+        size_bins=[0, 0.2, 0.4, 0.6, 0.8, 1.0],
+        volatility_bins=[0, 0.2, 0.4, 0.6, 0.8, 1.0]
+    )
+    
+    assert config.holding_bins == [1, 3, 5, 10, 20]
+    assert config.size_bins == [0, 0.2, 0.4, 0.6, 0.8, 1.0]
+    assert config.volatility_bins == [0, 0.2, 0.4, 0.6, 0.8, 1.0]
+    
+    print("  ✓ Configuration test passed")
+    return True
+
+
+def main():
+    """Run all tests."""
+    print("\n" + "=" * 70)
+    print("PROJECT ATLAS - MODULE 213 INTEGRATION TEST")
+    print("Performance Attribution")
+    print("=" * 70)
+    
+    results = {}
+    
+    results["load_trade_log"] = test_engine_load_trade_log()
+    results["compute_metrics"] = test_compute_metrics()
+    results["direction_attribution"] = test_attribute_direction()
+    results["session_attribution"] = test_attribute_session()
+    results["hour_attribution"] = test_attribute_hour()
+    results["day_attribution"] = test_attribute_day()
+    results["holding_time_attribution"] = test_attribute_holding_time()
+    results["size_attribution"] = test_attribute_size()
+    results["volatility_attribution"] = test_attribute_volatility()
+    results["regime_attribution"] = test_attribute_regime()
+    results["commission_attribution"] = test_attribute_commission()
+    results["slippage_attribution"] = test_attribute_slippage()
+    results["full_engine"] = test_full_engine()
+    results["statistics"] = test_statistics()
+    results["validator"] = test_validator()
+    results["pipeline"] = test_pipeline()
+    results["configuration"] = test_configuration()
+    
+    print("\n" + "=" * 70)
+    print("RESULTS")
+    print("=" * 70)
+    
+    for name, ok in results.items():
+        print(f"  {'✓' if ok else '✗'} {name}")
+    
+    passed = sum(results.values())
+    total = len(results)
+    
+    print(f"\n  {passed}/{total} tests passed")
+    
+    if passed == total:
+        print("\n✓ Module 213 VALIDATED")
+        return 0
+    else:
+        print("\n⚠ Some tests failed")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

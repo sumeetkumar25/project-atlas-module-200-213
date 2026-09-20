@@ -1,0 +1,632 @@
+"""
+Module 213 - Performance Attribution Engine
+
+Decomposes strategy performance into measurable components.
+
+Analyses:
+- Long vs Short
+- Session Attribution
+- Holding Time Attribution
+- Time-of-Day Attribution
+- Day-of-Week Attribution
+- Trade Size Attribution
+- Volatility Attribution
+- Regime Attribution
+- Commission Attribution
+- Slippage Attribution
+
+Output: Comprehensive performance attribution results.
+"""
+
+import numpy as np
+import pandas as pd
+from dataclasses import dataclass, field
+from typing import Optional, Dict, Any, List, Tuple
+from pathlib import Path
+from datetime import datetime
+import warnings
+warnings.filterwarnings('ignore')
+
+
+@dataclass
+class AttributionConfig:
+    """Configuration for performance attribution."""
+    holding_bins: List[int] = field(default_factory=lambda: [1, 5, 10, 20, 50])
+    size_bins: List[float] = field(default_factory=lambda: [0, 0.25, 0.5, 0.75, 1.0])
+    volatility_bins: List[float] = field(default_factory=lambda: [0, 0.25, 0.5, 0.75, 1.0])
+    sessions: List[str] = field(default_factory=lambda: ['Asia', 'Europe', 'US', 'Overlap'])
+    session_hours: Dict[str, List[int]] = field(default_factory=lambda: {
+        'Asia': [0, 1, 2, 3, 4, 5, 6, 7],
+        'Europe': [8, 9, 10, 11, 12, 13, 14, 15],
+        'US': [16, 17, 18, 19, 20, 21, 22, 23],
+        'Overlap': [8, 9, 10, 11, 12, 13, 14, 15, 16, 17]  # Europe/US overlap
+    })
+
+
+@dataclass
+class AttributionResult:
+    """Results from performance attribution."""
+    overall_summary: pd.DataFrame
+    direction_attribution: pd.DataFrame
+    session_attribution: pd.DataFrame
+    hour_attribution: pd.DataFrame
+    day_attribution: pd.DataFrame
+    holding_time_attribution: pd.DataFrame
+    size_attribution: pd.DataFrame
+    volatility_attribution: pd.DataFrame
+    regime_attribution: pd.DataFrame
+    commission_attribution: pd.DataFrame
+    slippage_attribution: pd.DataFrame
+    top_contributors: pd.DataFrame
+    worst_contributors: pd.DataFrame
+    largest_losses: pd.DataFrame
+    largest_gains: pd.DataFrame
+
+
+class PerformanceAttributionEngine:
+    """Core engine for performance attribution."""
+
+    def __init__(
+        self,
+        config: Optional[AttributionConfig] = None
+    ):
+        """
+        Initialize the performance attribution engine.
+        
+        Args:
+            config: AttributionConfig with attribution parameters
+        """
+        self.config = config or AttributionConfig()
+
+    def load_trade_log(self, filepath: Path) -> pd.DataFrame:
+        """Load executed trade log from Module 210."""
+        if not filepath.exists():
+            raise FileNotFoundError(f"Trade log not found: {filepath}")
+        
+        if filepath.suffix == '.parquet':
+            df = pd.read_parquet(filepath)
+        else:
+            df = pd.read_csv(filepath)
+        
+        # Ensure datetime columns
+        if 'entry_time' in df.columns:
+            df['entry_time'] = pd.to_datetime(df['entry_time'])
+        if 'exit_time' in df.columns:
+            df['exit_time'] = pd.to_datetime(df['exit_time'])
+        
+        return df
+
+    def compute_metrics(self, df: pd.DataFrame) -> Dict[str, Any]:
+        """Compute comprehensive metrics for a DataFrame."""
+        if df.empty:
+            return {
+                'trades': 0,
+                'net_pnl': 0.0,
+                'gross_profit': 0.0,
+                'gross_loss': 0.0,
+                'profit_factor': 0.0,
+                'win_rate': 0.0,
+                'avg_pnl': 0.0,
+                'sharpe': 0.0,
+                'max_drawdown': 0.0,
+                'avg_holding': 0.0,
+                'commission': 0.0,
+                'slippage': 0.0,
+                'commission_pct': 0.0,
+                'slippage_pct': 0.0
+            }
+        
+        pnl_col = 'net_pnl' if 'net_pnl' in df.columns else 'total_pnl'
+        pnl = df[pnl_col]
+        
+        gross_profit = pnl[pnl > 0].sum()
+        gross_loss = abs(pnl[pnl < 0].sum())
+        
+        profit_factor = gross_profit / gross_loss if gross_loss > 0 else np.inf
+        win_rate = (pnl > 0).mean()
+        avg_pnl = pnl.mean()
+        
+        # Sharpe ratio
+        if pnl.std() > 0:
+            sharpe = (pnl.mean() / pnl.std()) * np.sqrt(252)
+        else:
+            sharpe = 0.0
+        
+        # Max drawdown on equity curve
+        equity = pnl.cumsum()
+        running_max = equity.expanding().max()
+        drawdown = (equity - running_max)
+        max_drawdown = abs(drawdown.min()) if not drawdown.empty else 0.0
+        
+        # Commission and slippage
+        commission = df['total_commission'].sum() if 'total_commission' in df.columns else 0.0
+        slippage = df['total_slippage'].sum() if 'total_slippage' in df.columns else 0.0
+        
+        # Percentages
+        total_trade_value = abs(pnl).sum() if abs(pnl).sum() > 0 else 1.0
+        commission_pct = (commission / total_trade_value) * 100
+        slippage_pct = (slippage / total_trade_value) * 100
+        
+        return {
+            'trades': len(df),
+            'net_pnl': float(pnl.sum()),
+            'gross_profit': float(gross_profit),
+            'gross_loss': float(gross_loss),
+            'profit_factor': float(profit_factor),
+            'win_rate': float(win_rate),
+            'avg_pnl': float(avg_pnl),
+            'sharpe': float(sharpe),
+            'max_drawdown': float(max_drawdown),
+            'avg_holding': float(df['holding_bars'].mean()) if 'holding_bars' in df.columns else 0.0,
+            'commission': float(commission),
+            'slippage': float(slippage),
+            'commission_pct': float(commission_pct),
+            'slippage_pct': float(slippage_pct)
+        }
+
+    def attribute_direction(self, df: pd.DataFrame) -> pd.DataFrame:
+        """1. Long vs Short attribution."""
+        results = []
+        
+        for direction in ['LONG', 'SHORT']:
+            subset = df[df['direction'] == direction]
+            metrics = self.compute_metrics(subset)
+            metrics['direction'] = direction
+            results.append(metrics)
+        
+        # Add overall
+        overall = self.compute_metrics(df)
+        overall['direction'] = 'OVERALL'
+        results.append(overall)
+        
+        return pd.DataFrame(results)
+
+    def attribute_session(self, df: pd.DataFrame) -> pd.DataFrame:
+        """2. Session attribution."""
+        results = []
+        
+        # Determine session based on hour
+        def get_session(hour):
+            if hour in self.config.session_hours['Asia']:
+                return 'Asia'
+            elif hour in self.config.session_hours['Europe']:
+                return 'Europe'
+            elif hour in self.config.session_hours['US']:
+                return 'US'
+            else:
+                return 'Other'
+        
+        df_copy = df.copy()
+        df_copy['hour'] = df_copy['entry_time'].dt.hour
+        df_copy['session'] = df_copy['hour'].apply(get_session)
+        
+        for session in self.config.sessions:
+            subset = df_copy[df_copy['session'] == session]
+            metrics = self.compute_metrics(subset)
+            metrics['session'] = session
+            results.append(metrics)
+        
+        # Add overlap
+        overlap_hours = self.config.session_hours.get('Overlap', [])
+        overlap_subset = df_copy[df_copy['hour'].isin(overlap_hours)]
+        if not overlap_subset.empty:
+            metrics = self.compute_metrics(overlap_subset)
+            metrics['session'] = 'Overlap'
+            results.append(metrics)
+        
+        return pd.DataFrame(results)
+
+    def attribute_hour(self, df: pd.DataFrame) -> pd.DataFrame:
+        """3. Time-of-Day attribution."""
+        results = []
+        
+        df_copy = df.copy()
+        df_copy['hour'] = df_copy['entry_time'].dt.hour
+        
+        for hour in range(24):
+            subset = df_copy[df_copy['hour'] == hour]
+            metrics = self.compute_metrics(subset)
+            metrics['hour'] = hour
+            results.append(metrics)
+        
+        return pd.DataFrame(results)
+
+    def attribute_day(self, df: pd.DataFrame) -> pd.DataFrame:
+        """4. Day-of-Week attribution."""
+        results = []
+        
+        df_copy = df.copy()
+        df_copy['day'] = df_copy['entry_time'].dt.dayofweek
+        
+        for day in range(7):
+            subset = df_copy[df_copy['day'] == day]
+            metrics = self.compute_metrics(subset)
+            metrics['day'] = day
+            results.append(metrics)
+        
+        return pd.DataFrame(results)
+
+    def attribute_holding_time(self, df: pd.DataFrame) -> pd.DataFrame:
+        """5. Holding Time attribution."""
+        results = []
+        
+        df_copy = df.copy()
+        
+        for i in range(len(self.config.holding_bins)):
+            if i == 0:
+                continue
+            lower = self.config.holding_bins[i-1]
+            upper = self.config.holding_bins[i]
+            
+            subset = df_copy[
+                (df_copy['holding_bars'] >= lower) & 
+                (df_copy['holding_bars'] < upper)
+            ]
+            
+            metrics = self.compute_metrics(subset)
+            metrics['holding_bin'] = f"{lower}-{upper}"
+            results.append(metrics)
+        
+        # Add 20+ bin
+        subset = df_copy[df_copy['holding_bars'] >= self.config.holding_bins[-1]]
+        metrics = self.compute_metrics(subset)
+        metrics['holding_bin'] = f"{self.config.holding_bins[-1]}+"
+        results.append(metrics)
+        
+        return pd.DataFrame(results)
+
+    def attribute_size(self, df: pd.DataFrame) -> pd.DataFrame:
+        """6. Trade Size attribution."""
+        results = []
+        
+        df_copy = df.copy()
+        
+        for i in range(len(self.config.size_bins)):
+            if i == 0:
+                continue
+            lower = self.config.size_bins[i-1]
+            upper = self.config.size_bins[i]
+            
+            subset = df_copy[
+                (df_copy['executed_size'] >= lower) & 
+                (df_copy['executed_size'] < upper)
+            ]
+            
+            metrics = self.compute_metrics(subset)
+            metrics['size_bin'] = f"{lower:.2f}-{upper:.2f}"
+            results.append(metrics)
+        
+        # Add max bin
+        subset = df_copy[df_copy['executed_size'] >= self.config.size_bins[-1]]
+        metrics = self.compute_metrics(subset)
+        metrics['size_bin'] = f"{self.config.size_bins[-1]:.2f}+"
+        results.append(metrics)
+        
+        return pd.DataFrame(results)
+
+    def attribute_volatility(self, df: pd.DataFrame) -> pd.DataFrame:
+        """7. Volatility attribution."""
+        results = []
+        
+        if 'volatility_percentile' not in df.columns:
+            # If not available, create dummy volatility based on returns
+            df_copy = df.copy()
+            pnl = df['net_pnl'] if 'net_pnl' in df.columns else df['total_pnl']
+            df_copy['volatility_percentile'] = pd.qcut(pnl.abs(), q=4, labels=False) / 3
+        else:
+            df_copy = df.copy()
+        
+        for i in range(len(self.config.volatility_bins)):
+            if i == 0:
+                continue
+            lower = self.config.volatility_bins[i-1]
+            upper = self.config.volatility_bins[i]
+            
+            subset = df_copy[
+                (df_copy['volatility_percentile'] >= lower) & 
+                (df_copy['volatility_percentile'] < upper)
+            ]
+            
+            metrics = self.compute_metrics(subset)
+            metrics['volatility_bin'] = f"{lower:.0%}-{upper:.0%}"
+            results.append(metrics)
+        
+        # Add max bin
+        subset = df_copy[df_copy['volatility_percentile'] >= self.config.volatility_bins[-1]]
+        metrics = self.compute_metrics(subset)
+        metrics['volatility_bin'] = f"{self.config.volatility_bins[-1]:.0%}+"
+        results.append(metrics)
+        
+        return pd.DataFrame(results)
+
+    def attribute_regime(self, df: pd.DataFrame) -> pd.DataFrame:
+        """8. Regime attribution."""
+        results = []
+        
+        if 'market_regime' not in df.columns:
+            # If not available, create dummy regime based on returns
+            df_copy = df.copy()
+            pnl = df['net_pnl'] if 'net_pnl' in df.columns else df['total_pnl']
+            df_copy['market_regime'] = pd.cut(
+                pnl, 
+                bins=[-np.inf, -0.5, 0.5, np.inf],
+                labels=['Bearish', 'Neutral', 'Bullish']
+            )
+        else:
+            df_copy = df.copy()
+        
+        regimes = df_copy['market_regime'].unique()
+        for regime in regimes:
+            subset = df_copy[df_copy['market_regime'] == regime]
+            metrics = self.compute_metrics(subset)
+            metrics['regime'] = regime
+            results.append(metrics)
+        
+        return pd.DataFrame(results)
+
+    def attribute_commission(self, df: pd.DataFrame) -> pd.DataFrame:
+        """9. Commission attribution."""
+        results = []
+        
+        pnl_col = 'net_pnl' if 'net_pnl' in df.columns else 'total_pnl'
+        pnl = df[pnl_col]
+        
+        # Calculate gross PnL (before commission and slippage)
+        if 'total_commission' in df.columns and 'total_slippage' in df.columns:
+            gross_pnl = pnl + df['total_commission'] + df['total_slippage']
+        else:
+            gross_pnl = pnl
+        
+        results.append({
+            'metric': 'Gross PnL',
+            'value': float(gross_pnl.sum())
+        })
+        
+        results.append({
+            'metric': 'Commission',
+            'value': float(df['total_commission'].sum()) if 'total_commission' in df.columns else 0.0
+        })
+        
+        results.append({
+            'metric': 'Slippage',
+            'value': float(df['total_slippage'].sum()) if 'total_slippage' in df.columns else 0.0
+        })
+        
+        results.append({
+            'metric': 'Net PnL',
+            'value': float(pnl.sum())
+        })
+        
+        total_value = abs(gross_pnl).sum() if abs(gross_pnl).sum() > 0 else 1.0
+        commission_pct = (df['total_commission'].sum() / total_value * 100) if 'total_commission' in df.columns else 0.0
+        slippage_pct = (df['total_slippage'].sum() / total_value * 100) if 'total_slippage' in df.columns else 0.0
+        
+        results.append({
+            'metric': 'Commission %',
+            'value': float(commission_pct)
+        })
+        
+        results.append({
+            'metric': 'Slippage %',
+            'value': float(slippage_pct)
+        })
+        
+        return pd.DataFrame(results)
+
+    def attribute_slippage(self, df: pd.DataFrame) -> pd.DataFrame:
+        """10. Slippage attribution."""
+        results = []
+        
+        pnl_col = 'net_pnl' if 'net_pnl' in df.columns else 'total_pnl'
+        pnl = df[pnl_col]
+        
+        # Calculate expected PnL (before slippage)
+        if 'total_slippage' in df.columns:
+            expected_pnl = pnl + df['total_slippage']
+        else:
+            expected_pnl = pnl
+        
+        results.append({
+            'metric': 'Expected PnL',
+            'value': float(expected_pnl.sum())
+        })
+        
+        results.append({
+            'metric': 'Actual PnL',
+            'value': float(pnl.sum())
+        })
+        
+        slippage_loss = expected_pnl.sum() - pnl.sum()
+        results.append({
+            'metric': 'Slippage Loss',
+            'value': float(slippage_loss)
+        })
+        
+        # By direction
+        for direction in ['LONG', 'SHORT']:
+            subset = df[df['direction'] == direction]
+            subset_pnl = subset[pnl_col]
+            if 'total_slippage' in subset.columns:
+                subset_expected = subset_pnl + subset['total_slippage']
+            else:
+                subset_expected = subset_pnl
+            
+            subset_slippage = subset_expected.sum() - subset_pnl.sum()
+            
+            results.append({
+                'metric': f'Slippage Loss ({direction})',
+                'value': float(subset_slippage)
+            })
+        
+        return pd.DataFrame(results)
+
+    def find_top_contributors(self, df: pd.DataFrame, n: int = 10) -> pd.DataFrame:
+        """Find top contributing trades."""
+        pnl_col = 'net_pnl' if 'net_pnl' in df.columns else 'total_pnl'
+        return df.nlargest(n, pnl_col)[['trade_id', 'direction', pnl_col, 'holding_bars']]
+
+    def find_worst_contributors(self, df: pd.DataFrame, n: int = 10) -> pd.DataFrame:
+        """Find worst contributing trades."""
+        pnl_col = 'net_pnl' if 'net_pnl' in df.columns else 'total_pnl'
+        return df.nsmallest(n, pnl_col)[['trade_id', 'direction', pnl_col, 'holding_bars']]
+
+    def find_largest_gains(self, df: pd.DataFrame, n: int = 10) -> pd.DataFrame:
+        """Find largest gain trades."""
+        pnl_col = 'net_pnl' if 'net_pnl' in df.columns else 'total_pnl'
+        winners = df[df[pnl_col] > 0]
+        return winners.nlargest(n, pnl_col)[['trade_id', 'direction', pnl_col, 'holding_bars']]
+
+    def find_largest_losses(self, df: pd.DataFrame, n: int = 10) -> pd.DataFrame:
+        """Find largest loss trades."""
+        pnl_col = 'net_pnl' if 'net_pnl' in df.columns else 'total_pnl'
+        losers = df[df[pnl_col] < 0]
+        return losers.nsmallest(n, pnl_col)[['trade_id', 'direction', pnl_col, 'holding_bars']]
+
+    def compute_attribution(self, df: pd.DataFrame) -> AttributionResult:
+        """
+        Run complete performance attribution.
+        """
+        print("\n  Running Performance Attribution...")
+        print(f"  Trades: {len(df)}")
+        
+        # Overall summary
+        print("  Computing overall summary...")
+        overall = self.compute_metrics(df)
+        overall_df = pd.DataFrame([overall])
+        
+        # Direction attribution
+        print("  Attributing by direction...")
+        direction_df = self.attribute_direction(df)
+        
+        # Session attribution
+        print("  Attributing by session...")
+        session_df = self.attribute_session(df)
+        
+        # Hour attribution
+        print("  Attributing by hour...")
+        hour_df = self.attribute_hour(df)
+        
+        # Day attribution
+        print("  Attributing by day...")
+        day_df = self.attribute_day(df)
+        
+        # Holding time attribution
+        print("  Attributing by holding time...")
+        holding_df = self.attribute_holding_time(df)
+        
+        # Size attribution
+        print("  Attributing by trade size...")
+        size_df = self.attribute_size(df)
+        
+        # Volatility attribution
+        print("  Attributing by volatility...")
+        volatility_df = self.attribute_volatility(df)
+        
+        # Regime attribution
+        print("  Attributing by regime...")
+        regime_df = self.attribute_regime(df)
+        
+        # Commission attribution
+        print("  Attributing commission...")
+        commission_df = self.attribute_commission(df)
+        
+        # Slippage attribution
+        print("  Attributing slippage...")
+        slippage_df = self.attribute_slippage(df)
+        
+        # Find top and worst contributors
+        print("  Finding contributors...")
+        top_contributors = self.find_top_contributors(df)
+        worst_contributors = self.find_worst_contributors(df)
+        largest_gains = self.find_largest_gains(df)
+        largest_losses = self.find_largest_losses(df)
+        
+        print("  Attribution complete!")
+        
+        return AttributionResult(
+            overall_summary=overall_df,
+            direction_attribution=direction_df,
+            session_attribution=session_df,
+            hour_attribution=hour_df,
+            day_attribution=day_df,
+            holding_time_attribution=holding_df,
+            size_attribution=size_df,
+            volatility_attribution=volatility_df,
+            regime_attribution=regime_df,
+            commission_attribution=commission_df,
+            slippage_attribution=slippage_df,
+            top_contributors=top_contributors,
+            worst_contributors=worst_contributors,
+            largest_losses=largest_losses,
+            largest_gains=largest_gains
+        )
+
+    def save_outputs(
+        self,
+        result: AttributionResult,
+        output_dir: Path
+    ) -> None:
+        """Save all outputs."""
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Save all attribution results
+        outputs = {
+            'performance_summary': result.overall_summary,
+            'performance_by_direction': result.direction_attribution,
+            'performance_by_session': result.session_attribution,
+            'performance_by_hour': result.hour_attribution,
+            'performance_by_day': result.day_attribution,
+            'performance_by_holding_time': result.holding_time_attribution,
+            'performance_by_volatility': result.volatility_attribution,
+            'performance_by_regime': result.regime_attribution,
+            'performance_by_size': result.size_attribution,
+            'performance_commission': result.commission_attribution,
+            'performance_slippage': result.slippage_attribution,
+            'top_contributors': result.top_contributors,
+            'worst_contributors': result.worst_contributors,
+            'largest_gains': result.largest_gains,
+            'largest_losses': result.largest_losses
+        }
+        
+        for name, df in outputs.items():
+            if not df.empty:
+                filepath = output_dir / f"{name}.csv"
+                df.to_csv(filepath, index=False)
+                print(f"  Saved {name} to {filepath}")
+
+    def compute(
+        self,
+        trade_log_path: Path,
+        output_dir: Optional[Path] = None
+    ) -> AttributionResult:
+        """
+        Main computation method.
+        """
+        if output_dir is None:
+            output_dir = Path("data/feature_store/performance_attribution")
+        
+        # Load trade log
+        print(f"  Loading trade log from: {trade_log_path}")
+        df = self.load_trade_log(trade_log_path)
+        print(f"  Loaded {len(df)} trades")
+        
+        # Run attribution
+        result = self.compute_attribution(df)
+        
+        # Save outputs
+        print("\n  Saving outputs...")
+        self.save_outputs(result, output_dir)
+        
+        # Print summary
+        overall = result.overall_summary.iloc[0] if not result.overall_summary.empty else None
+        if overall is not None:
+            print(f"\n  Performance Summary:")
+            print(f"    Trades: {overall['trades']}")
+            print(f"    Net PnL: {overall['net_pnl']:.2f}")
+            print(f"    Profit Factor: {overall['profit_factor']:.3f}")
+            print(f"    Win Rate: {overall['win_rate']:.1%}")
+            print(f"    Sharpe: {overall['sharpe']:.3f}")
+            print(f"    Commission %: {overall['commission_pct']:.2f}%")
+            print(f"    Slippage %: {overall['slippage_pct']:.2f}%")
+        
+        return result

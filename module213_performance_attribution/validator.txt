@@ -1,0 +1,138 @@
+"""
+Module 213 - Performance Attribution Validator
+"""
+
+import pandas as pd
+import numpy as np
+from .engine import AttributionResult
+from .statistics import AttributionStatistics
+
+
+class AttributionValidator:
+    """Validator for performance attribution results."""
+    
+    def validate(
+        self,
+        result: AttributionResult,
+        statistics: AttributionStatistics,
+        output_dir: str
+    ) -> bool:
+        """Validate results and statistics."""
+        issues = []
+        warnings = []
+        
+        # Check overall summary
+        if result.overall_summary.empty:
+            issues.append("Overall summary is empty")
+        
+        # Check no missing trades
+        if not result.overall_summary.empty:
+            total_trades = result.overall_summary.iloc[0]['trades']
+            if total_trades == 0:
+                issues.append("No trades found")
+        
+        # Check attribution totals equal overall totals
+        if not result.direction_attribution.empty and not result.overall_summary.empty:
+            direction_df = result.direction_attribution
+            direction_df = direction_df[direction_df['direction'] != 'OVERALL']
+            
+            if not direction_df.empty:
+                total_direction_trades = direction_df['trades'].sum()
+                overall_trades = result.overall_summary.iloc[0]['trades']
+                
+                if total_direction_trades != overall_trades:
+                    warnings.append(
+                        f"Direction trades total ({total_direction_trades}) "
+                        f"does not match overall ({overall_trades})"
+                    )
+        
+        # Check no duplicated trade IDs
+        for attr_name in ['top_contributors', 'worst_contributors', 'largest_gains', 'largest_losses']:
+            df = getattr(result, attr_name)
+            if not df.empty and 'trade_id' in df.columns:
+                if df['trade_id'].duplicated().any():
+                    issues.append(f"Duplicated trade IDs found in {attr_name}")
+        
+        # Check percentages sum correctly
+        if not result.commission_attribution.empty:
+            comm_df = result.commission_attribution
+            comm_pct = comm_df[comm_df['metric'] == 'Commission %']['value']
+            slippage_pct = comm_df[comm_df['metric'] == 'Slippage %']['value']
+            
+            if not comm_pct.empty and not slippage_pct.empty:
+                total_pct = comm_pct.iloc[0] + slippage_pct.iloc[0]
+                # Check reasonable range
+                if total_pct > 10:
+                    warnings.append(f"High total cost: {total_pct:.2f}%")
+        
+        # Check no NaNs in critical DataFrames
+        for attr_name in ['overall_summary', 'direction_attribution', 'hour_attribution', 'day_attribution']:
+            df = getattr(result, attr_name)
+            if not df.empty:
+                if df.isna().any().any():
+                    issues.append(f"NaNs found in {attr_name}")
+        
+        # Check all exported files exist
+        required_files = [
+            'performance_summary.csv',
+            'performance_by_direction.csv',
+            'performance_by_session.csv',
+            'performance_by_hour.csv',
+            'performance_by_day.csv',
+            'performance_by_holding_time.csv',
+            'performance_commission.csv',
+            'performance_slippage.csv'
+        ]
+        
+        from pathlib import Path
+        output_path = Path(output_dir)
+        
+        for filename in required_files:
+            filepath = output_path / filename
+            if not filepath.exists():
+                warnings.append(f"File not found: {filename}")
+        
+        # Warnings (non-fatal)
+        if statistics.profit_factor < 1.0:
+            warnings.append(f"Profit factor below 1.0: {statistics.profit_factor:.3f}")
+        
+        if statistics.win_rate < 0.3:
+            warnings.append(f"Low win rate: {statistics.win_rate:.1%}")
+        
+        if statistics.commission_pct > 2.0:
+            warnings.append(f"High commission: {statistics.commission_pct:.2f}%")
+        
+        if statistics.slippage_pct > 2.0:
+            warnings.append(f"High slippage: {statistics.slippage_pct:.2f}%")
+        
+        if warnings:
+            print("\n  WARNINGS:")
+            for warning in warnings:
+                print(f"    ⚠ {warning}")
+        
+        if issues:
+            raise ValueError(
+                f"Performance Attribution failed with {len(issues)} issue(s):\n" +
+                "\n".join(f"  - {issue}" for issue in issues)
+            )
+        
+        return True
+
+
+def run_validation(result: AttributionResult, statistics: AttributionStatistics, output_dir: str) -> bool:
+    """Run validation with user-friendly output."""
+    validator = AttributionValidator()
+    
+    print("\n" + "=" * 60)
+    print("PERFORMANCE ATTRIBUTION VALIDATION")
+    print("=" * 60)
+    
+    try:
+        validator.validate(result, statistics, output_dir)
+        print("\n  ✓ All validation checks passed")
+        print("=" * 60)
+        return True
+    except ValueError as e:
+        print(e)
+        print("=" * 60)
+        return False
