@@ -30,7 +30,8 @@ class FeatureIntegrationStatisticsEngine:
         "module": 200,
         "name": "Feature Integration",
         "version": "1.0.0",
-        "description": "Validates and normalizes master feature matrix"
+        "description": "Validates and normalizes master feature matrix",
+        "depends_on": ["126"],
     }
     
     def analyze(self, result: FeatureIntegrationResult) -> FeatureIntegrationStatistics:
