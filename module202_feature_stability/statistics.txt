@@ -34,7 +34,8 @@ class FeatureStabilityStatisticsEngine:
         "module": 202,
         "name": "Feature Stability",
         "version": "1.0.0",
-        "description": "Determines which features remain statistically stable across time and regimes"
+        "description": "Determines which features remain statistically stable across time and regimes",
+        "depends_on": ["201"],
     }
     
     def analyze(self, result: FeatureStabilityResult) -> FeatureStabilityStatistics:
