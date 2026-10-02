@@ -34,7 +34,8 @@ class FeaturePredictivePowerStatisticsEngine:
         "module": 203,
         "name": "Feature Predictive Power",
         "version": "1.0.0",
-        "description": "Measures how much future market information each stable feature contains"
+        "description": "Measures how much future market information each stable feature contains",
+        "depends_on": ["202"],
     }
     
     def analyze(self, result: FeaturePredictivePowerResult) -> FeaturePredictivePowerStatistics:
