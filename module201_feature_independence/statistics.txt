@@ -29,7 +29,8 @@ class FeatureIndependenceStatisticsEngine:
         "module": 201,
         "name": "Feature Independence",
         "version": "1.0.0",
-        "description": "Computes feature independence and selects representatives"
+        "description": "Computes feature independence and selects representatives",
+        "depends_on": ["200"],
     }
     
     def analyze(self, result: FeatureIndependenceResult) -> FeatureIndependenceStatistics:
