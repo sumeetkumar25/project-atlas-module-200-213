@@ -970,3 +970,74 @@ class FeatureRedundancySynergyEngine:
         # Compute statistics
         stats = self.compute_statistics(
             features, kept, removed,
+            redundancy_table, synergy_df, clusters
+        )
+        
+        # Save outputs
+        print("  Saving outputs...")
+        self.save_outputs(
+            df, kept, removed,
+            redundancy_table, synergy_df,
+            conditional_df, clusters, stats,
+            output_dir
+        )
+        
+        # Build result
+        result = FeatureRedundancySynergyResult(
+            optimal_matrix=df[[self.timestamp_column] + kept],
+            redundancy_table=redundancy_table,
+            synergy_matrix=synergy_df,
+            conditional_info=conditional_df,
+            feature_clusters=clusters,
+            removed_features=removed,
+            kept_features=kept,
+            summary_statistics=stats
+        )
+        
+        print(f"\n  Feature Redundancy & Synergy Complete:")
+        print(f"    Features: {len(features)}")
+        print(f"    Kept: {len(kept)}")
+        print(f"    Removed: {len(removed)}")
+        print(f"    Clusters: {stats['unique_clusters']}")
+        
+        return result
+
+
+# ---------------------------------------------------------------------------
+# Module-level entry point
+# ---------------------------------------------------------------------------
+
+def run_module204(
+    matrix_path: Path,
+    output_dir: Optional[Path] = None,
+    **kwargs
+) -> FeatureRedundancySynergyResult:
+    """
+    Convenience function to run Module 204.
+    
+    Args:
+        matrix_path: Path to the predictive feature matrix (parquet or CSV)
+        output_dir: Directory for output artifacts (defaults to data/feature_store/optimal)
+        **kwargs: Additional arguments passed to FeatureRedundancySynergyEngine
+        
+    Returns:
+        FeatureRedundancySynergyResult
+    """
+    engine = FeatureRedundancySynergyEngine(**kwargs)
+    return engine.compute(matrix_path, output_dir)
+
+
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Module 204 - Feature Redundancy & Synergy Engine")
+    parser.add_argument("--matrix", type=str, required=True, help="Path to predictive feature matrix")
+    parser.add_argument("--output", type=str, default=None, help="Output directory")
+    args = parser.parse_args()
+    
+    result = run_module204(
+        matrix_path=Path(args.matrix),
+        output_dir=Path(args.output) if args.output else None
+    )
+    
+    print("\nDone.")
