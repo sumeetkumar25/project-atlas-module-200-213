@@ -97,12 +97,21 @@ class FeatureSelectionReport:
         return "\n".join(lines)
     
     @staticmethod
-    def generate_ranking_table(ranking: pd.DataFrame, top_n: int = 10) -> str:
+    def generate_ranking_table(feature_ranking, top_n=10):
         """Generate a ranking table report."""
         lines = []
         lines.append("\n" + "=" * 70)
         lines.append(f"TOP {top_n} FEATURES")
         lines.append("=" * 70)
+
+        # ------------------------------------------------------------
+        # Copy the caller's DataFrame so we can safely add or mutate
+        # columns without touching the original.
+        # ------------------------------------------------------------
+        ranking_df = feature_ranking.copy()
+
+        if ranking_df.empty:
+            return "No feature ranking available."
 
         # ------------------------------------------------------------
         # Defensive: ensure a 'predictive_score' column exists before
@@ -112,24 +121,29 @@ class FeatureSelectionReport:
         # ------------------------------------------------------------
         if "predictive_score" not in ranking_df.columns:
             if "final_score" in ranking_df.columns:
-                ranking_df = ranking_df.copy()
                 ranking_df["predictive_score"] = ranking_df["final_score"]
             elif "score" in ranking_df.columns:
-                ranking_df = ranking_df.copy()
                 ranking_df["predictive_score"] = ranking_df["score"]
             else:
                 raise ValueError(
-                    "Feature ranking is missing a usable predictive score column."
+                    "Feature ranking is missing predictive_score, "
+                    "final_score, and score."
                 )
 
-        top_features = ranking_df.head(top_n)
-        
+        # ------------------------------------------------------------
+        # Sort by the resolved predictive score and take the top N.
+        # ------------------------------------------------------------
+        ranking_df = ranking_df.sort_values(
+            "predictive_score",
+            ascending=False
+        ).head(top_n)
+
         lines.append(
             f"\n{'Rank':<8} {'Feature':<25} {'Score':<12} {'Predictive':<12} {'Stability':<12}"
         )
         lines.append("-" * 75)
-        
-        for _, row in top_features.iterrows():
+
+        for _, row in ranking_df.iterrows():
             lines.append(
                 f"{row['rank']:<8} "
                 f"{row['feature'][:24]:<25} "
@@ -137,7 +151,7 @@ class FeatureSelectionReport:
                 f"{row['predictive_score']:<12.3f} "
                 f"{row['stability_score']:<12.3f}"
             )
-        
+
         lines.append("\n" + "=" * 70)
         return "\n".join(lines)
     
