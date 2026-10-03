@@ -237,8 +237,28 @@ class FeatureSelectionEngine:
         """
         total = len(all_scores_df)
         scores = all_scores_df['final_score']
-        
-        # Find best and worst from all scores (not filtered)
+
+        # Handle valid zero-feature research outcome
+        if total == 0:
+            return {
+                'total_features': 0,
+                'selected_count': len(selected),
+                'rejected_count': len(rejected),
+                'selected_percentage': 0.0,
+                'rejected_percentage': 0.0,
+                'average_score': 0.0,
+                'median_score': 0.0,
+                'min_score': 0.0,
+                'max_score': 0.0,
+                'best_feature': None,
+                'worst_feature': None,
+                'best_score': 0.0,
+                'worst_score': 0.0,
+                'selection_threshold': self.predictive_threshold,
+                'stability_threshold': self.stability_threshold
+            }
+
+        # Find best and worst from all scores
         best_idx = scores.idxmax()
         worst_idx = scores.idxmin()
         
