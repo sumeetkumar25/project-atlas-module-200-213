@@ -689,6 +689,81 @@ class FeatureRedundancySynergyEngine:
         stats_df.to_csv(stats_path, index=False)
         print(f"  Saved statistics to {stats_path}")
 
+    def _select_fallback_representative(
+        self,
+        features: List[str],
+        redundancy_table: pd.DataFrame
+    ) -> str:
+        """
+        Deterministically choose a representative feature when no
+        feature survives the redundancy thresholds.
+
+        The representative must be the feature with the strongest
+        usable signal — not merely the lowest-redundancy feature.
+
+        The redundancy_table contains one row per unordered feature
+        pair, with these signal-bearing columns:
+            - conditional_mi
+            - incremental_gain
+            - permutation_importance
+            - tree_importance
+            - synergy
+
+        For each candidate feature, compute the mean of these
+        signal columns across every pair it participates in.
+        The feature with the highest mean signal wins.
+
+        Ties are broken lexicographically by feature name so the
+        result is fully deterministic and reproducible across runs.
+        """
+
+        signal_columns = [
+            "conditional_mi",
+            "incremental_gain",
+            "permutation_importance",
+            "tree_importance",
+            "synergy",
+        ]
+
+        # Filter to the signal columns that actually exist
+        available_signals = [
+            col for col in signal_columns
+            if col in redundancy_table.columns
+        ]
+
+        if not available_signals:
+            # No signal columns available — fall back to the first
+            # feature in the input list so the pipeline can proceed.
+            return features[0]
+
+        # Compute per-feature mean signal across all pairs involving
+        # that feature.
+        feature_signal: Dict[str, float] = {}
+
+        for feature in features:
+            rows = redundancy_table[
+                (redundancy_table["feature_a"] == feature) |
+                (redundancy_table["feature_b"] == feature)
+            ]
+
+            if rows.empty:
+                feature_signal[feature] = 0.0
+                continue
+
+            mean_signal = float(
+                rows[available_signals].mean().mean()
+            )
+            feature_signal[feature] = mean_signal
+
+        # Deterministic selection: highest mean signal first,
+        # lexicographically smallest name as tiebreaker.
+        representative = max(
+            sorted(features),                      # sort for tie stability
+            key=lambda f: (feature_signal[f], f)   # (signal, name) tuple
+        )
+
+        return representative
+
     def compute(self, matrix_path: Path, output_dir: Optional[Path] = None) -> FeatureRedundancySynergyResult:
         """Main computation method."""
         print("\n  Computing Feature Redundancy & Synergy...")
@@ -841,17 +916,22 @@ class FeatureRedundancySynergyEngine:
         # feature. Otherwise Module 205 cannot produce a usable
         # feature set for Module 206.
         #
-        # If the composite decision eliminated every feature, promote
-        # the single highest-scoring feature to KEEP and demote the
-        # rest to REMOVE. This guarantees a non-empty kept_features
-        # list without inventing new evidence — the representative
-        # chosen is always the feature with the strongest score
-        # among those that already entered the redundancy analysis.
+        # The representative is chosen deterministically based on the
+        # feature with the strongest mean signal across all pairs it
+        # participates in — NOT merely the highest redundancy score.
+        #
+        # Specifically, for each candidate feature we compute the
+        # mean of the signal-bearing columns (conditional_mi,
+        # incremental_gain, permutation_importance, tree_importance,
+        # synergy) across every pair it appears in. The feature with
+        # the highest mean signal wins. Ties are broken
+        # lexicographically by feature name so the result is fully
+        # reproducible across runs.
         # ------------------------------------------------------------
         if not kept and feature_scores:
-            representative = max(
-                feature_scores,
-                key=feature_scores.get
+            representative = self._select_fallback_representative(
+                features=features,
+                redundancy_table=redundancy_table,
             )
 
             kept = [representative]
@@ -889,31 +969,4 @@ class FeatureRedundancySynergyEngine:
         
         # Compute statistics
         stats = self.compute_statistics(
-            features, kept, removed, redundancy_table, synergy_df, clusters
-        )
-        
-        # Save outputs
-        print("\n  Saving outputs...")
-        self.save_outputs(
-            df, kept, removed, redundancy_table, synergy_df,
-            conditional_df, clusters, stats, output_dir
-        )
-        
-        print(f"\n  Redundancy & Synergy Summary:")
-        print(f"    Total Features: {stats['total_features']}")
-        print(f"    Kept: {stats['kept_features']}")
-        print(f"    Removed: {stats['removed_features']}")
-        print(f"    Clusters: {stats['unique_clusters']}")
-        print(f"    Avg Conditional MI: {stats['avg_conditional_mi']:.3f}")
-        print(f"    Avg Synergy: {stats['avg_synergy']:.3f}")
-        
-        return FeatureRedundancySynergyResult(
-            optimal_matrix=df[[self.timestamp_column] + kept],
-            redundancy_table=redundancy_table,
-            synergy_matrix=synergy_df,
-            conditional_info=conditional_df,
-            feature_clusters=clusters,
-            removed_features=removed,
-            kept_features=kept,
-            summary_statistics=stats
-        )
+            features, kept, removed,
