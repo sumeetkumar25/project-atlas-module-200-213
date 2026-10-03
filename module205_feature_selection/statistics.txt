@@ -35,7 +35,8 @@ class FeatureSelectionStatisticsEngine:
         "module": 205,
         "name": "Feature Selection & Ranking",
         "version": "1.0.0",
-        "description": "Produces the final feature set for all future models"
+        "description": "Produces the final feature set for all future models",
+        "depends_on": ["202", "203", "204"],
     }
     
     def analyze(self, result: FeatureSelectionResult) -> FeatureSelectionStatistics:
