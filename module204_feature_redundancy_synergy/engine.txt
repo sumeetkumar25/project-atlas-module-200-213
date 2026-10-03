@@ -835,6 +835,35 @@ class FeatureRedundancySynergyEngine:
                 kept.append(feature)
             else:
                 removed.append(feature)
+
+        # ------------------------------------------------------------
+        # A redundancy group must retain at least one representative
+        # feature. Otherwise Module 205 cannot produce a usable
+        # feature set for Module 206.
+        #
+        # If the composite decision eliminated every feature, promote
+        # the single highest-scoring feature to KEEP and demote the
+        # rest to REMOVE. This guarantees a non-empty kept_features
+        # list without inventing new evidence — the representative
+        # chosen is always the feature with the strongest score
+        # among those that already entered the redundancy analysis.
+        # ------------------------------------------------------------
+        if not kept and feature_scores:
+            representative = max(
+                feature_scores,
+                key=feature_scores.get
+            )
+
+            kept = [representative]
+            removed = [
+                feature for feature in features
+                if feature != representative
+            ]
+
+            print(
+                f"  No feature passed redundancy thresholds. "
+                f"Keeping representative feature: {representative}"
+            )
         
         # Cluster features
         print("  Clustering features...")
