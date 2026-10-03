@@ -103,8 +103,26 @@ class FeatureSelectionReport:
         lines.append("\n" + "=" * 70)
         lines.append(f"TOP {top_n} FEATURES")
         lines.append("=" * 70)
-        
-        top_features = ranking.head(top_n)
+
+        # ------------------------------------------------------------
+        # Defensive: ensure a 'predictive_score' column exists before
+        # rendering. Fall back to 'final_score' or 'score' if needed,
+        # so the ranking table renders correctly even if the ranking
+        # DataFrame was produced by an older engine or a custom pipeline.
+        # ------------------------------------------------------------
+        if "predictive_score" not in ranking_df.columns:
+            if "final_score" in ranking_df.columns:
+                ranking_df = ranking_df.copy()
+                ranking_df["predictive_score"] = ranking_df["final_score"]
+            elif "score" in ranking_df.columns:
+                ranking_df = ranking_df.copy()
+                ranking_df["predictive_score"] = ranking_df["score"]
+            else:
+                raise ValueError(
+                    "Feature ranking is missing a usable predictive score column."
+                )
+
+        top_features = ranking_df.head(top_n)
         
         lines.append(
             f"\n{'Rank':<8} {'Feature':<25} {'Score':<12} {'Predictive':<12} {'Stability':<12}"
