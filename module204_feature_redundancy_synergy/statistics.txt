@@ -34,7 +34,8 @@ class FeatureRedundancySynergyStatisticsEngine:
         "module": 204,
         "name": "Feature Redundancy & Synergy",
         "version": "1.0.0",
-        "description": "Evaluates feature groups for redundancy and synergy"
+        "description": "Evaluates feature groups for redundancy and synergy",
+        "depends_on": ["203"],
     }
     
     def analyze(self, result: FeatureRedundancySynergyResult) -> FeatureRedundancySynergyStatistics:
