@@ -4,7 +4,7 @@ Module 205 - Feature Selection & Ranking Engine
 Produces the final feature set that every future model in Project Atlas will use.
 
 Inputs:
-  - Module201: predictive_feature_matrix.parquet
+  - Module203: predictive_feature_matrix.parquet
   - Module202: feature_stability.csv
   - Module203: interaction_statistics.csv
   - Module204: feature_redundancy.csv, feature_clusters.csv, removed_features.csv
@@ -117,9 +117,7 @@ class FeatureSelectionEngine:
         return df.iloc[:, 0].tolist()
 
     def get_feature_columns(self, df: pd.DataFrame) -> List[str]:
-        """
-        Get feature columns (exclude timestamp and OHLCV).
-        """
+        """Get feature columns (exclude timestamp and OHLCV)."""
         ignore_cols = {
             "timestamp", "date", "time", "index",
             "close", "open", "high", "low", "volume"
@@ -346,8 +344,14 @@ class FeatureSelectionEngine:
         predictive_df = self.load_predictive_matrix(predictive_matrix_path)
 
         # ------------------------------------------------------------
-        # Fail clearly when the predictive matrix contains no features.
+        # Fail clearly when Module 203 produced no usable features.
+        #
+        # An empty feature set here means Module 203 wrote a matrix
+        # containing only timestamp/OHLCV columns. Module 205 has
+        # nothing to select from, so it must abort with a message
+        # that pinpoints the upstream problem.
         # ------------------------------------------------------------
+
         features = self.get_feature_columns(predictive_df)
 
         if not features:
