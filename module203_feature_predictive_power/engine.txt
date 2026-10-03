@@ -207,37 +207,62 @@ class FeaturePredictivePowerEngine:
         future_returns: np.ndarray
     ) -> float:
         """
-        Compute predictive stability using rolling IC.
+        Measure stability of predictive relationship.
+
+        A feature is considered stable only when:
+        1. Its rolling IC has reasonable magnitude.
+        2. The IC does not fluctuate excessively.
+        3. The relationship is not merely stable around zero.
         """
         clean_mask = ~(np.isnan(feature) | np.isnan(future_returns))
+
         feature_clean = feature[clean_mask]
         returns_clean = future_returns[clean_mask]
-        
+
         if len(feature_clean) < self.rolling_window * 2:
             return 0.0
-        
+
         ics = []
+
         n_windows = len(feature_clean) // self.rolling_window
-        
+
         for i in range(n_windows - 1):
             start = i * self.rolling_window
             end = start + self.rolling_window
+
             window_feature = feature_clean.iloc[start:end]
             window_returns = returns_clean[start:end]
-            
+
             try:
                 ic, _ = pearsonr(window_feature, window_returns)
-                ics.append(ic)
-            except:
+
+                if np.isfinite(ic):
+                    ics.append(float(ic))
+
+            except Exception:
                 continue
-        
+
         if len(ics) < 2:
             return 0.0
-        
-        # Stability = 1 - std(IC) (normalized)
-        ic_std = np.std(ics)
-        stability = max(0.0, 1.0 - min(1.0, ic_std * 5))
-        return float(stability)
+
+        ics = np.asarray(ics)
+
+        mean_abs_ic = float(np.mean(np.abs(ics)))
+        ic_std = float(np.std(ics))
+
+        # Predictive magnitude component.
+        magnitude_score = min(1.0, mean_abs_ic / self.ic_threshold)
+
+        # Stability component.
+        stability_score = max(
+            0.0,
+            1.0 - min(1.0, ic_std * 5.0)
+        )
+
+        # Require both predictive magnitude and stability.
+        stability = magnitude_score * stability_score
+
+        return float(np.clip(stability, 0.0, 1.0))
 
     def compute_horizon_consistency(
         self,
@@ -246,22 +271,48 @@ class FeaturePredictivePowerEngine:
         horizons: List[int]
     ) -> float:
         """
-        Compute horizon consistency across different forecast horizons.
+        Measure whether a feature maintains a meaningful predictive
+        relationship across forecast horizons.
         """
+
         ics = []
-        
+
         for horizon in horizons:
             future_returns = self.compute_future_returns(df, horizon)
-            ic_result = self.compute_information_coefficient(feature, future_returns)
-            ics.append(ic_result['ic'])
-        
+
+            ic_result = self.compute_information_coefficient(
+                feature,
+                future_returns
+            )
+
+            ic = ic_result["ic"]
+
+            if np.isfinite(ic):
+                ics.append(float(ic))
+
         if len(ics) < 2:
             return 0.0
-        
-        # Consistency = 1 - std(IC across horizons)
-        ic_std = np.std(ics)
-        consistency = max(0.0, 1.0 - min(1.0, ic_std * 5))
-        return float(consistency)
+
+        ics = np.asarray(ics)
+
+        mean_abs_ic = float(np.mean(np.abs(ics)))
+        ic_std = float(np.std(ics))
+
+        # First require meaningful predictive magnitude.
+        magnitude_score = min(
+            1.0,
+            mean_abs_ic / self.ic_threshold
+        )
+
+        # Then measure consistency.
+        consistency_score = max(
+            0.0,
+            1.0 - min(1.0, ic_std * 5.0)
+        )
+
+        consistency = magnitude_score * consistency_score
+
+        return float(np.clip(consistency, 0.0, 1.0))
 
     def compute_direction_accuracy(
         self,
@@ -269,21 +320,68 @@ class FeaturePredictivePowerEngine:
         future_returns: np.ndarray
     ) -> float:
         """
-        Compute direction accuracy (feature predicts up/down).
+        Measure directional predictive accuracy using the sign of
+        the feature's relationship to future returns.
+
+        The direction is inferred from the Pearson relationship,
+        so inverse predictors are handled correctly.
         """
+
         clean_mask = ~(np.isnan(feature) | np.isnan(future_returns))
+
         x = feature[clean_mask].values
         y = future_returns[clean_mask]
-        
+
         if len(x) < 10:
             return 0.5
-        
-        # Sign of feature vs sign of return
-        feature_sign = np.sign(x)
-        return_sign = np.sign(y)
-        
-        correct = np.sum(feature_sign == return_sign)
-        return float(correct / len(x))
+
+        try:
+            ic, _ = pearsonr(x, y)
+
+            if not np.isfinite(ic) or abs(ic) < 1e-12:
+                return 0.5
+
+            predicted_direction = np.sign(x) * np.sign(ic)
+            actual_direction = np.sign(y)
+
+            valid = actual_direction != 0
+
+            if not np.any(valid):
+                return 0.5
+
+            accuracy = np.mean(
+                predicted_direction[valid] == actual_direction[valid]
+            )
+
+            return float(accuracy)
+
+        except Exception:
+            return 0.5
+
+    def combine_pvalues_fisher(self, p_values: List[float]) -> float:
+        """
+        Combine independent/approximately independent p-values
+        using Fisher's method.
+        """
+
+        clean = np.asarray(
+            [p for p in p_values if np.isfinite(p)],
+            dtype=float
+        )
+
+        if len(clean) == 0:
+            return 1.0
+
+        clean = np.clip(clean, 1e-300, 1.0)
+
+        statistic = -2.0 * np.sum(np.log(clean))
+
+        return float(
+            1.0 - stats.chi2.cdf(
+                statistic,
+                2 * len(clean)
+            )
+        )
 
     def normalize_metric(self, value: float, threshold: float, is_abs: bool = True) -> float:
         """
@@ -332,11 +430,11 @@ class FeaturePredictivePowerEngine:
         
         # Weighted combination
         weights = {
-            'ic': 0.30,
-            'rank_ic': 0.15,
-            'mutual_information': 0.20,
+            'ic': 0.20,
+            'rank_ic': 0.10,
+            'mutual_information': 0.30,
             'predictive_stability': 0.15,
-            'horizon_consistency': 0.10,
+            'horizon_consistency': 0.15,
             'direction_accuracy': 0.05,
             'significance': 0.05
         }
@@ -373,7 +471,7 @@ class FeaturePredictivePowerEngine:
         Args:
             p_values: Array of p-values from hypothesis tests (one per feature)
             alpha: FDR significance level
-            
+        
         Returns:
             Boolean array indicating significant features
         """
@@ -485,8 +583,6 @@ class FeaturePredictivePowerEngine:
         
         # Compute metrics for each feature
         rows = []
-        kept = []
-        removed = []
         
         for feature in features:
             series = df[feature]
@@ -531,11 +627,16 @@ class FeaturePredictivePowerEngine:
             # Horizon consistency
             horizon_consistency = self.compute_horizon_consistency(series, df, self.horizons)
             
-            # Average p-value
-            avg_p_value = np.mean(p_values)
+            # ------------------------------------------------------------
+            # Combine p-values across horizons using Fisher's method.
+            # ------------------------------------------------------------
+            combined_p_value = self.combine_pvalues_fisher(p_values)
             
             # Significance score (higher = more significant)
-            significance = 1.0 - min(1.0, avg_p_value * 10)
+            significance = 1.0 - min(
+                1.0,
+                combined_p_value * 10
+            )
             
             # Compile metrics
             metrics = {
@@ -552,11 +653,6 @@ class FeaturePredictivePowerEngine:
             predictive_score = self.compute_composite_score(metrics)
             decision = self.make_decision(predictive_score)
             
-            if decision in ["KEEP", "WARNING"]:
-                kept.append(feature)
-            else:
-                removed.append(feature)
-            
             rows.append({
                 'feature': feature,
                 'ic': avg_ic,
@@ -568,18 +664,44 @@ class FeaturePredictivePowerEngine:
                 'significance': significance,
                 'predictive_score': predictive_score,
                 'decision': decision,
-                'avg_p_value': avg_p_value
+                'avg_p_value': combined_p_value
             })
         
         # Create DataFrames
         feature_scores = pd.DataFrame(rows)
         feature_scores = feature_scores.sort_values('predictive_score', ascending=False).reset_index(drop=True)
         
-        # Apply FDR correction to average p-values (one per feature)
+        # ------------------------------------------------------------
+        # Apply Benjamini-Hochberg FDR correction.
+        # ------------------------------------------------------------
         feature_scores["fdr_significant"] = self.apply_fdr_correction(
             feature_scores["avg_p_value"].to_numpy(),
             self.fdr_alpha
         )
+        
+        # ------------------------------------------------------------
+        # FDR is a statistical gate, not just an informational column.
+        # ------------------------------------------------------------
+        feature_scores.loc[
+            ~feature_scores["fdr_significant"],
+            "decision"
+        ] = "REMOVE"
+        
+        # Keep the predictive score unchanged.
+        # Only statistically supported features may remain KEEP/WARNING.
+        
+        # ------------------------------------------------------------
+        # Rebuild the final lists after FDR correction.
+        # ------------------------------------------------------------
+        kept = feature_scores.loc[
+            feature_scores["decision"].isin(["KEEP", "WARNING"]),
+            "feature"
+        ].tolist()
+        
+        removed = feature_scores.loc[
+            feature_scores["decision"] == "REMOVE",
+            "feature"
+        ].tolist()
         
         # Create rankings
         feature_rankings = feature_scores[['feature', 'predictive_score']].copy()
@@ -600,7 +722,8 @@ class FeaturePredictivePowerEngine:
                     "direction_accuracy",
                     "significance",
                     "predictive_score",
-                    "decision"
+                    "decision",
+                    "fdr_significant"
                 ]
             ].to_string(index=False)
         )
