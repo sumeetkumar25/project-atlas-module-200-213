@@ -704,9 +704,18 @@ class FeatureRedundancySynergyEngine:
         # Get features
         features = self.get_feature_columns(df)
         print(f"  Found {len(features)} features")
-        
+
+        # ------------------------------------------------------------
+        # Module 204 requires at least two features for pairwise
+        # redundancy / synergy analysis. Fail with a message that
+        # names the module, the requirement, and the actual column
+        # list so the operator can pinpoint the upstream problem.
+        # ------------------------------------------------------------
         if len(features) < 2:
-            raise ValueError("Need at least 2 features for redundancy analysis")
+            raise ValueError(
+                f"Module 204 requires at least 2 feature columns, "
+                f"but received {len(features)}: {features}"
+            )
         
         # Compute target
         target = self.compute_target(df)
