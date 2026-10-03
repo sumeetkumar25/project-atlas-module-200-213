@@ -589,8 +589,18 @@ class FeaturePredictivePowerEngine:
         """Save all outputs."""
         output_dir.mkdir(parents=True, exist_ok=True)
         
-        # Predictive matrix
-        predictive_df = df[[self.timestamp_column] + kept_features]
+        # ------------------------------------------------------------
+        # Module 203 ranks features; Module 205 performs final
+        # selection.
+        #
+        # Write ALL ranked features to the predictive matrix (not
+        # only the KEEP/WARNING survivors). This guarantees the
+        # matrix always contains feature columns, even when FDR
+        # removes every feature.
+        # ------------------------------------------------------------
+        ranked_features = feature_scores["feature"].tolist()
+
+        predictive_df = df[[self.timestamp_column] + ranked_features]
         matrix_path = output_dir / "predictive_feature_matrix.parquet"
         predictive_df.to_parquet(matrix_path, index=False)
         print(f"  Saved predictive matrix to {matrix_path}")
@@ -799,8 +809,18 @@ class FeaturePredictivePowerEngine:
         print(f"    Average IC: {stats['average_ic']:.3f}")
         print(f"    Average Rank IC: {stats['average_rank_ic']:.3f}")
         
+        # ------------------------------------------------------------
+        # Module 203 ranks features; Module 205 performs final
+        # selection.
+        #
+        # The returned predictive_matrix contains ALL ranked features
+        # so that Module 205 has a non-empty matrix to select from,
+        # even when FDR removes every feature from kept/removed.
+        # ------------------------------------------------------------
+        ranked_features = feature_scores["feature"].tolist()
+
         return FeaturePredictivePowerResult(
-            predictive_matrix=df[[self.timestamp_column] + kept],
+            predictive_matrix=df[[self.timestamp_column] + ranked_features],
             feature_scores=feature_scores,
             feature_rankings=feature_rankings,
             removed_features=removed,
