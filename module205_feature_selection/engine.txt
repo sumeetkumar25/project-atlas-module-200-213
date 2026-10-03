@@ -226,11 +226,45 @@ class FeatureSelectionEngine:
 
     def rank_features(self, scores_df: pd.DataFrame) -> pd.DataFrame:
         """
-        Rank features by final score.
+        Rank features by predictive score.
+
+        IMPORTANT:
+        - The ranking MUST include every scored feature, not only the
+          selected subset. A feature that was rejected by the hard
+          filters is still part of the audit trail, and its predictive
+          score is still meaningful for downstream reporting.
+        - The ranking MUST contain a 'predictive_score' column. The
+          score column is resolved with a fallback chain so that the
+          ranking is robust to schema drift in the upstream scores
+          DataFrame:
+              predictive_score → final_score → score
+          If none of these exist, the method raises KeyError.
         """
-        ranking = scores_df.sort_values('final_score', ascending=False).reset_index(drop=True)
-        ranking['rank'] = range(1, len(ranking) + 1)
-        return ranking
+
+        feature_ranking = scores_df.copy()
+
+        if "predictive_score" not in feature_ranking.columns:
+            if "final_score" in feature_ranking.columns:
+                feature_ranking["predictive_score"] = feature_ranking["final_score"]
+            elif "score" in feature_ranking.columns:
+                feature_ranking["predictive_score"] = feature_ranking["score"]
+            else:
+                raise KeyError(
+                    "Module 205 cannot create ranking: "
+                    "no predictive_score, final_score, or score column exists"
+                )
+
+        feature_ranking["rank"] = (
+            feature_ranking["predictive_score"]
+            .rank(method="first", ascending=False)
+            .astype(int)
+        )
+
+        feature_ranking = feature_ranking.sort_values(
+            "rank"
+        ).reset_index(drop=True)
+
+        return feature_ranking
 
     def compute_statistics(
         self,
@@ -376,16 +410,13 @@ class FeatureSelectionEngine:
         print(f"  Found {len(removed_features)} previously removed features")
         
         # ------------------------------------------------------------
-        # FIX: Module 201 Predictive Scores - use actual scores
+        # Predictive scores: use actual Module 203 scores when available.
         # ------------------------------------------------------------
         
-        # Option 1: From Module 203's interaction_df (contains predictive scores)
         if 'predictive_score' in interaction_df.columns:
             predictive_dict = dict(zip(interaction_df['feature'], interaction_df['predictive_score']))
             print(f"  Using predictive scores from Module 203")
         else:
-            # Option 2: Fallback - use normalized scores from predictive matrix
-            # This could be extracted from Module 201 output
             predictive_dict = {f: 0.5 for f in features}
             print(f"  Warning: No predictive scores found, using defaults")
         
@@ -454,9 +485,16 @@ class FeatureSelectionEngine:
         print(f"    Selected: {len(selected)} features")
         print(f"    Rejected: {len(rejected)} features")
         
-        # Rank features (using filtered_df which only contains selected features)
+        # ------------------------------------------------------------
+        # Rank ALL scored features — not just the selected subset.
+        #
+        # The ranking is an audit artifact and must include every
+        # feature that received a final_score, including rejected
+        # ones. Filtering the ranking to only `selected` would
+        # discard the score evidence for rejected features.
+        # ------------------------------------------------------------
         print("  Ranking features...")
-        ranking_df = self.rank_features(filtered_df)
+        ranking_df = self.rank_features(scores_df)
         
         # Compute statistics (using scores_df which contains ALL features)
         stats = self.compute_statistics(scores_df, selected, rejected)
