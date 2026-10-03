@@ -65,6 +65,20 @@ class FeatureSelectionValidator:
         if overlap:
             issues.append(f"Features appear in both selected and rejected: {overlap}")
         
+        # ------------------------------------------------------------
+        # Empty-selection guard.
+        #
+        # A Module 205 result with zero selected features cannot be
+        # forwarded to Module 206 — the downstream model requires at
+        # least one feature column to train or evaluate on. An empty
+        # selection must therefore fail validation, not be silently
+        # accepted as a valid research conclusion.
+        # ------------------------------------------------------------
+        if len(result.selected_features) == 0:
+            issues.append(
+                "No features selected; Module 206 requires at least one feature."
+            )
+        
         # Check selected features exist in scores
         for feature in result.selected_features:
             if feature not in result.feature_scores['feature'].values:
