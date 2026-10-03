@@ -408,48 +408,103 @@ class FeaturePredictivePowerEngine:
 
     def compute_composite_score(self, metrics: Dict[str, float]) -> float:
         """
-        Compute composite predictive score with normalized metrics.
-        
-        Each metric is normalized to [0, 1] based on thresholds:
-        - IC >= 0.10 -> 1.0 (strong predictive power)
-        - Rank IC >= 0.10 -> 1.0
-        - MI >= 0.10 -> 1.0
-        - Stability >= 0.70 -> 1.0
-        - Consistency >= 0.70 -> 1.0
-        - Direction Accuracy >= 0.60 -> 1.0
-        - Significance >= 0.80 -> 1.0
+        Compute composite predictive score.
+
+        The score combines:
+          - Linear predictive evidence:
+              IC
+              Rank IC
+          - Nonlinear predictive evidence:
+              Mutual Information
+          - Temporal robustness:
+              Predictive Stability
+              Horizon Consistency
+          - Directional evidence:
+              Direction Accuracy
+          - Statistical evidence:
+              Significance
+
+        The weighting gives nonlinear information a meaningful role without
+        allowing MI alone to dominate the final score.
         """
-        # Normalize each metric to [0, 1]
-        ic_score = self.normalize_metric(metrics.get('ic', 0), self.ic_threshold, is_abs=True)
-        rank_ic_score = self.normalize_metric(metrics.get('rank_ic', 0), self.ic_threshold, is_abs=True)
-        mi_score = self.normalize_metric(metrics.get('mutual_information', 0), self.mi_threshold, is_abs=False)
-        stability_score = self.normalize_metric(metrics.get('predictive_stability', 0), self.stability_threshold, is_abs=False)
-        consistency_score = self.normalize_metric(metrics.get('horizon_consistency', 0), self.consistency_threshold, is_abs=False)
-        direction_score = self.normalize_metric(metrics.get('direction_accuracy', 0), self.direction_threshold, is_abs=False)
-        significance_score = self.normalize_metric(metrics.get('significance', 0), self.significance_threshold, is_abs=False)
-        
-        # Weighted combination
-        weights = {
-            'ic': 0.20,
-            'rank_ic': 0.10,
-            'mutual_information': 0.30,
-            'predictive_stability': 0.15,
-            'horizon_consistency': 0.15,
-            'direction_accuracy': 0.05,
-            'significance': 0.05
-        }
-        
-        score = (
-            weights['ic'] * ic_score +
-            weights['rank_ic'] * rank_ic_score +
-            weights['mutual_information'] * mi_score +
-            weights['predictive_stability'] * stability_score +
-            weights['horizon_consistency'] * consistency_score +
-            weights['direction_accuracy'] * direction_score +
-            weights['significance'] * significance_score
+
+        # ---------------------------------------------------------
+        # Normalize individual metrics to [0, 1]
+        # ---------------------------------------------------------
+
+        ic_score = self.normalize_metric(
+            metrics.get("ic", 0),
+            self.ic_threshold,
+            is_abs=True
         )
-        
-        return np.clip(score, 0.0, 1.0)
+
+        rank_ic_score = self.normalize_metric(
+            metrics.get("rank_ic", 0),
+            self.ic_threshold,
+            is_abs=True
+        )
+
+        mi_score = self.normalize_metric(
+            metrics.get("mutual_information", 0),
+            self.mi_threshold,
+            is_abs=False
+        )
+
+        stability_score = self.normalize_metric(
+            metrics.get("predictive_stability", 0),
+            self.stability_threshold,
+            is_abs=False
+        )
+
+        consistency_score = self.normalize_metric(
+            metrics.get("horizon_consistency", 0),
+            self.consistency_threshold,
+            is_abs=False
+        )
+
+        direction_score = self.normalize_metric(
+            metrics.get("direction_accuracy", 0),
+            self.direction_threshold,
+            is_abs=False
+        )
+
+        significance_score = self.normalize_metric(
+            metrics.get("significance", 0),
+            self.significance_threshold,
+            is_abs=False
+        )
+
+        # ---------------------------------------------------------
+        # Weighted evidence model
+        #
+        # Linear evidence       = 30%
+        # Nonlinear evidence    = 30%
+        # Temporal robustness  = 25%
+        # Direction             = 5%
+        # Significance          = 10%
+        # ---------------------------------------------------------
+
+        linear_score = (
+            0.65 * ic_score +
+            0.35 * rank_ic_score
+        )
+
+        nonlinear_score = mi_score
+
+        temporal_score = (
+            0.60 * stability_score +
+            0.40 * consistency_score
+        )
+
+        score = (
+            0.30 * linear_score +
+            0.30 * nonlinear_score +
+            0.25 * temporal_score +
+            0.05 * direction_score +
+            0.10 * significance_score
+        )
+
+        return float(np.clip(score, 0.0, 1.0))
 
     def make_decision(self, score: float) -> str:
         """Make KEEP/WARNING/REMOVE decision."""
