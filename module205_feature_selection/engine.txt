@@ -220,47 +220,26 @@ class FeatureSelectionEngine:
         normalized ones. This ensures the thresholds represent
         absolute quality floors rather than batch-relative ranks.
 
-        Module 204's 'removed_features' list is honoured as an
-        additional rejection criterion, BUT only when Module 204
-        retained more than one feature. When Module 204 had to fall
-        back to keeping a single representative — because every
-        candidate failed its redundancy thresholds — that
-        representative is protected here: Module 205 must not
-        override Module 204's decision to retain it.
+        Module 204's 'removed_features' list is treated as ADVISORY,
+        not authoritative. A feature that Module 204 flagged for
+        redundancy removal is still retained when it independently
+        passes both the predictive and stability thresholds. This
+        prevents Module 204's redundancy view from silently
+        discarding features that are demonstrably useful on their
+        own merits.
 
         Args:
             scores_df: Feature scores DataFrame
             removed_features: Features flagged for removal by Module 204
             all_features: All candidate features from Module 203
             module204_removed_features: Optional explicit list of
-                features removed by Module 204. When provided, used
-                to determine whether Module 204's removal list is
-                authoritative (many removed → trust it) or a fallback
-                (only the representative survives → do not override).
+                features removed by Module 204. Currently unused for
+                trust decisions, but retained for API compatibility
+                and future diagnostic reporting.
         """
         # Start with all features
         selected = all_features.copy()
         rejected = []
-
-        # ------------------------------------------------------------
-        # Determine whether Module 204's removed_features list is
-        # authoritative. The list is authoritative when it removes
-        # more than len(all_features) - 1 features — i.e., when
-        # Module 204's kept set contains at least 2 features. When
-        # Module 204 kept exactly 1 feature, its removed list is a
-        # forced fallback and must not be trusted blindly.
-        # ------------------------------------------------------------
-        trust_removed_list = True
-
-        if module204_removed_features is not None:
-            num_removed = len(module204_removed_features)
-            num_total = len(all_features)
-
-            if num_total > 0 and num_removed >= num_total - 1:
-                # Module 204 kept at most 1 feature. Its removal list
-                # is a fallback and must not override the retained
-                # representative.
-                trust_removed_list = False
 
         # Check each feature
         for feature in all_features:
@@ -294,9 +273,23 @@ class FeatureSelectionEngine:
                 selected.remove(feature)
                 continue
 
-            # Remove if Module 204 flagged it — but only when the
-            # removal list is authoritative.
-            if trust_removed_list and feature in removed_features:
+            # --------------------------------------------------------
+            # Module 204 redundancy removal is advisory.
+            #
+            # Do not reject a feature that independently passes
+            # predictive and stability requirements. Module 204's
+            # view of redundancy is pairwise and context-dependent;
+            # a feature can be highly correlated with a sibling yet
+            # still carry unique predictive signal that the
+            # composite score undervalues.
+            # --------------------------------------------------------
+            if feature in removed_features:
+                # Module 204 redundancy removal is advisory.
+                # Do not reject a feature that independently passes
+                # predictive and stability requirements.
+                if predictive >= self.predictive_threshold and stability >= self.stability_threshold:
+                    continue
+
                 rejected.append(feature)
                 selected.remove(feature)
                 continue
@@ -603,3 +596,75 @@ class FeatureSelectionEngine:
             feature_ranking=ranking_df,
             summary_statistics=stats
         )
+
+
+# ---------------------------------------------------------------------------
+# Module-level entry point
+# ---------------------------------------------------------------------------
+
+def run_module205(
+    predictive_matrix_path: Path,
+    stability_file: Path,
+    interaction_file: Path,
+    redundancy_file: Path,
+    removed_file: Path,
+    output_dir: Optional[Path] = None,
+    **kwargs
+) -> FeatureSelectionResult:
+    """
+    Convenience function to run Module 205.
+    
+    Args:
+        predictive_matrix_path: Path to predictive feature matrix (Module 203)
+        stability_file: Path to feature_stability.csv (Module 202)
+        interaction_file: Path to interaction_statistics.csv (Module 203)
+        redundancy_file: Path to feature_redundancy.csv (Module 204)
+        removed_file: Path to removed_redundant_features.csv (Module 204)
+        output_dir: Directory for output artifacts (defaults to data/feature_store/selected)
+        **kwargs: Additional arguments passed to FeatureSelectionEngine
+        
+    Returns:
+        FeatureSelectionResult
+    """
+    engine = FeatureSelectionEngine(**kwargs)
+    return engine.compute(
+        predictive_matrix_path=predictive_matrix_path,
+        stability_file=stability_file,
+        interaction_file=interaction_file,
+        redundancy_file=redundancy_file,
+        removed_file=removed_file,
+        output_dir=output_dir,
+    )
+
+
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(
+        description="Module 205 - Feature Selection & Ranking Engine"
+    )
+    parser.add_argument("--matrix", type=str, required=True,
+                        help="Path to predictive feature matrix (Module 203)")
+    parser.add_argument("--stability", type=str, required=True,
+                        help="Path to feature_stability.csv (Module 202)")
+    parser.add_argument("--interaction", type=str, required=True,
+                        help="Path to interaction_statistics.csv (Module 203)")
+    parser.add_argument("--redundancy", type=str, required=True,
+                        help="Path to feature_redundancy.csv (Module 204)")
+    parser.add_argument("--removed", type=str, required=True,
+                        help="Path to removed_redundant_features.csv (Module 204)")
+    parser.add_argument("--output", type=str, default=None,
+                        help="Output directory")
+    
+    args = parser.parse_args()
+    
+    result = run_module205(
+        predictive_matrix_path=Path(args.matrix),
+        stability_file=Path(args.stability),
+        interaction_file=Path(args.interaction),
+        redundancy_file=Path(args.redundancy),
+        removed_file=Path(args.removed),
+        output_dir=Path(args.output) if args.output else None,
+    )
+    
+    print("\nDone.")
