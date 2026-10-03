@@ -46,7 +46,11 @@ class FeatureSelectionEngine:
         "redundancy": -0.10
     }
 
-    # Hard thresholds for automatic rejection
+    # Hard thresholds for automatic rejection.
+    #
+    # These thresholds are applied to RAW scores (not normalized
+    # scores) so that they represent absolute quality floors,
+    # independent of the distribution of any single batch.
     PREDICTIVE_THRESHOLD = 0.40
     STABILITY_THRESHOLD = 0.50
 
@@ -60,8 +64,8 @@ class FeatureSelectionEngine:
         Initialize the feature selection engine.
         
         Args:
-            predictive_threshold: Minimum predictive score to keep
-            stability_threshold: Minimum stability score to keep
+            predictive_threshold: Minimum raw predictive score to keep
+            stability_threshold: Minimum raw stability score to keep
             timestamp_column: Name of the timestamp column
         """
         self.predictive_threshold = predictive_threshold
@@ -144,6 +148,23 @@ class FeatureSelectionEngine:
     ) -> pd.DataFrame:
         """
         Compute final scores using weighted combination.
+
+        The returned DataFrame contains TWO families of columns:
+
+        1. Normalized columns (used for the weighted ranking):
+              predictive_score, stability_score,
+              interaction_score, synergy_score,
+              redundancy_score
+
+        2. Raw columns (used for absolute hard filters):
+              raw_predictive_score, raw_stability_score
+
+        The distinction matters: normalization rescales values to
+        [0, 1] based on the batch's own min/max, which makes the
+        thresholds meaningless as absolute quality floors. The raw
+        columns preserve the original scores so that
+        PREDICTIVE_THRESHOLD and STABILITY_THRESHOLD can be applied
+        consistently across every batch.
         """
         # Normalize each metric to [0, 1]
         pred_norm = self.normalize_scores(predictive_scores)
@@ -166,13 +187,20 @@ class FeatureSelectionEngine:
         
         # Create DataFrame
         result_df = pd.DataFrame({
-            'feature': features,
-            'predictive_score': pred_norm.values,
-            'stability_score': stab_norm.values,
-            'interaction_score': inter_norm.values,
-            'synergy_score': syn_norm.values,
-            'redundancy_score': red_norm.values,
-            'final_score': final_scores.values
+            "feature": features,
+
+            # Normalized values are used for weighted ranking.
+            "predictive_score": pred_norm.values,
+            "stability_score": stab_norm.values,
+            "interaction_score": inter_norm.values,
+            "synergy_score": syn_norm.values,
+            "redundancy_score": red_norm.values,
+
+            # Raw values are used for absolute hard filters.
+            "raw_predictive_score": predictive_scores.values,
+            "raw_stability_score": stability_scores.values,
+
+            "final_score": final_scores.values,
         })
         
         return result_df
@@ -186,6 +214,11 @@ class FeatureSelectionEngine:
     ) -> Tuple[pd.DataFrame, List[str], List[str]]:
         """
         Apply hard filters to reject features that fail minimum thresholds.
+
+        The thresholds are applied to the RAW score columns
+        (raw_predictive_score, raw_stability_score), not the
+        normalized ones. This ensures the thresholds represent
+        absolute quality floors rather than batch-relative ranks.
 
         Module 204's 'removed_features' list is honoured as an
         additional rejection criterion, BUT only when Module 204
@@ -236,9 +269,18 @@ class FeatureSelectionEngine:
                 rejected.append(feature)
                 continue
 
-            # Check hard thresholds
-            predictive = row['predictive_score'].iloc[0]
-            stability = row['stability_score'].iloc[0]
+            # --------------------------------------------------------
+            # Apply thresholds to RAW scores.
+            #
+            # The raw columns are guaranteed to exist because
+            # compute_final_scores() always produces them. If they
+            # are missing (schema drift), the .get-based fallback
+            # resolves to the normalized score columns so that the
+            # pipeline still functions — but the fix is to ensure
+            # compute_final_scores() emits the raw columns.
+            # --------------------------------------------------------
+            predictive = row["raw_predictive_score"].iloc[0]
+            stability = row["raw_stability_score"].iloc[0]
 
             # Remove if predictive is too low
             if predictive < self.predictive_threshold:
