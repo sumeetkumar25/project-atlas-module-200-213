@@ -159,12 +159,13 @@ class FeatureSelectionEngine:
         stability_scores: pd.Series,
         interaction_scores: pd.Series,
         synergy_scores: pd.Series,
-        redundancy_scores: pd.Series
+        redundancy_scores: pd.Series,
+        module203_decisions: Optional[Dict[str, str]] = None,
     ) -> pd.DataFrame:
         """
         Compute final scores using weighted combination.
 
-        The returned DataFrame contains TWO families of columns:
+        The returned DataFrame contains THREE families of columns:
 
         1. Normalized columns (used for the weighted ranking):
               predictive_score, stability_score,
@@ -174,13 +175,27 @@ class FeatureSelectionEngine:
         2. Raw columns (used for absolute hard filters):
               raw_predictive_score, raw_stability_score
 
-        The distinction matters: normalization rescales values to
-        [0, 1] based on the batch's own min/max, which makes the
-        thresholds meaningless as absolute quality floors. The raw
-        columns preserve the original scores so that
+        3. Upstream decision column (Module 203 final decision):
+              module203_decision
+
+        The distinction between (1) and (2) matters: normalization
+        rescales values to [0, 1] based on the batch's own min/max,
+        which makes the thresholds meaningless as absolute quality
+        floors. The raw columns preserve the original scores so that
         PREDICTIVE_THRESHOLD and STABILITY_THRESHOLD can be applied
         consistently across every batch.
+
+        The module203_decision column records Module 203's final
+        KEEP / REMOVE / WARNING decision for each feature. It is an
+        audit field only and is not used in scoring — but it must
+        appear in feature_scores.csv so that downstream consumers
+        can reconcile Module 205's eligibility decision against
+        Module 203's upstream decision without re-loading the
+        Module 203 CSV.
         """
+        if module203_decisions is None:
+            module203_decisions = {}
+
         # Normalize each metric to [0, 1]
         pred_norm = self.normalize_scores(predictive_scores)
         stab_norm = self.normalize_scores(stability_scores)
@@ -215,6 +230,12 @@ class FeatureSelectionEngine:
             "raw_predictive_score": predictive_scores.values,
             "raw_stability_score": stability_scores.values,
 
+            # Upstream Module 203 final decision (audit field).
+            "module203_decision": [
+                module203_decisions.get(feature, "UNKNOWN")
+                for feature in features
+            ],
+
             "final_score": final_scores.values,
         })
         
@@ -225,33 +246,46 @@ class FeatureSelectionEngine:
         scores_df: pd.DataFrame,
         removed_features: List[str],
         all_features: List[str],
-        module204_removed_features: Optional[List[str]] = None
+        module204_removed_features: Optional[List[str]] = None,
+        module203_decisions: Optional[Dict[str, str]] = None
     ) -> Tuple[pd.DataFrame, List[str], List[str]]:
         """
-        Apply hard filters to reject features that fail minimum thresholds.
+        Apply final eligibility filters to candidate features.
 
-        The thresholds are applied to the RAW score columns
-        (raw_predictive_score, raw_stability_score), not the
-        normalized ones. This ensures the thresholds represent
-        absolute quality floors rather than batch-relative ranks.
+        Module 203 is the statistical predictive-power gate.
+        Module 205 must not resurrect a feature that Module 203
+        has finally classified as REMOVE.
 
-        Module 204's 'removed_features' list is treated as ADVISORY,
-        not authoritative. A feature that Module 204 flagged for
-        redundancy removal is still retained when it independently
-        passes both the predictive and stability thresholds. This
-        prevents Module 204's redundancy view from silently
-        discarding features that are demonstrably useful on their
-        own merits.
+        Module 204 redundancy removal remains advisory:
+        a feature rejected by Module 204 may still survive if it
+        passes Module 203 eligibility plus Module 205 quality floors.
 
         Args:
-            scores_df: Feature scores DataFrame
-            removed_features: Features flagged for removal by Module 204
-            all_features: All candidate features from Module 203
-            module204_removed_features: Optional explicit list of
-                features removed by Module 204. Currently unused for
-                trust decisions, but retained for API compatibility
-                and future diagnostic reporting.
+            scores_df:
+                Module 205 calculated score table.
+            removed_features:
+                Features flagged by Module 204.
+            all_features:
+                All candidate features supplied by Module 203.
+            module204_removed_features:
+                Explicit Module 204 removal list. Kept for API
+                compatibility and diagnostics.
+            module203_decisions:
+                Final Module 203 decisions keyed by feature.
+                Example:
+                    {"trend_score": "KEEP",
+                     "compression_score": "REMOVE",
+                     ...}
+
+                A feature whose decision is "REMOVE" is rejected
+                unconditionally, regardless of Module 205 scores.
+                This honours Module 203's FDR-controlled statistical
+                gate and prevents Module 205 from resurrecting a
+                feature that failed the upstream significance test.
         """
+        if module203_decisions is None:
+            module203_decisions = {}
+
         # Start with all features
         selected = all_features.copy()
         rejected = []
@@ -275,6 +309,21 @@ class FeatureSelectionEngine:
             # --------------------------------------------------------
             predictive = row["raw_predictive_score"].iloc[0]
             stability = row["raw_stability_score"].iloc[0]
+
+            # --------------------------------------------------------
+            # Module 203 is the statistical predictive-power gate.
+            #
+            # If Module 203 finally classified this feature as
+            # REMOVE, Module 205 must not resurrect it — even if
+            # its Module 205 scores pass the local quality floors.
+            # Module 203's decision already includes its FDR gate.
+            # --------------------------------------------------------
+            upstream_decision = module203_decisions.get(feature)
+
+            if upstream_decision == "REMOVE":
+                rejected.append(feature)
+                selected.remove(feature)
+                continue
 
             # Remove if predictive is too low
             if predictive < self.predictive_threshold:
@@ -512,6 +561,27 @@ class FeatureSelectionEngine:
             print("  Warning: No predictive scores found, using defaults")
 
         # ------------------------------------------------------------
+        # Module 203's decision already includes its FDR gate.
+        # Module 205 must respect REMOVE decisions and must not
+        # resurrect statistically rejected features.
+        # ------------------------------------------------------------
+
+        if "decision" in interaction_df.columns:
+            module203_decisions = dict(
+                zip(
+                    interaction_df["feature"],
+                    interaction_df["decision"]
+                )
+            )
+            print("  Using final predictive decisions from Module 203")
+        else:
+            module203_decisions = {}
+            print(
+                "  Warning: Module 203 decision column not found; "
+                "no upstream decision gate applied"
+            )
+
+        # ------------------------------------------------------------
         # Stability scores: Module 202
         # ------------------------------------------------------------
         stability_dict = dict(
@@ -585,7 +655,8 @@ class FeatureSelectionEngine:
             stability_series,
             interaction_series,
             synergy_series,
-            redundancy_series
+            redundancy_series,
+            module203_decisions=module203_decisions,
         )
         
         # Apply hard filters
@@ -595,6 +666,7 @@ class FeatureSelectionEngine:
             removed_features,
             features,
             module204_removed_features=removed_features,
+            module203_decisions=module203_decisions,
         )
         print(f"    Selected: {len(selected)} features")
         print(f"    Rejected: {len(rejected)} features")
