@@ -98,11 +98,27 @@ class FeatureSelectionReport:
     
     @staticmethod
     def generate_ranking_table(feature_ranking, top_n=10):
-        """Generate a ranking table report."""
+        """
+        Generate a ranking table report.
+
+        Displays BOTH raw and normalized scores so the reader can
+        distinguish between:
+
+            - Raw scores: absolute quality values used for hard
+              filter thresholds (predictive >= 0.40, stability >= 0.50)
+
+            - Normalized scores: relative ranking values within this
+              batch, rescaled to [0, 1]. A normalized stability of
+              0.0 does NOT mean zero stability — it means "lowest
+              stability among the current candidates."
+
+        Without both columns visible, a reader could easily
+        misinterpret normalized 0.0 as an absolute failure.
+        """
         lines = []
-        lines.append("\n" + "=" * 70)
-        lines.append(f"TOP {top_n} FEATURES")
-        lines.append("=" * 70)
+        lines.append("\n" + "=" * 90)
+        lines.append(f"TOP {top_n} FEATURES (raw + normalized)")
+        lines.append("=" * 90)
 
         # ------------------------------------------------------------
         # Copy the caller's DataFrame so we can safely add or mutate
@@ -131,6 +147,28 @@ class FeatureSelectionReport:
                 )
 
         # ------------------------------------------------------------
+        # Defensive: ensure the raw columns exist. If they are absent
+        # (older engine, custom pipeline), fall back to the normalized
+        # columns so the table still renders — but emit a warning
+        # marker in the header so the reader knows the raw columns
+        # were not available.
+        # ------------------------------------------------------------
+        raw_columns_available = (
+            "raw_predictive_score" in ranking_df.columns and
+            "raw_stability_score" in ranking_df.columns
+        )
+
+        if not raw_columns_available:
+            if "raw_predictive_score" not in ranking_df.columns:
+                ranking_df["raw_predictive_score"] = ranking_df.get(
+                    "predictive_score", 0.0
+                )
+            if "raw_stability_score" not in ranking_df.columns:
+                ranking_df["raw_stability_score"] = ranking_df.get(
+                    "stability_score", 0.0
+                )
+
+        # ------------------------------------------------------------
         # Sort by the resolved predictive score and take the top N.
         # ------------------------------------------------------------
         ranking_df = ranking_df.sort_values(
@@ -138,21 +176,67 @@ class FeatureSelectionReport:
             ascending=False
         ).head(top_n)
 
+        if not raw_columns_available:
+            lines.append(
+                "  NOTE: raw score columns missing; "
+                "displayed raw values fall back to normalized."
+            )
+
+        # ------------------------------------------------------------
+        # Header — explicitly label both families so the reader
+        # understands the semantic difference.
+        # ------------------------------------------------------------
         lines.append(
-            f"\n{'Rank':<8} {'Feature':<25} {'Score':<12} {'Predictive':<12} {'Stability':<12}"
+            "\n"
+            f"{'Rank':<6}"
+            f"{'Feature':<24}"
+            f"{'Final':<9}"
+            f"{'Pred(norm)':<12}"
+            f"{'Pred(raw)':<12}"
+            f"{'Stab(norm)':<12}"
+            f"{'Stab(raw)':<12}"
         )
-        lines.append("-" * 75)
+        lines.append("-" * 90)
 
         for _, row in ranking_df.iterrows():
             lines.append(
-                f"{row['rank']:<8} "
-                f"{row['feature'][:24]:<25} "
-                f"{row['final_score']:<12.3f} "
-                f"{row['predictive_score']:<12.3f} "
+                f"{row['rank']:<6}"
+                f"{str(row['feature'])[:23]:<24}"
+                f"{row['final_score']:<9.3f}"
+                f"{row['predictive_score']:<12.3f}"
+                f"{row['raw_predictive_score']:<12.3f}"
                 f"{row['stability_score']:<12.3f}"
+                f"{row['raw_stability_score']:<12.3f}"
             )
 
-        lines.append("\n" + "=" * 70)
+        lines.append("")
+        lines.append("-" * 90)
+        lines.append(
+            "  Legend:"
+        )
+        lines.append(
+            "    Final        = weighted combination (clipped to [0,1])"
+        )
+        lines.append(
+            "    Pred(norm)   = predictive score rescaled to [0,1] within this batch"
+        )
+        lines.append(
+            "    Pred(raw)    = predictive score used for hard threshold (>=0.40)"
+        )
+        lines.append(
+            "    Stab(norm)   = stability score rescaled to [0,1] within this batch"
+        )
+        lines.append(
+            "    Stab(raw)    = stability score used for hard threshold (>=0.50)"
+        )
+        lines.append(
+            "  A normalized value of 0.0 means 'lowest in this batch',"
+        )
+        lines.append(
+            "  NOT 'zero absolute quality'. Consult the raw column."
+        )
+        lines.append("=" * 90)
+
         return "\n".join(lines)
     
     @staticmethod
