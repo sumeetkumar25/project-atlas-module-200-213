@@ -286,6 +286,31 @@ class FeatureSelectionEngine:
         if module203_decisions is None:
             module203_decisions = {}
 
+        # ------------------------------------------------------------
+        # Module 203 statistical eligibility gate
+        # ------------------------------------------------------------
+        # Module 203 applies BH-FDR correction and its final decision
+        # is the authoritative predictive eligibility result.
+        #
+        # A feature rejected by Module 203 must not be resurrected
+        # by the Module 205 composite score.
+        # ------------------------------------------------------------
+
+        predictive_decisions = {}
+
+        if module203_decisions:
+            predictive_decisions = {
+                str(feature): str(decision).upper()
+                for feature, decision in module203_decisions.items()
+            }
+
+        # Features rejected by Module 203 are ineligible for final selection.
+        module203_ineligible = {
+            feature
+            for feature, decision in predictive_decisions.items()
+            if decision == "REMOVE"
+        }
+
         # Start with all features
         selected = all_features.copy()
         rejected = []
@@ -311,18 +336,19 @@ class FeatureSelectionEngine:
             stability = row["raw_stability_score"].iloc[0]
 
             # --------------------------------------------------------
-            # Module 203 is the statistical predictive-power gate.
+            # Module 203 statistical eligibility gate.
             #
             # If Module 203 finally classified this feature as
             # REMOVE, Module 205 must not resurrect it — even if
             # its Module 205 scores pass the local quality floors.
-            # Module 203's decision already includes its FDR gate.
+            # Module 203's decision already includes its BH-FDR
+            # correction and is the authoritative predictive
+            # eligibility result.
             # --------------------------------------------------------
-            upstream_decision = module203_decisions.get(feature)
-
-            if upstream_decision == "REMOVE":
+            if feature in module203_ineligible:
                 rejected.append(feature)
-                selected.remove(feature)
+                if feature in selected:
+                    selected.remove(feature)
                 continue
 
             # Remove if predictive is too low
@@ -561,16 +587,20 @@ class FeatureSelectionEngine:
             print("  Warning: No predictive scores found, using defaults")
 
         # ------------------------------------------------------------
-        # Module 203's decision already includes its FDR gate.
-        # Module 205 must respect REMOVE decisions and must not
-        # resurrect statistically rejected features.
+        # Module 203 statistical eligibility gate
+        # ------------------------------------------------------------
+        # Module 203 applies BH-FDR correction and its final decision
+        # is the authoritative predictive eligibility result.
+        #
+        # A feature rejected by Module 203 must not be resurrected
+        # by the Module 205 composite score.
         # ------------------------------------------------------------
 
         if "decision" in interaction_df.columns:
             module203_decisions = dict(
                 zip(
                     interaction_df["feature"],
-                    interaction_df["decision"]
+                    interaction_df["decision"].astype(str).str.upper()
                 )
             )
             print("  Using final predictive decisions from Module 203")
