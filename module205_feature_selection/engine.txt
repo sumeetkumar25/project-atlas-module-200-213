@@ -37,11 +37,26 @@ class FeatureSelectionResult:
 class FeatureSelectionEngine:
     """Core engine for feature selection and ranking."""
 
+    # ------------------------------------------------------------------
     # Scoring weights
+    #
+    # The interaction weight is 0.00 because Module 203 does not
+    # currently supply an independent interaction statistic. Reusing
+    # Module 203's predictive_score as the interaction score would
+    # double-count the same evidence under two different weights.
+    #
+    # The weight mass freed by zeroing interaction is redistributed
+    # to the two metrics that represent genuine, independent evidence:
+    #   - predictive (Module 203 predictive evidence)
+    #   - stability  (Module 202 stability evidence)
+    #
+    # The weights are not required to sum to 1 because the final
+    # score is clipped to [0, 1] after combination.
+    # ------------------------------------------------------------------
     SCORING_WEIGHTS = {
-        "predictive": 0.30,
-        "stability": 0.25,
-        "interaction": 0.20,
+        "predictive": 0.45,
+        "stability": 0.30,
+        "interaction": 0.00,
         "synergy": 0.15,
         "redundancy": -0.10
     }
@@ -485,24 +500,45 @@ class FeatureSelectionEngine:
         print(f"  Found {len(removed_features)} previously removed features")
         
         # ------------------------------------------------------------
-        # Predictive scores: use actual Module 203 scores when available.
+        # Predictive scores: Module 203
         # ------------------------------------------------------------
-        
         if 'predictive_score' in interaction_df.columns:
-            predictive_dict = dict(zip(interaction_df['feature'], interaction_df['predictive_score']))
-            print(f"  Using predictive scores from Module 203")
+            predictive_dict = dict(
+                zip(interaction_df['feature'], interaction_df['predictive_score'])
+            )
+            print("  Using predictive scores from Module 203")
         else:
             predictive_dict = {f: 0.5 for f in features}
-            print(f"  Warning: No predictive scores found, using defaults")
-        
-        # Stability scores (Module 202)
-        stability_dict = dict(zip(stability_df['feature'], stability_df['stability_score']))
-        
-        # Interaction scores (Module 203)
-        if 'predictive_score' in interaction_df.columns:
-            interaction_dict = dict(zip(interaction_df['feature'], interaction_df['predictive_score']))
-        else:
-            interaction_dict = {f: 0.5 for f in features}
+            print("  Warning: No predictive scores found, using defaults")
+
+        # ------------------------------------------------------------
+        # Stability scores: Module 202
+        # ------------------------------------------------------------
+        stability_dict = dict(
+            zip(stability_df['feature'], stability_df['stability_score'])
+        )
+
+        # ------------------------------------------------------------
+        # Interaction scores
+        #
+        # IMPORTANT:
+        # Module 203 predictive_score is NOT an independent
+        # interaction metric. Do not reuse it here because that
+        # double-counts the same evidence.
+        #
+        # Until an independent interaction statistic is supplied,
+        # use the neutral value 0.5 for the interaction component.
+        #
+        # Note: even the neutral 0.5 has no effect on final_score
+        # because SCORING_WEIGHTS["interaction"] is 0.00. It is
+        # retained here only for schema compatibility so that
+        # downstream consumers still see the column.
+        # ------------------------------------------------------------
+        interaction_dict = {f: 0.5 for f in features}
+        print(
+            "  No independent interaction metric supplied; "
+            "using neutral interaction baseline (0.5)"
+        )
         
         # Synergy scores (Module 204 - conditional MI)
         if 'conditional_mi' in redundancy_df.columns:
