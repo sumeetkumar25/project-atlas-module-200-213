@@ -523,7 +523,8 @@ class FeaturePredictivePowerEngine:
 
         WARNING:
             Evidence exists but statistical confirmation is insufficient,
-            or nonlinear evidence is promising while linear evidence is weak.
+            or nonlinear evidence is promising while linear evidence is weak,
+            or the feature is statistically supported but below KEEP level.
 
         REMOVE:
             Weak evidence across the predictive metrics.
@@ -534,6 +535,16 @@ class FeaturePredictivePowerEngine:
             and fdr_significant
         ):
             return "KEEP"
+
+        # Preserve statistically supported features for downstream validation.
+        #
+        # A feature that passed the BH-FDR significance gate but has not
+        # reached the KEEP composite threshold still carries validated
+        # statistical evidence. It must not be discarded on a composite
+        # score alone — downstream research (Module 205 and beyond) is the
+        # correct place to evaluate whether its partial evidence is useful.
+        if fdr_significant and score >= 0.50:
+            return "WARNING"
 
         # Promising nonlinear / temporal evidence that should remain
         # available for downstream research validation.
@@ -797,6 +808,10 @@ class FeaturePredictivePowerEngine:
         # nonlinear or temporal evidence is retained as WARNING for
         # downstream research validation, even when the linear IC
         # test is not statistically significant.
+        #
+        # A feature that passed FDR but did not reach KEEP is also
+        # preserved as WARNING: statistically supported evidence is
+        # too valuable to discard on a composite score alone.
         #
         # Only features that are weak across all predictive metrics
         # are classified as REMOVE.
