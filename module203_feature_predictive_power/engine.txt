@@ -506,14 +506,46 @@ class FeaturePredictivePowerEngine:
 
         return float(np.clip(score, 0.0, 1.0))
 
-    def make_decision(self, score: float) -> str:
-        """Make KEEP/WARNING/REMOVE decision."""
-        if score >= self.pass_threshold:
+    def make_decision(
+        self,
+        score: float,
+        fdr_significant: bool,
+        mi_score: float,
+        ic_score: float,
+        stability_score: float,
+        consistency_score: float,
+    ) -> str:
+        """
+        Classify feature for research.
+
+        KEEP:
+            Strong composite evidence and statistical support.
+
+        WARNING:
+            Evidence exists but statistical confirmation is insufficient,
+            or nonlinear evidence is promising while linear evidence is weak.
+
+        REMOVE:
+            Weak evidence across the predictive metrics.
+        """
+        # Strong statistically supported predictive feature
+        if (
+            score >= self.pass_threshold
+            and fdr_significant
+        ):
             return "KEEP"
-        elif score >= self.warning_threshold:
+
+        # Promising nonlinear / temporal evidence that should remain
+        # available for downstream research validation.
+        if (
+            score >= self.warning_threshold
+            or mi_score >= 0.10
+            or stability_score >= 0.50
+            or consistency_score >= 0.50
+        ):
             return "WARNING"
-        else:
-            return "REMOVE"
+
+        return "REMOVE"
 
     def apply_fdr_correction(
         self,
@@ -716,8 +748,16 @@ class FeaturePredictivePowerEngine:
             
             # Composite score with normalized metrics
             predictive_score = self.compute_composite_score(metrics)
-            decision = self.make_decision(predictive_score)
             
+            # ------------------------------------------------------------
+            # Do NOT decide before FDR exists.
+            #
+            # All rows are emitted with decision = 'UNCLASSIFIED'. The
+            # final classification is performed after Benjamini-Hochberg
+            # FDR correction is applied across the whole batch, so that
+            # the decision can depend on the statistical significance
+            # of each feature relative to the rest of the batch.
+            # ------------------------------------------------------------
             rows.append({
                 'feature': feature,
                 'ic': avg_ic,
@@ -728,7 +768,7 @@ class FeaturePredictivePowerEngine:
                 'direction_accuracy': avg_dir_acc,
                 'significance': significance,
                 'predictive_score': predictive_score,
-                'decision': decision,
+                'decision': 'UNCLASSIFIED',
                 'avg_p_value': combined_p_value
             })
         
@@ -738,22 +778,49 @@ class FeaturePredictivePowerEngine:
         
         # ------------------------------------------------------------
         # Apply Benjamini-Hochberg FDR correction.
+        #
+        # FDR is evidence about statistical significance; it is not
+        # by itself a permanent feature-removal mechanism. It is
+        # combined with the composite score and nonlinear/temporal
+        # evidence to classify each feature.
         # ------------------------------------------------------------
         feature_scores["fdr_significant"] = self.apply_fdr_correction(
             feature_scores["avg_p_value"].to_numpy(),
             self.fdr_alpha
         )
-        
+
         # ------------------------------------------------------------
-        # FDR is a statistical gate, not just an informational column.
+        # Classify AFTER FDR is known.
+        #
+        # A feature is KEPT only when it has both strong composite
+        # evidence and statistical support. A feature with promising
+        # nonlinear or temporal evidence is retained as WARNING for
+        # downstream research validation, even when the linear IC
+        # test is not statistically significant.
+        #
+        # Only features that are weak across all predictive metrics
+        # are classified as REMOVE.
         # ------------------------------------------------------------
-        feature_scores.loc[
-            ~feature_scores["fdr_significant"],
-            "decision"
-        ] = "REMOVE"
-        
-        # Keep the predictive score unchanged.
-        # Only statistically supported features may remain KEEP/WARNING.
+        feature_scores["decision"] = feature_scores.apply(
+            lambda row: self.make_decision(
+                score=float(row["predictive_score"]),
+                fdr_significant=bool(row["fdr_significant"]),
+                mi_score=float(row["mutual_information"]),
+                ic_score=abs(float(row["ic"])),
+                stability_score=float(row["predictive_stability"]),
+                consistency_score=float(row["horizon_consistency"]),
+            ),
+            axis=1
+        )
+
+        # Statistical status is separate from decision.
+        # A feature may be WARNING-and-NOT_SUPPORTED (pending research)
+        # or KEEP-and-SUPPORTED (validated).
+        feature_scores["statistical_status"] = np.where(
+            feature_scores["fdr_significant"],
+            "SUPPORTED",
+            "NOT_SUPPORTED"
+        )
         
         # ------------------------------------------------------------
         # Rebuild the final lists after FDR correction.
@@ -787,8 +854,9 @@ class FeaturePredictivePowerEngine:
                     "direction_accuracy",
                     "significance",
                     "predictive_score",
+                    "fdr_significant",
+                    "statistical_status",
                     "decision",
-                    "fdr_significant"
                 ]
             ].to_string(index=False)
         )
@@ -827,3 +895,48 @@ class FeaturePredictivePowerEngine:
             kept_features=kept,
             summary_statistics=stats
         )
+
+
+# ---------------------------------------------------------------------------
+# Module-level entry point
+# ---------------------------------------------------------------------------
+
+def run_module203(
+    matrix_path: Path,
+    output_dir: Optional[Path] = None,
+    **kwargs
+) -> FeaturePredictivePowerResult:
+    """
+    Convenience function to run Module 203.
+
+    Args:
+        matrix_path: Path to stable feature matrix (from Module 202)
+        output_dir: Directory for output artifacts
+        **kwargs: Additional arguments passed to FeaturePredictivePowerEngine
+
+    Returns:
+        FeaturePredictivePowerResult
+    """
+    engine = FeaturePredictivePowerEngine(**kwargs)
+    return engine.compute(matrix_path, output_dir)
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Module 203 - Feature Predictive Power Engine"
+    )
+    parser.add_argument("--matrix", type=str, required=True,
+                        help="Path to stable feature matrix (Module 202)")
+    parser.add_argument("--output", type=str, default=None,
+                        help="Output directory")
+
+    args = parser.parse_args()
+
+    result = run_module203(
+        matrix_path=Path(args.matrix),
+        output_dir=Path(args.output) if args.output else None,
+    )
+
+    print("\nDone.")
