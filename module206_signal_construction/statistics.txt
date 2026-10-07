@@ -32,7 +32,8 @@ class SignalConstructionStatisticsEngine:
         "module": 206,
         "name": "Signal Construction",
         "version": "1.0.0",
-        "description": "Converts selected features into continuous trading signals"
+        "description": "Converts selected features into continuous trading signals",
+        "depends_on": ["205"],
     }
     
     def analyze(self, result: SignalConstructionResult) -> SignalConstructionStatistics:
