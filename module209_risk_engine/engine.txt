@@ -96,26 +96,53 @@ class RiskEngine:
         portfolio_df: pd.DataFrame
     ) -> Tuple[pd.Series, pd.Series]:
         """
-        Compute volatility scaling multiplier.
+        Calculate rolling volatility and the position-scaling multiplier.
         
-        multiplier = target_vol / rolling_volatility
-        Clipped to [volatility_min_multiplier, volatility_max_multiplier]
+        Requires validated close prices when volatility scaling is enabled.
         """
         if not self.config.use_volatility_scaling:
-            return pd.Series(1.0, index=portfolio_df.index), pd.Series(0.0, index=portfolio_df.index)
+            return (
+                pd.Series(1.0, index=portfolio_df.index),
+                pd.Series(0.0, index=portfolio_df.index),
+            )
         
-        # Check if we have price data
         if self.price_column not in portfolio_df.columns:
-            print("  Warning: Price column not found, using no volatility scaling")
-            return pd.Series(1.0, index=portfolio_df.index), pd.Series(0.0, index=portfolio_df.index)
+            raise ValueError(
+                f"Required price column '{self.price_column}' "
+                "is missing. Volatility scaling cannot be calculated."
+            )
         
-        # Calculate returns
-        returns = portfolio_df[self.price_column].pct_change()
-        rolling_vol = returns.rolling(window=self.config.volatility_window, min_periods=5).std()
+        prices = pd.to_numeric(
+            portfolio_df[self.price_column],
+            errors="coerce",
+        )
         
-        # Calculate multiplier
-        multiplier = self.config.volatility_target / (rolling_vol + 1e-12)
-        multiplier = np.clip(multiplier, self.config.volatility_min_multiplier, self.config.volatility_max_multiplier)
+        if (
+            prices.isna().any()
+            or not np.isfinite(prices.to_numpy()).all()
+            or (prices <= 0).any()
+        ):
+            raise ValueError(
+                f"Invalid values in risk-engine price column "
+                f"'{self.price_column}'"
+            )
+        
+        returns = prices.pct_change()
+        rolling_vol = returns.rolling(
+            window=self.config.volatility_window,
+            min_periods=5,
+        ).std()
+        
+        multiplier = self.config.volatility_target / (
+            rolling_vol + 1e-12
+        )
+        
+        multiplier = np.clip(
+            multiplier,
+            self.config.volatility_min_multiplier,
+            self.config.volatility_max_multiplier,
+        )
+        
         multiplier = multiplier.fillna(1.0)
         
         return multiplier, rolling_vol
@@ -404,11 +431,27 @@ class RiskEngine:
         if missing:
             raise ValueError(f"Missing columns in portfolio matrix: {missing}")
         
-        signal = portfolio_df['signal']
-        confidence = portfolio_df['confidence']
-        desired_position = portfolio_df['desired_position']
-        position_size = portfolio_df['position_size']
-        actual_position = portfolio_df['actual_position']
+        signal = portfolio_df["signal"]
+        confidence = portfolio_df["confidence"]
+        desired_position = portfolio_df["desired_position"]
+        position_size = portfolio_df["position_size"]
+        
+        actual_position = pd.to_numeric(
+            portfolio_df["actual_position"],
+            errors="coerce",
+        )
+        
+        if (
+            actual_position.isna().any()
+            or not np.isfinite(actual_position.to_numpy()).all()
+        ):
+            raise ValueError(
+                "Module 208 actual_position contains invalid values"
+            )
+        
+        # Module 208 already creates the signed, fractional, lagged position.
+        # Module 209 must adjust this position, not replace it with desired_position.
+        risk_base_position = actual_position.astype(float)
         
         # Compute volatility scaling
         print("  Computing volatility scaling...")
@@ -416,7 +459,10 @@ class RiskEngine:
         
         # Compute position limit
         print("  Computing position limits...")
-        position_limit = self.compute_position_limit(desired_position, volatility_multiplier)
+        position_limit = self.compute_position_limit(
+            risk_base_position,
+            volatility_multiplier
+        )
         
         # Compute exposure limit
         print("  Computing exposure limits...")
@@ -433,7 +479,7 @@ class RiskEngine:
         # Approve position
         print("  Approving positions...")
         approved_position, approved_size, risk_reason, risk_state = self.approve_position(
-            desired_position,
+            risk_base_position,
             position_size,
             volatility_multiplier,
             position_limit,
@@ -450,15 +496,16 @@ class RiskEngine:
         # Build risk adjusted portfolio
         risk_adjusted_portfolio = pd.DataFrame({
             self.timestamp_column: portfolio_df[self.timestamp_column],
-            'signal': signal.values,
-            'confidence': confidence.values,
-            'desired_position': desired_position.values,
-            'requested_size': position_size.values,
-            'approved_size': approved_size.values,
-            'approved_position': approved_position.values,
-            'volatility_multiplier': volatility_multiplier.values,
-            'risk_reason': risk_reason.values,
-            'risk_state': risk_state.values
+            "signal": signal.values,
+            "confidence": confidence.values,
+            "desired_position": desired_position.values,
+            "actual_position": actual_position.values,
+            "requested_size": position_size.values,
+            "approved_size": approved_size.values,
+            "approved_position": approved_position.values,
+            "volatility_multiplier": volatility_multiplier.values,
+            "risk_reason": risk_reason.values,
+            "risk_state": risk_state.values,
         })
         
         # Build approved positions DataFrame
