@@ -390,8 +390,19 @@ class SignalConstructionEngine:
         norm_df.to_csv(norm_path, index=False)
         print(f"  Saved normalized signal to {norm_path}")
         
-        # Signal components
-        comp_df = components.reset_index()
+        # Signal components: preserve the actual market timestamps.
+        comp_df = components.reset_index(drop=True).copy()
+        
+        timestamps = signal_matrix[self.timestamp_column].reset_index(drop=True)
+        
+        if len(comp_df) != len(timestamps):
+            raise ValueError(
+                "Signal component/timestamp row-count mismatch: "
+                f"components={len(comp_df)}, timestamps={len(timestamps)}"
+            )
+        
+        comp_df.insert(0, self.timestamp_column, timestamps)
+        
         comp_path = output_dir / "signal_components.csv"
         comp_df.to_csv(comp_path, index=False)
         print(f"  Saved signal components to {comp_path}")
