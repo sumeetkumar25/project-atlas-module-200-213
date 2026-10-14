@@ -278,6 +278,21 @@ def test_engine_compute():
         assert (output_dir / "signal_components.csv").exists()
         assert (output_dir / "contribution_percentages.csv").exists()
         assert (output_dir / "signal_statistics.csv").exists()
+        
+        # Regression check: component output must include genuine timestamps.
+        saved_components = pd.read_csv(output_dir / "signal_components.csv")
+        assert "timestamp" in saved_components.columns
+        assert len(saved_components) == len(data["predictive_matrix"])
+        
+        actual_timestamps = pd.to_datetime(
+            saved_components["timestamp"]
+        ).reset_index(drop=True)
+        
+        expected_timestamps = pd.to_datetime(
+            data["predictive_matrix"]["timestamp"]
+        ).reset_index(drop=True)
+        
+        assert actual_timestamps.equals(expected_timestamps)
     
     print("  ✓ Full engine test passed")
     return True
@@ -402,6 +417,12 @@ def test_pipeline():
         assert "signal_construction_report" in result.artifacts
         assert "component_report" in result.artifacts
         assert result.statistics.get("software_validation_passed") == True
+        
+        # Regression check: component artifact must include genuine timestamps
+        # and must remain row-aligned with the signal matrix artifact.
+        component_artifact = result.artifacts["signal_components"]
+        assert "timestamp" in component_artifact.columns
+        assert len(component_artifact) == len(result.artifacts["signal_matrix"])
         
         # Check outputs were saved
         assert (output_dir / "signal_matrix.parquet").exists()
