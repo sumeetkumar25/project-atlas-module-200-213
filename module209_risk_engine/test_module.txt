@@ -34,6 +34,9 @@ def create_test_data(n=100, seed=42):
     
     # Price for volatility
     close = 100 + np.cumsum(np.random.randn(n) * 0.5)
+    open_price = close * (
+        1.0 + np.random.normal(0.0, 0.001, n)
+    )
     
     portfolio_df = pd.DataFrame({
         'timestamp': timestamps,
@@ -45,7 +48,8 @@ def create_test_data(n=100, seed=42):
         'exposure': np.abs(actual_position),
         'decision_reason': ['FLAT'] * n,
         'portfolio_state': ['FLAT'] * n,
-        'close': close
+        'close': close,
+        'open': open_price,
     })
     
     return {
@@ -257,6 +261,19 @@ def test_engine_compute():
         
         assert not result.risk_adjusted_portfolio.empty
         assert result.summary_statistics['total_rows'] > 0
+        
+        # Market prices must survive risk adjustment.
+        assert {"open", "close"}.issubset(
+            result.risk_adjusted_portfolio.columns
+        )
+        np.testing.assert_allclose(
+            result.risk_adjusted_portfolio["open"].to_numpy(),
+            data["portfolio_matrix"]["open"].to_numpy()
+        )
+        np.testing.assert_allclose(
+            result.risk_adjusted_portfolio["close"].to_numpy(),
+            data["portfolio_matrix"]["close"].to_numpy()
+        )
         
         # Check outputs were saved
         assert (output_dir / "risk_adjusted_portfolio.parquet").exists()
