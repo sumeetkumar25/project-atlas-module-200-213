@@ -597,6 +597,13 @@ class RiskEngine:
             "risk_state": risk_state.values,
         })
         
+        # Preserve market prices for downstream execution and slippage modules.
+        for price_col in ("open", "high", "low", "close", "volume"):
+            if price_col in portfolio_df.columns:
+                risk_adjusted_portfolio[price_col] = (
+                    portfolio_df[price_col].to_numpy()
+                )
+        
         # Build approved positions DataFrame
         approved_positions = risk_adjusted_portfolio[
             risk_adjusted_portfolio['risk_state'] == "APPROVED"
