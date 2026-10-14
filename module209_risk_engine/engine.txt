@@ -96,56 +96,130 @@ class RiskEngine:
         portfolio_df: pd.DataFrame
     ) -> Tuple[pd.Series, pd.Series]:
         """
-        Calculate rolling volatility and the position-scaling multiplier.
-        
-        Requires validated close prices when volatility scaling is enabled.
+        Calculate annualized rolling volatility and risk multiplier.
+
+        volatility_target is interpreted as an annualized target.
+        The multiplier is capped at 1.0 so volatility scaling cannot
+        increase the original position.
+
+        Supports regularly sampled crypto data such as 15m, 1h and 4h.
         """
+        index = portfolio_df.index
+
         if not self.config.use_volatility_scaling:
             return (
-                pd.Series(1.0, index=portfolio_df.index),
-                pd.Series(0.0, index=portfolio_df.index),
+                pd.Series(1.0, index=index, dtype=float),
+                pd.Series(0.0, index=index, dtype=float),
             )
-        
+
         if self.price_column not in portfolio_df.columns:
             raise ValueError(
-                f"Required price column '{self.price_column}' "
-                "is missing. Volatility scaling cannot be calculated."
+                f"Required price column '{self.price_column}' is missing. "
+                "Volatility scaling cannot be calculated."
             )
-        
+
+        if self.timestamp_column not in portfolio_df.columns:
+            raise ValueError(
+                f"Required timestamp column '{self.timestamp_column}' "
+                "is missing. Annualization cannot be calculated."
+            )
+
         prices = pd.to_numeric(
             portfolio_df[self.price_column],
             errors="coerce",
         )
-        
+
         if (
             prices.isna().any()
             or not np.isfinite(prices.to_numpy()).all()
             or (prices <= 0).any()
         ):
             raise ValueError(
-                f"Invalid values in risk-engine price column "
-                f"'{self.price_column}'"
+                f"Invalid prices in column '{self.price_column}'."
             )
-        
-        returns = prices.pct_change()
+
+        timestamps = pd.to_datetime(
+            portfolio_df[self.timestamp_column],
+            errors="coerce",
+            utc=True,
+        )
+
+        if timestamps.isna().any():
+            raise ValueError(
+                "Invalid timestamps in volatility-scaling input."
+            )
+
+        if not timestamps.is_monotonic_increasing:
+            raise ValueError(
+                "Timestamps are not monotonically increasing. "
+                "Volatility scaling requires chronological order."
+            )
+
+        # ------------------------------------------------------------
+        # Infer bar duration from consecutive timestamps so the same
+        # formula works for 15m, 1h and 4h samples without hard-coded
+        # timeframe assumptions.
+        # ------------------------------------------------------------
+        deltas = timestamps.diff().dropna()
+
+        if deltas.empty:
+            raise ValueError(
+                "Cannot infer bar duration from a single-timestamp "
+                "input."
+            )
+
+        median_delta = deltas.median()
+
+        if pd.isna(median_delta) or median_delta <= pd.Timedelta(0):
+            raise ValueError(
+                "Inferred bar duration is non-positive; timestamps "
+                "appear irregular."
+            )
+
+        bar_seconds = median_delta.total_seconds()
+        periods_per_year = (365.25 * 24 * 60 * 60) / bar_seconds
+
+        if not np.isfinite(periods_per_year) or periods_per_year <= 0:
+            raise ValueError(
+                "Computed periods_per_year is invalid."
+            )
+
+        # ------------------------------------------------------------
+        # Log returns and rolling standard deviation.
+        # ------------------------------------------------------------
+        returns = np.log(prices / prices.shift(1))
+
         rolling_vol = returns.rolling(
             window=self.config.volatility_window,
             min_periods=5,
         ).std()
-        
-        multiplier = self.config.volatility_target / (
-            rolling_vol + 1e-12
+
+        # Annualize the rolling standard deviation.
+        annualized_vol = rolling_vol * np.sqrt(periods_per_year)
+
+        # ------------------------------------------------------------
+        # Volatility-target multiplier.
+        #
+        #   multiplier = annualized_target / annualized_realized_vol
+        #
+        # Capped at volatility_max_multiplier so it cannot increase
+        # the original position; floored at volatility_min_multiplier
+        # to avoid fully collapsing a position on a single spike.
+        # ------------------------------------------------------------
+        multiplier = (
+            self.config.volatility_target
+            / (annualized_vol + 1e-12)
         )
-        
+
         multiplier = np.clip(
             multiplier,
             self.config.volatility_min_multiplier,
             self.config.volatility_max_multiplier,
         )
-        
+
         multiplier = multiplier.fillna(1.0)
-        
-        return multiplier, rolling_vol
+
+        return multiplier, annualized_vol
 
     def compute_position_limit(
         self,
