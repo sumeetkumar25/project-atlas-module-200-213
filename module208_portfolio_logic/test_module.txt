@@ -104,43 +104,116 @@ def test_engine_load_confidence():
 
 
 def test_engine_desired_position():
-    """Test 3: Desired position computation."""
-    print("\n" + "=" * 60)
-    print("TEST 3: Desired Position")
-    print("=" * 60)
-    
+    """Test entry filtering, position persistence and exits."""
     config = PortfolioLogicConfig(
-        entry_threshold=0.5,
-        exit_threshold=0.2,
-        confidence_threshold=0.6
+        entry_threshold=0.50,
+        exit_threshold=0.20,
+        confidence_threshold=0.60,
+        allow_position_flip=True
     )
     engine = PortfolioLogicEngine(config=config)
-    
-    # Test scenarios
+
+    # An existing position must survive a confidence drop
+    # and signals between entry and exit thresholds.
     signal = pd.Series([0.8, 0.8, 0.3, -0.8, -0.8, -0.3])
     confidence = pd.Series([0.7, 0.5, 0.7, 0.7, 0.5, 0.7])
-    
-    positions = engine.compute_desired_position(signal, confidence)
-    
-    # Strong signal with high confidence -> LONG
-    assert positions.iloc[0] == 1
-    
-    # Strong signal with low confidence -> FLAT
-    assert positions.iloc[1] == 0
-    
-    # Weak signal -> FLAT
-    assert positions.iloc[2] == 0
-    
-    # Strong negative with high confidence -> SHORT
-    assert positions.iloc[3] == -1
-    
-    # Strong negative with low confidence -> FLAT
-    assert positions.iloc[4] == 0
-    
-    # Weak negative -> FLAT
-    assert positions.iloc[5] == 0
-    
-    print("  ✓ Desired position test passed")
+    positions = engine.compute_desired_position(
+        signal, confidence
+    )
+    assert positions.tolist() == [1, 1, 1, -1, -1, -1]
+
+    # A new position must still require sufficient confidence.
+    # LONG exits below +0.20; a later valid signal may re-enter.
+    signal2 = pd.Series([0.8, 0.8, 0.3, 0.1, 0.8])
+    confidence2 = pd.Series([0.5, 0.7, 0.4, 0.4, 0.7])
+    positions2 = engine.compute_desired_position(
+        signal2, confidence2
+    )
+    assert positions2.tolist() == [0, 1, 1, 0, 1]
+
+    # SHORT must persist through the exit band and exit above -0.20.
+    signal3 = pd.Series([-0.8, -0.45, -0.30, -0.1])
+    confidence3 = pd.Series([0.8, 0.3, 0.3, 0.3])
+    positions3 = engine.compute_desired_position(
+        signal3, confidence3
+    )
+    assert positions3.tolist() == [-1, -1, -1, 0]
+
+    print("  Desired position and hysteresis tests passed")
+    return True
+
+
+def test_engine_timestamp_alignment():
+    """Test matching, ordered and unique input timestamps."""
+    engine = PortfolioLogicEngine()
+
+    timestamps = pd.date_range(
+        "2025-01-01",
+        periods=3,
+        freq="h"
+    )
+    signal_df = pd.DataFrame({
+        "timestamp": timestamps,
+        "normalized_signal": [0.7, 0.4, 0.1]
+    })
+    confidence_df = pd.DataFrame({
+        "timestamp": timestamps,
+        "confidence": [0.8, 0.5, 0.4]
+    })
+
+    # Matching timestamps must pass.
+    engine._validate_timestamp_alignment(
+        signal_df, confidence_df
+    )
+
+    # Different timestamps must fail.
+    bad_confidence = confidence_df.copy()
+    bad_confidence.loc[1, "timestamp"] += pd.Timedelta(hours=1)
+    try:
+        engine._validate_timestamp_alignment(
+            signal_df, bad_confidence
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError(
+            "Mismatched timestamps were not rejected."
+        )
+
+    # Duplicate timestamps must fail.
+    duplicate_signal = signal_df.copy()
+    duplicate_signal.loc[1, "timestamp"] = (
+        duplicate_signal.loc[0, "timestamp"]
+    )
+    try:
+        engine._validate_timestamp_alignment(
+            duplicate_signal, confidence_df
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError(
+            "Duplicate timestamps were not rejected."
+        )
+
+    # Out-of-order timestamps must fail.
+    unordered_signal = signal_df.copy()
+    unordered_signal.loc[1, "timestamp"], unordered_signal.loc[2, "timestamp"] = (
+        unordered_signal.loc[2, "timestamp"],
+        unordered_signal.loc[1, "timestamp"]
+    )
+    try:
+        engine._validate_timestamp_alignment(
+            unordered_signal, confidence_df
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError(
+            "Unordered timestamps were not rejected."
+        )
+
+    print("  Timestamp alignment tests passed")
     return True
 
 
@@ -448,13 +521,13 @@ def test_config_customization():
     assert engine.config.max_position_size == 0.80
     assert engine.config.allow_position_flip == False
     
-    # Test with custom config
-    signal = pd.Series([0.65, 0.55])
-    confidence = pd.Series([0.75, 0.75])
-    
+    # Test with custom config:
+    # Does not enter at 0.55 while FLAT, enters at 0.65,
+    # holds at 0.55, exits at 0.25.
+    signal = pd.Series([0.55, 0.65, 0.55, 0.25])
+    confidence = pd.Series([0.75, 0.75, 0.75, 0.75])
     positions = engine.compute_desired_position(signal, confidence)
-    assert positions.iloc[0] == 1  # 0.65 > 0.60
-    assert positions.iloc[1] == 0  # 0.55 < 0.60
+    assert positions.tolist() == [0, 1, 1, 0]
     
     print("  ✓ Configuration customization test passed")
     return True
@@ -518,6 +591,7 @@ def main():
     results["load_signal"] = test_engine_load_signal()
     results["load_confidence"] = test_engine_load_confidence()
     results["desired_position"] = test_engine_desired_position()
+    results["timestamp_alignment"] = test_engine_timestamp_alignment()
     results["position_size"] = test_engine_position_size()
     results["state_machine"] = test_engine_state_machine()
     results["statistics"] = test_engine_statistics()
