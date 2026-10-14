@@ -103,6 +103,13 @@ class RiskEngine:
         increase the original position.
 
         Supports regularly sampled crypto data such as 15m, 1h and 4h.
+
+        IMPORTANT — NO LOOK-AHEAD:
+        The annualized volatility estimate is shifted forward by one bar
+        so that the multiplier applied at bar i uses only information
+        available BEFORE bar i begins. Without this shift, the estimate
+        at bar i would incorporate the return realized during bar i,
+        which is not known at the position's start.
         """
         index = portfolio_df.index
 
@@ -189,13 +196,21 @@ class RiskEngine:
         # ------------------------------------------------------------
         returns = np.log(prices / prices.shift(1))
 
-        rolling_vol = returns.rolling(
+        rolling_vol_per_bar = returns.rolling(
             window=self.config.volatility_window,
             min_periods=5,
         ).std()
 
+        # ------------------------------------------------------------
         # Annualize the rolling standard deviation.
-        annualized_vol = rolling_vol * np.sqrt(periods_per_year)
+        #
+        # Use volatility known before the current candle begins.
+        # The unshifted estimate includes the current candle's return,
+        # which is not yet known at the candle's start.
+        # ------------------------------------------------------------
+        annualized_vol = (
+            rolling_vol_per_bar * np.sqrt(periods_per_year)
+        ).shift(1)
 
         # ------------------------------------------------------------
         # Volatility-target multiplier.
