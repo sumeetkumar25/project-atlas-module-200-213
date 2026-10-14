@@ -406,6 +406,52 @@ def test_config_customization():
     return True
 
 
+def test_preserves_actual_position_sizing():
+    """Regression test: risk controls must preserve Module 208's sized position."""
+    print("\n" + "=" * 60)
+    print("TEST 14: Preserve Actual Position Sizing")
+    print("=" * 60)
+
+    data = create_test_data()
+    portfolio_df = data["portfolio_matrix"].copy()
+
+    engine = RiskEngine(
+        config=RiskConfig(
+            max_position_size=1.0,
+            max_gross_exposure=1.0,
+            leverage_limit=1.0,
+            use_volatility_scaling=False,
+            allow_short=True,
+        )
+    )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        matrix_path = tmp_path / "portfolio_matrix.parquet"
+        output_dir = tmp_path / "output"
+        portfolio_df.to_parquet(matrix_path, index=False)
+
+        result = engine.compute(
+            portfolio_matrix_path=matrix_path,
+            output_dir=output_dir,
+        )
+
+        expected = portfolio_df["actual_position"].to_numpy(dtype=float)
+        actual = result.risk_adjusted_portfolio["approved_position"].to_numpy(dtype=float)
+        preserved = result.risk_adjusted_portfolio["actual_position"].to_numpy(dtype=float)
+
+        assert np.allclose(actual, expected), (
+            "Risk engine replaced or altered Module 208's actual position "
+            "despite volatility scaling being disabled and limits being non-binding"
+        )
+        assert np.allclose(preserved, expected), (
+            "Risk-adjusted output did not preserve the original actual_position"
+        )
+
+    print("  ✓ Actual position sizing and direction preserved")
+    return True
+
+
 def test_risk_reduction_comparison():
     """Test 13: Risk reduction comparison."""
     print("\n" + "=" * 60)
@@ -481,6 +527,7 @@ def main():
     results["validator"] = test_validator()
     results["pipeline"] = test_pipeline()
     results["config_customization"] = test_config_customization()
+    results["actual_position_sizing"] = test_preserves_actual_position_sizing()
     results["risk_reduction"] = test_risk_reduction_comparison()
     
     print("\n" + "=" * 70)
