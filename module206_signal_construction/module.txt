@@ -171,9 +171,35 @@ class SignalConstructionResearch(BaseResearchModule):
         """Step 4: Export."""
         self.logger.info("Step 4: Export")
         
-        # Register DataFrames as artifacts
+        # Register DataFrames as artifacts.
         self.result.artifacts["signal_matrix"] = self.result_data.signal_matrix
-        self.result.artifacts["signal_components"] = self.result_data.signal_components
+        
+        # Add the corresponding market timestamp to every component row.
+        components_for_export = (
+            self.result_data.signal_components
+            .reset_index(drop=True)
+            .copy()
+        )
+        
+        timestamps = (
+            self.result_data.signal_matrix[self.engine.timestamp_column]
+            .reset_index(drop=True)
+        )
+        
+        if len(components_for_export) != len(timestamps):
+            raise ValueError(
+                "Signal component/timestamp row-count mismatch: "
+                f"components={len(components_for_export)}, "
+                f"timestamps={len(timestamps)}"
+            )
+        
+        components_for_export.insert(
+            0,
+            self.engine.timestamp_column,
+            timestamps,
+        )
+        
+        self.result.artifacts["signal_components"] = components_for_export
         
         # Store signals as DataFrames
         raw_df = pd.DataFrame({
