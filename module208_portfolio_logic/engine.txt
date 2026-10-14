@@ -97,34 +97,165 @@ class PortfolioLogicEngine:
         
         return df
 
+    def _validate_timestamp_alignment(
+        self,
+        signal_df: pd.DataFrame,
+        confidence_df: pd.DataFrame
+    ) -> None:
+        """Fail fast if signal and confidence timestamps are misaligned."""
+        for name, df in (
+            ("signal", signal_df),
+            ("confidence", confidence_df),
+        ):
+            if self.timestamp_column not in df.columns:
+                raise ValueError(
+                    f"{name} matrix is missing timestamp column "
+                    f"'{self.timestamp_column}'."
+                )
+
+            timestamps = pd.Series(
+                pd.to_datetime(
+                    df[self.timestamp_column],
+                    errors="raise"
+                )
+            ).reset_index(drop=True)
+
+            if timestamps.empty:
+                raise ValueError(f"{name} matrix is empty.")
+
+            if timestamps.isna().any():
+                raise ValueError(
+                    f"{name} matrix contains missing timestamps."
+                )
+
+            if timestamps.duplicated().any():
+                raise ValueError(
+                    f"{name} matrix contains duplicate timestamps."
+                )
+
+            if not timestamps.is_monotonic_increasing:
+                raise ValueError(
+                    f"{name} timestamps are not in increasing order."
+                )
+
+        signal_ts = pd.Series(
+            pd.to_datetime(
+                signal_df[self.timestamp_column],
+                errors="raise"
+            )
+        ).reset_index(drop=True)
+
+        confidence_ts = pd.Series(
+            pd.to_datetime(
+                confidence_df[self.timestamp_column],
+                errors="raise"
+            )
+        ).reset_index(drop=True)
+
+        if len(signal_ts) != len(confidence_ts):
+            raise ValueError(
+                "Signal and confidence matrices have different row counts."
+            )
+
+        if not signal_ts.equals(confidence_ts):
+            raise ValueError(
+                "Signal and confidence timestamps do not match exactly."
+            )
+
     def compute_desired_position(
         self,
         signal: pd.Series,
         confidence: pd.Series
     ) -> pd.Series:
         """
-        Compute desired position based on signal and confidence.
-        
-        Returns:
-            Series with values: 1 (LONG), -1 (SHORT), 0 (FLAT)
+        Stateful position decisions with separate entry and exit thresholds.
+
+        FLAT:
+            Enter LONG  if signal > entry_threshold
+                        and confidence > confidence_threshold.
+            Enter SHORT if signal < -entry_threshold
+                        and confidence > confidence_threshold.
+
+        LONG:
+            Stay LONG unless signal < exit_threshold.
+            If flips are enabled, a valid SHORT entry reverses to SHORT.
+
+        SHORT:
+            Stay SHORT unless signal > -exit_threshold.
+            If flips are enabled, a valid LONG entry reverses to LONG.
+
+        Confidence filters new entries. A confidence drop alone does not
+        close an existing position.
         """
-        positions = pd.Series(0, index=signal.index)
-        
-        # Entry conditions
-        long_entry = (signal > self.config.entry_threshold) & (confidence > self.config.confidence_threshold)
-        short_entry = (signal < -self.config.entry_threshold) & (confidence > self.config.confidence_threshold)
-        
-        # Exit conditions
-        long_exit = (signal < self.config.exit_threshold) & (signal > -self.config.exit_threshold)
-        short_exit = (signal > -self.config.exit_threshold) & (signal < self.config.exit_threshold)
-        
-        # Apply decisions
-        positions[long_entry] = 1
-        positions[short_entry] = -1
-        positions[long_exit] = 0
-        positions[short_exit] = 0
-        
-        return positions
+        if len(signal) != len(confidence):
+            raise ValueError(
+                "Signal and confidence have different lengths."
+            )
+
+        if not signal.index.equals(confidence.index):
+            raise ValueError(
+                "Signal and confidence Series indexes do not match."
+            )
+
+        signal_values = pd.to_numeric(
+            signal, errors="raise"
+        ).to_numpy(dtype=float)
+
+        confidence_values = pd.to_numeric(
+            confidence, errors="raise"
+        ).to_numpy(dtype=float)
+
+        if not np.isfinite(signal_values).all():
+            raise ValueError(
+                "Signal contains NaN or infinite values."
+            )
+
+        if not np.isfinite(confidence_values).all():
+            raise ValueError(
+                "Confidence contains NaN or infinite values."
+            )
+
+        positions = np.zeros(len(signal_values), dtype=int)
+        current_position = 0  # 0 = FLAT, 1 = LONG, -1 = SHORT
+
+        for i, (sig, conf) in enumerate(
+            zip(signal_values, confidence_values)
+        ):
+            long_entry = (
+                sig > self.config.entry_threshold
+                and conf > self.config.confidence_threshold
+            )
+
+            short_entry = (
+                sig < -self.config.entry_threshold
+                and conf > self.config.confidence_threshold
+            )
+
+            if current_position == 0:
+                if long_entry:
+                    current_position = 1
+                elif short_entry:
+                    current_position = -1
+
+            elif current_position == 1:
+                if self.config.allow_position_flip and short_entry:
+                    current_position = -1
+                elif sig < self.config.exit_threshold:
+                    current_position = 0
+
+            elif current_position == -1:
+                if self.config.allow_position_flip and long_entry:
+                    current_position = 1
+                elif sig > -self.config.exit_threshold:
+                    current_position = 0
+
+            positions[i] = current_position
+
+        return pd.Series(
+            positions,
+            index=signal.index,
+            dtype=int
+        )
 
     def compute_position_size(
         self,
@@ -360,6 +491,9 @@ class PortfolioLogicEngine:
         print(f"  Loading confidence matrix from: {confidence_matrix_path}")
         confidence_df = self.load_confidence_matrix(confidence_matrix_path)
         print(f"  Shape: {confidence_df.shape}")
+        
+        # Validate timestamp alignment
+        self._validate_timestamp_alignment(signal_df, confidence_df)
         
         # Extract columns
         if self.signal_column not in signal_df.columns:
