@@ -102,60 +102,55 @@ class SignalConfidenceEngine:
         return pd.Series(strength, index=signal.index)
 
     def compute_agreement_score(self, components: pd.DataFrame) -> pd.Series:
-        """
-        Compute feature agreement score.
-        
-        Measures how many features agree on the direction.
-        """
-        # Get feature columns (exclude timestamp)
-        feature_cols = [c for c in components.columns if c != 'index' and c != self.timestamp_column]
-        
-        if not feature_cols:
-            return pd.Series(0.5, index=components.index)
-        
-        # Direction of each component
-        directions = np.sign(components[feature_cols].values)
-        
-        # Agreement = proportion of features with same sign as majority
-        majority_direction = np.sign(np.sum(directions, axis=1))
-        agreement = np.mean(directions == majority_direction[:, None], axis=1)
-        
+        """Measure agreement only when at least two features exist."""
+        feature_cols = [
+            c for c in components.columns
+            if c not in ("index", self.timestamp_column)
+        ]
+
+        if len(feature_cols) < 2:
+            return pd.Series(
+                np.nan, index=components.index, dtype=float
+            )
+
+        directions = np.sign(
+            components[feature_cols].to_numpy(dtype=float)
+        )
+        majority_direction = np.sign(directions.sum(axis=1))
+        agreement = np.mean(
+            directions == majority_direction[:, None], axis=1
+        )
+
         return pd.Series(agreement, index=components.index)
 
-    def compute_contribution_balance(self, components: pd.DataFrame) -> pd.Series:
-        """
-        Compute contribution balance using Herfindahl-Hirschman Index (HHI).
-        
-        Lower HHI = more balanced = higher confidence.
-        """
-        feature_cols = [c for c in components.columns if c != 'index' and c != self.timestamp_column]
-        
-        if not feature_cols:
-            return pd.Series(0.5, index=components.index)
-        
-        # Calculate absolute contributions
-        abs_contrib = np.abs(components[feature_cols].values)
-        
-        # Handle case where all contributions are zero
+    def compute_contribution_balance(
+        self, components: pd.DataFrame
+    ) -> pd.Series:
+        """Measure contribution balance only with multiple features."""
+        feature_cols = [
+            c for c in components.columns
+            if c not in ("index", self.timestamp_column)
+        ]
+
+        if len(feature_cols) < 2:
+            return pd.Series(
+                np.nan, index=components.index, dtype=float
+            )
+
+        abs_contrib = np.abs(
+            components[feature_cols].to_numpy(dtype=float)
+        )
+
         row_sums = abs_contrib.sum(axis=1, keepdims=True)
         row_sums = np.where(row_sums == 0, 1.0, row_sums)
-        
-        # Normalize to proportions
+
         proportions = abs_contrib / row_sums
-        
-        # HHI = sum of squared proportions
+
         hhi = np.sum(proportions ** 2, axis=1)
-        
-        # Convert HHI to balance score (HHI ranges from 1/n to 1)
-        # Lower HHI = more balanced = higher score
-        max_hhi = 1.0
         min_hhi = 1.0 / len(feature_cols)
-        
-        if max_hhi - min_hhi > 0:
-            balance = 1 - (hhi - min_hhi) / (max_hhi - min_hhi)
-        else:
-            balance = 0.5
-        
+
+        balance = 1.0 - (hhi - min_hhi) / (1.0 - min_hhi)
+
         return pd.Series(balance, index=components.index)
 
     def compute_stability_score(self, signal: pd.Series) -> pd.Series:
@@ -222,18 +217,50 @@ class SignalConfidenceEngine:
         stability: pd.Series,
         consistency: pd.Series
     ) -> pd.Series:
-        """
-        Compute final confidence score.
-        """
-        confidence = (
-            self.CONFIDENCE_WEIGHTS["strength"] * strength +
-            self.CONFIDENCE_WEIGHTS["agreement"] * agreement +
-            self.CONFIDENCE_WEIGHTS["stability"] * stability +
-            self.CONFIDENCE_WEIGHTS["contribution_balance"] * balance +
-            self.CONFIDENCE_WEIGHTS["direction_consistency"] * consistency
+        """Calculate confidence using only available factors."""
+        factors = {
+            "strength": strength,
+            "agreement": agreement,
+            "stability": stability,
+            "contribution_balance": balance,
+            "direction_consistency": consistency,
+        }
+
+        numerator = np.zeros(len(signal), dtype=float)
+        denominator = np.zeros(len(signal), dtype=float)
+
+        for name, factor in factors.items():
+            values = pd.to_numeric(
+                pd.Series(factor).reset_index(drop=True),
+                errors="coerce",
+            ).to_numpy(dtype=float)
+
+            if len(values) != len(signal):
+                raise ValueError(
+                    f"Confidence factor '{name}' has {len(values)} rows; "
+                    f"expected {len(signal)}."
+                )
+
+            valid = np.isfinite(values)
+            weight = self.CONFIDENCE_WEIGHTS[name]
+
+            numerator[valid] += weight * values[valid]
+            denominator[valid] += weight
+
+        # Renormalize by the total available weight per row.
+        confidence = np.full(len(signal), np.nan, dtype=float)
+        positive_weight = denominator > 0
+        confidence[positive_weight] = (
+            numerator[positive_weight] / denominator[positive_weight]
         )
-        
-        return pd.Series(np.clip(confidence, 0.0, 1.0), index=signal.index)
+
+        # Rows with no available factor are treated as neutral (0.5).
+        confidence[~positive_weight] = 0.5
+
+        return pd.Series(
+            np.clip(confidence, 0.0, 1.0),
+            index=signal.index,
+        )
 
     def compute_statistics(
         self,
