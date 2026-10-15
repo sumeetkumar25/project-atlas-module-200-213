@@ -1002,7 +1002,14 @@ class ExecutionSimulationEngine:
         else:
             orders_generated = int(len(events))
 
-        orders_executed = int(len(filled))
+        # orders_executed counts distinct submitted orders, not fill
+        # events. A single reversal order produces two fill events
+        # (one close and one open). Counting events would inflate the
+        # execution rate above 100%.
+        if "order_index" in filled.columns and not filled.empty:
+            orders_executed = int(filled["order_index"].nunique())
+        else:
+            orders_executed = int(len(filled))
 
         execution_rate = (
             orders_executed / orders_generated
@@ -1092,6 +1099,8 @@ class ExecutionSimulationEngine:
             "open_positions_at_end": int(open_positions_count),
             "execution_delay": int(self.config.latency_bars),
             "average_executed_size": float(average_executed_size),
+            # total_events reports fill events, kept separate from the
+            # order-level counts above.
             "total_events": int(len(filled)),
         }
 
