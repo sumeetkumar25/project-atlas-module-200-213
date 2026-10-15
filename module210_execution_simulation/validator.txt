@@ -84,6 +84,94 @@ class ExecutionSimulationValidator:
                 invalid = set(result.execution_events['event_type'].unique()) - set(valid_types)
                 if invalid:
                     issues.append(f"Invalid event types: {invalid}")
+            
+            # Validate signed position changes against actual fill quantities.
+            event_df = result.execution_events
+            
+            required_event_columns = {
+                "event_type",
+                "size",
+                "position_before",
+                "position_after",
+                "commission",
+                "slippage",
+            }
+            
+            missing_event_columns = (
+                required_event_columns - set(event_df.columns)
+            )
+            
+            if missing_event_columns:
+                issues.append(
+                    "Execution events missing columns: "
+                    f"{sorted(missing_event_columns)}"
+                )
+            else:
+                signed_change = {
+                    "OPEN_LONG": 1.0,
+                    "BUY": 1.0,
+                    "CLOSE_LONG": -1.0,
+                    "SELL": -1.0,
+                    "OPEN_SHORT": -1.0,
+                    "SHORT": -1.0,
+                    "CLOSE_SHORT": 1.0,
+                    "COVER": 1.0,
+                    "NO_ACTION": 0.0,
+                }
+                
+                previous_after = None
+                
+                for row_index, row in event_df.iterrows():
+                    event_type = row["event_type"]
+                    size = float(row["size"])
+                    before = float(row["position_before"])
+                    after = float(row["position_after"])
+                    
+                    if event_type not in signed_change:
+                        continue
+                    
+                    # NO_ACTION has zero size and no execution cost.
+                    if event_type == "NO_ACTION":
+                        if abs(size) > 1e-10:
+                            issues.append(
+                                f"Event row {row_index}: NO_ACTION has nonzero size."
+                            )
+                        if abs(float(row["commission"])) > 1e-10:
+                            issues.append(
+                                f"Event row {row_index}: NO_ACTION has commission."
+                            )
+                        if abs(float(row["slippage"])) > 1e-10:
+                            issues.append(
+                                f"Event row {row_index}: NO_ACTION has slippage."
+                            )
+                    
+                    expected_after = (
+                        before + signed_change[event_type] * size
+                    )
+                    
+                    if not np.isclose(
+                        after,
+                        expected_after,
+                        atol=1e-8,
+                        rtol=0,
+                    ):
+                        issues.append(
+                            f"Event row {row_index}: position mismatch; "
+                            f"expected {expected_after}, recorded {after}."
+                        )
+                    
+                    # Verify position continuity from one event to the next.
+                    if previous_after is not None and not np.isclose(
+                        before,
+                        previous_after,
+                        atol=1e-8,
+                        rtol=0,
+                    ):
+                        issues.append(
+                            f"Event row {row_index}: position history is discontinuous."
+                        )
+                    
+                    previous_after = after
         
         # Check position history
         if result.position_history.empty:
