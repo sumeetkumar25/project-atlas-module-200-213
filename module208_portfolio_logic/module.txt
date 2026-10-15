@@ -37,6 +37,7 @@ class PortfolioLogicResearch(BaseResearchModule):
         confidence_threshold: float = 0.60,
         max_position_size: float = 1.00,
         allow_position_flip: bool = True,
+        lag_by_one_bar: bool = True,
         timestamp_column: str = "timestamp",
         signal_column: str = "normalized_signal",
         confidence_column: str = "confidence"
@@ -51,6 +52,9 @@ class PortfolioLogicResearch(BaseResearchModule):
             confidence_threshold: Minimum confidence to enter a position
             max_position_size: Maximum position size (0-1)
             allow_position_flip: Whether to allow flipping from LONG to SHORT directly
+            lag_by_one_bar: Whether to lag positions by one bar to avoid
+                look-ahead bias (execution at next bar's open). Set to
+                False to allow same-bar execution for comparison.
             timestamp_column: Name of the timestamp column
             signal_column: Name of the signal column
             confidence_column: Name of the confidence column
@@ -67,7 +71,8 @@ class PortfolioLogicResearch(BaseResearchModule):
             exit_threshold=exit_threshold,
             confidence_threshold=confidence_threshold,
             max_position_size=max_position_size,
-            allow_position_flip=allow_position_flip
+            allow_position_flip=allow_position_flip,
+            lag_by_one_bar=lag_by_one_bar
         )
         
         self.engine = PortfolioLogicEngine(
@@ -111,6 +116,10 @@ class PortfolioLogicResearch(BaseResearchModule):
         )
         
         self.logger.metric(
+            "Lag By One Bar",
+            str(self.config.lag_by_one_bar)
+        )
+        self.logger.metric(
             "Total Rows",
             f"{self.result_data.summary_statistics['total_rows']:,}"
         )
@@ -139,6 +148,7 @@ class PortfolioLogicResearch(BaseResearchModule):
         )
         
         return {
+            "lag_by_one_bar": self.config.lag_by_one_bar,
             "total_rows": self.result_data.summary_statistics["total_rows"],
             "long_pct": self.result_data.summary_statistics["long_pct"],
             "short_pct": self.result_data.summary_statistics["short_pct"],
