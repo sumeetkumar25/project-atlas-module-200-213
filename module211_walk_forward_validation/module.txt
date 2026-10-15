@@ -24,6 +24,32 @@ from .report import WalkForwardReport
 from .exporter import WalkForwardExporter
 
 
+# ---------------------------------------------------------------------------
+# Timeframe-specific calendar window settings.
+#
+# Each entry defines (train_days, test_days, step_days) for a given
+# timeframe. These are the calendar durations used to build walk-forward
+# windows when the engine is configured for calendar-based windowing.
+# ---------------------------------------------------------------------------
+TIMEFRAME_CALENDAR_SETTINGS: Dict[str, Dict[str, int]] = {
+    "15m": {
+        "train_days": 180,
+        "test_days": 30,
+        "step_days": 30,
+    },
+    "1h": {
+        "train_days": 365,
+        "test_days": 90,
+        "step_days": 90,
+    },
+    "4h": {
+        "train_days": 730,
+        "test_days": 180,
+        "step_days": 180,
+    },
+}
+
+
 class WalkForwardValidation(BaseResearchModule):
     """Main research module for walk-forward validation."""
     
@@ -33,6 +59,7 @@ class WalkForwardValidation(BaseResearchModule):
     def __init__(
         self,
         registry: Optional[AtlasRegistry] = None,
+        timeframe: str = "1h",
         train_window_bars: int = 10000,
         test_window_bars: int = 2500,
         step_size: int = 2500,
@@ -43,16 +70,20 @@ class WalkForwardValidation(BaseResearchModule):
         price_column: str = "close",
         trade_id_column: str = "trade_id",
         entry_time_column: str = "entry_time",
-        exit_time_column: str = "exit_time"
+        exit_time_column: str = "exit_time",
+        use_calendar_windows: bool = True
     ):
         """
         Initialize the walk-forward validation module.
         
         Args:
             registry: Optional Atlas registry
-            train_window_bars: Number of bars for training window
-            test_window_bars: Number of bars for testing window
-            step_size: Step size between windows
+            timeframe: Trading timeframe ('15m', '1h', '4h'). Determines
+                calendar-based walk-forward window sizes.
+            train_window_bars: Number of bars for training window (fallback
+                when calendar windowing is disabled)
+            test_window_bars: Number of bars for testing window (fallback)
+            step_size: Step size between windows (fallback)
             minimum_trades: Minimum trades required in test window
             overlap: Whether windows can overlap
             max_windows: Maximum number of windows to process
@@ -61,6 +92,9 @@ class WalkForwardValidation(BaseResearchModule):
             trade_id_column: Name of the trade ID column
             entry_time_column: Name of the entry time column
             exit_time_column: Name of the exit time column
+            use_calendar_windows: If True, use calendar-based windows
+                derived from the timeframe. If False, fall back to
+                bar-count windowing.
         """
         super().__init__(
             module_name="Walk Forward Validation",
@@ -68,15 +102,30 @@ class WalkForwardValidation(BaseResearchModule):
         )
         
         self.registry = registry or AtlasRegistry()
+        self.timeframe = timeframe
+        self.use_calendar_windows = use_calendar_windows
         
-        self.config = WalkForwardConfig(
-            train_window_bars=train_window_bars,
-            test_window_bars=test_window_bars,
-            step_size=step_size,
-            minimum_trades=minimum_trades,
-            overlap=overlap,
-            max_windows=max_windows
-        )
+        # Resolve calendar settings for the timeframe.
+        calendar_settings = self._resolve_calendar_settings(timeframe)
+        
+        # Build config.
+        config_kwargs: Dict[str, Any] = {
+            "train_window_bars": train_window_bars,
+            "test_window_bars": test_window_bars,
+            "step_size": step_size,
+            "minimum_trades": minimum_trades,
+            "overlap": overlap,
+            "max_windows": max_windows,
+        }
+        
+        if self.use_calendar_windows and calendar_settings is not None:
+            config_kwargs.update({
+                "train_window_days": calendar_settings["train_days"],
+                "test_window_days": calendar_settings["test_days"],
+                "step_days": calendar_settings["step_days"],
+            })
+        
+        self.config = WalkForwardConfig(**config_kwargs)
         
         self.engine = WalkForwardEngine(
             config=self.config,
@@ -92,6 +141,25 @@ class WalkForwardValidation(BaseResearchModule):
         self.window_report = None
         self._output_dir = None
         self._paths = None
+
+    @staticmethod
+    def _resolve_calendar_settings(timeframe: str) -> Optional[Dict[str, int]]:
+        """
+        Resolve calendar window settings for a given timeframe.
+        
+        Returns None if the timeframe is not recognized, in which case
+        the engine falls back to bar-count windowing.
+        """
+        if timeframe is None:
+            return None
+        
+        key = str(timeframe).strip().lower()
+        settings = TIMEFRAME_CALENDAR_SETTINGS.get(key)
+        
+        if settings is None:
+            return None
+        
+        return dict(settings)
 
     def _register_pipeline_steps(self):
         """Register pipeline steps."""
@@ -120,6 +188,10 @@ class WalkForwardValidation(BaseResearchModule):
         )
         
         self.logger.metric(
+            "Timeframe",
+            self.timeframe
+        )
+        self.logger.metric(
             "Windows",
             str(len(self.result_data.window_results))
         )
@@ -144,6 +216,7 @@ class WalkForwardValidation(BaseResearchModule):
         )
         
         return {
+            "timeframe": self.timeframe,
             "windows": len(self.result_data.window_results),
             "total_trades": self.result_data.summary_statistics.get("total_trades", 0),
             "avg_return": self.result_data.summary_statistics.get("avg_return", 0),
