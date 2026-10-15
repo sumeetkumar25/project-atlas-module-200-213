@@ -172,11 +172,34 @@ class ExecutionSimulationResearch(BaseResearchModule):
         return self.stats_engine.summary_dict(self.statistics)
     
     def _validate(self) -> Dict[str, Any]:
-        """Step 3: Validation."""
+        """Validate execution results and fail closed on accounting errors."""
         self.logger.info("Step 3: Validation")
-        passed = run_validation(self.result_data, self.statistics)
+
+        passed = run_validation(
+            self.result_data,
+            self.statistics,
+        )
+
+        # Keep both flags explicit for downstream consumers.
+        self.result_data.summary_statistics[
+            "software_validation_passed"
+        ] = bool(passed)
+        self.result_data.summary_statistics[
+            "validation_passed"
+        ] = bool(passed)
+
+        if not passed:
+            raise ValueError(
+                "Module 210 validation failed. "
+                "Review execution_events.csv, position_history.csv, "
+                "and the validation errors before proceeding."
+            )
+
         self.logger.success("Validation complete")
-        return {"software_validation_passed": passed}
+
+        return {
+            "software_validation_passed": True,
+        }
     
     def _export_results(self) -> Dict[str, Any]:
         """Step 4: Export."""
