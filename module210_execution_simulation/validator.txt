@@ -26,7 +26,31 @@ class ExecutionSimulationValidator:
         
         # Check trade log
         if result.executed_trade_log.empty:
-            warnings.append("Trade log is empty")
+            events = result.execution_events
+
+            if not events.empty:
+                if "filled" in events.columns:
+                    has_fills = (
+                        events["filled"]
+                        .fillna(False)
+                        .astype(bool)
+                        .any()
+                    )
+                else:
+                    has_fills = (
+                        events["event_type"] != "NO_ACTION"
+                    ).any()
+
+                if has_fills:
+                    issues.append(
+                        "Trade log is empty despite executed fill events."
+                    )
+                else:
+                    warnings.append(
+                        "Trade log is empty because no fills occurred."
+                    )
+            else:
+                warnings.append("Trade log is empty.")
         else:
             # Check required columns
             required_cols = ['trade_id', 'entry_time', 'exit_time', 'direction', 
@@ -193,6 +217,42 @@ class ExecutionSimulationValidator:
                 f"Total events mismatch: stats={statistics.total_events}, "
                 f"result={len(result.execution_events)}"
             )
+        
+        # Reject statistics that contradict the actual fill ledger.
+        events = result.execution_events
+        
+        if not events.empty:
+            if "filled" in events.columns:
+                filled = events[
+                    events["filled"].fillna(False).astype(bool)
+                ].copy()
+            else:
+                filled = events[
+                    events["event_type"] != "NO_ACTION"
+                ].copy()
+
+            if not filled.empty:
+                if "position_before" in filled and "position_after" in filled:
+                    changed = (
+                        filled["position_after"].astype(float)
+                        - filled["position_before"].astype(float)
+                    ).abs() > 1e-10
+                    filled = filled[changed]
+
+                if not filled.empty:
+                    actual_mean_size = float(filled["size"].mean())
+
+                    if not np.isclose(
+                        statistics.average_executed_size,
+                        actual_mean_size,
+                        atol=1e-8,
+                        rtol=1e-5,
+                    ):
+                        issues.append(
+                            "Average executed size does not match the fill ledger: "
+                            f"statistic={statistics.average_executed_size}, "
+                            f"actual={actual_mean_size}."
+                        )
         
         # Warnings (non-fatal)
         if statistics.execution_rate < 0.5:
