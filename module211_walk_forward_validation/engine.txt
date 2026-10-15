@@ -230,9 +230,11 @@ class WalkForwardEngine:
         winning_trades = test_pnl > 0
         win_rate = winning_trades.mean() if n_test > 0 else 0.0
         
-        # Sharpe ratio (assuming risk-free rate of 0)
+        # Sharpe ratio (trade-level, per-trade, no annualization)
         if n_test > 1 and test_pnl.std() > 0:
-            sharpe_ratio = (test_pnl.mean() / test_pnl.std()) * np.sqrt(252)
+            sharpe_ratio = (
+                test_pnl.mean() / test_pnl.std()
+            )
         else:
             sharpe_ratio = 0.0
         
@@ -293,11 +295,17 @@ class WalkForwardEngine:
         print(f"  Step Size: {self.config.step_size} bars")
         print(f"  Minimum Trades: {self.config.minimum_trades}")
         
-        # Sort by exit time
+        # Sort by exit time (stable, deterministic ordering)
         if self.exit_time_column in trade_log.columns:
-            trade_log = trade_log.sort_values(self.exit_time_column)
-        elif self.entry_time_column in trade_log.columns:
-            trade_log = trade_log.sort_values(self.entry_time_column)
+            sort_cols = [self.exit_time_column]
+
+            if self.trade_id_column in trade_log.columns:
+                sort_cols.append(self.trade_id_column)
+
+            trade_log = trade_log.sort_values(
+                sort_cols,
+                kind="mergesort"
+            ).reset_index(drop=True)
         
         # Generate windows based on timestamps
         timestamps = trade_log[self.exit_time_column].values
@@ -312,7 +320,16 @@ class WalkForwardEngine:
         for train_start, train_end, test_start, test_end in windows:
             # Split data
             train_trades = trade_log.iloc[train_start:train_end]
-            test_trades = trade_log.iloc[test_start:test_end]
+            test_trades = trade_log.iloc[test_start:test_end].copy()
+
+            # Do not count trades opened before the test period.
+            # This prevents train/test position leakage.
+            if self.entry_time_column in test_trades.columns:
+                test_start_ts = trade_log.iloc[test_start][self.exit_time_column]
+
+                test_trades = test_trades[
+                    test_trades[self.entry_time_column] >= test_start_ts
+                ].copy()
             
             # Get timestamps for window
             train_start_ts = trade_log.iloc[train_start][self.exit_time_column]
