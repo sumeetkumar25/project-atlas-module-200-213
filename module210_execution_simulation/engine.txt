@@ -81,443 +81,803 @@ class ExecutionSimulationEngine:
         self.high_column = high_column
         self.low_column = low_column
 
+        # Cross-method state populated during execution.
+        self._orders_generated_count: int = 0
+        self.open_positions_at_end: pd.DataFrame = pd.DataFrame()
+        self.unexecuted_orders_at_end: pd.DataFrame = pd.DataFrame()
+
+    # ------------------------------------------------------------------
+    # Fix A — load_portfolio
+    # ------------------------------------------------------------------
     def load_portfolio(self, matrix_path: Path) -> pd.DataFrame:
-        """Load the risk-adjusted portfolio from Module 209."""
+        """Load and validate the Module 209 risk-adjusted portfolio."""
+        matrix_path = Path(matrix_path)
         if not matrix_path.exists():
-            raise FileNotFoundError(f"Portfolio matrix not found: {matrix_path}")
-        
-        if matrix_path.suffix == '.parquet':
+            raise FileNotFoundError(
+                f"Portfolio matrix not found: {matrix_path}"
+            )
+
+        if matrix_path.suffix.lower() == ".parquet":
             df = pd.read_parquet(matrix_path)
         else:
             df = pd.read_csv(matrix_path)
-            if self.timestamp_column in df.columns:
-                df[self.timestamp_column] = pd.to_datetime(df[self.timestamp_column])
-        
+
+        required = {
+            self.timestamp_column,
+            "approved_position",
+        }
+        missing = required - set(df.columns)
+        if missing:
+            raise ValueError(
+                f"Module 209 portfolio missing columns: {sorted(missing)}"
+            )
+
+        if df.empty:
+            raise ValueError("Module 209 portfolio is empty.")
+
+        df = df.copy()
+
+        df[self.timestamp_column] = pd.to_datetime(
+            df[self.timestamp_column],
+            errors="raise",
+        )
+
+        if df[self.timestamp_column].isna().any():
+            raise ValueError("Portfolio has missing timestamps.")
+
+        if df[self.timestamp_column].duplicated().any():
+            raise ValueError("Portfolio contains duplicate timestamps.")
+
+        if not df[self.timestamp_column].is_monotonic_increasing:
+            raise ValueError(
+                "Portfolio timestamps must be sorted chronologically."
+            )
+
+        df["approved_position"] = pd.to_numeric(
+            df["approved_position"],
+            errors="raise",
+        )
+
+        positions = df["approved_position"].to_numpy(dtype=float)
+
+        if not np.isfinite(positions).all():
+            raise ValueError(
+                "Portfolio contains NaN or infinite approved positions."
+            )
+
+        if not (
+            self.open_column in df.columns
+            or self.price_column in df.columns
+        ):
+            raise ValueError(
+                "Cannot simulate execution: neither open nor close price exists."
+            )
+
         return df
 
+    # ------------------------------------------------------------------
+    # Fix B — generate_orders
+    # ------------------------------------------------------------------
     def generate_orders(self, portfolio_df: pd.DataFrame) -> pd.DataFrame:
         """
-        Generate orders from approved positions.
-        
-        Converts approved_position changes into orders.
+        Convert approved_position changes into target-position orders.
+
+        The target is the desired signed position, not an instruction to
+        add the target size to the existing position.
         """
+        if "approved_position" not in portfolio_df.columns:
+            raise ValueError(
+                "Missing required column: approved_position"
+            )
+
+        targets = pd.to_numeric(
+            portfolio_df["approved_position"],
+            errors="raise",
+        ).to_numpy(dtype=float)
+
+        if not np.isfinite(targets).all():
+            raise ValueError("Approved positions contain invalid values.")
+
         orders = []
-        
-        # Get approved positions
-        approved_pos = portfolio_df['approved_position'].values
-        
-        for i in range(len(approved_pos)):
-            current_pos = approved_pos[i]
-            
-            # Determine previous position
-            if i == 0:
-                prev_pos = 0
-            else:
-                prev_pos = approved_pos[i - 1]
-            
-            # Check if position changed
-            if current_pos != prev_pos:
-                # Order needed
-                size_change = current_pos - prev_pos
-                
-                # Determine order type
-                if prev_pos == 0 and current_pos > 0:
-                    order_type = "OPEN_LONG"
-                elif prev_pos == 0 and current_pos < 0:
-                    order_type = "OPEN_SHORT"
-                elif prev_pos > 0 and current_pos == 0:
-                    order_type = "CLOSE_LONG"
-                elif prev_pos < 0 and current_pos == 0:
-                    order_type = "CLOSE_SHORT"
-                elif prev_pos > 0 and current_pos < 0:
-                    order_type = "FLIP"
-                elif prev_pos < 0 and current_pos > 0:
-                    order_type = "FLIP"
-                else:
-                    order_type = "NO_ACTION"
-                
-                orders.append({
-                    'timestamp': portfolio_df[self.timestamp_column].iloc[i],
-                    'order_index': i,
-                    'prev_position': prev_pos,
-                    'current_position': current_pos,
-                    'size_change': size_change,
-                    'order_type': order_type,
-                    'approved_size': abs(size_change)
-                })
-        
-        return pd.DataFrame(orders)
 
-    def apply_execution_delay(self, orders_df: pd.DataFrame, portfolio_df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Apply execution delay to orders.
-        
-        Orders are executed on the next bar (latency_bars).
-        """
+        for i, target in enumerate(targets):
+            previous_target = 0.0 if i == 0 else float(targets[i - 1])
+
+            if np.isclose(target, previous_target, atol=1e-10, rtol=0):
+                continue
+
+            orders.append({
+                "timestamp": portfolio_df[self.timestamp_column].iloc[i],
+                "order_index": i,
+                "prev_position": previous_target,
+                "current_position": float(target),
+                "target_position": float(target),
+                "size_change": float(target - previous_target),
+                "order_type": "TARGET_CHANGE",
+                "approved_size": float(abs(target - previous_target)),
+            })
+
+        # Statistics use the total number of submitted target changes.
+        self._orders_generated_count = len(orders)
+
+        return pd.DataFrame(
+            orders,
+            columns=[
+                "timestamp",
+                "order_index",
+                "prev_position",
+                "current_position",
+                "target_position",
+                "size_change",
+                "order_type",
+                "approved_size",
+            ],
+        )
+
+    # ------------------------------------------------------------------
+    # Fix C — apply_execution_delay
+    # ------------------------------------------------------------------
+    def apply_execution_delay(
+        self,
+        orders_df: pd.DataFrame,
+        portfolio_df: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """Delay orders by the configured number of bars."""
+        self.unexecuted_orders_at_end = pd.DataFrame()
+
         if orders_df.empty:
-            return orders_df
-        
-        delayed_orders = orders_df.copy()
-        
-        # Map timestamps to indices
-        timestamp_to_idx = {ts: i for i, ts in enumerate(portfolio_df[self.timestamp_column])}
-        
-        # Apply delay
-        delayed_indices = []
-        
-        for _, order in orders_df.iterrows():
-            order_idx = order['order_index']
-            delayed_idx = min(order_idx + self.config.latency_bars, len(portfolio_df) - 1)
-            delayed_indices.append(delayed_idx)
-        
-        delayed_orders['execution_index'] = delayed_indices
-        delayed_orders['execution_timestamp'] = [
-            portfolio_df[self.timestamp_column].iloc[idx] for idx in delayed_indices
-        ]
-        
-        return delayed_orders
+            result = orders_df.copy()
+            result["execution_index"] = pd.Series(dtype=int)
+            result["execution_timestamp"] = pd.Series(dtype="datetime64[ns]")
+            return result
 
+        latency = int(self.config.latency_bars)
+        if latency < 0:
+            raise ValueError("latency_bars cannot be negative.")
+
+        execution_indices = (
+            orders_df["order_index"].astype(int).to_numpy() + latency
+        )
+
+        # Do not clamp orders beyond the dataset onto the final candle.
+        # That would create multiple artificial fills at the last timestamp.
+        valid = execution_indices < len(portfolio_df)
+
+        self.unexecuted_orders_at_end = orders_df.loc[~valid].copy()
+
+        delayed = orders_df.loc[valid].copy()
+        valid_indices = execution_indices[valid]
+
+        delayed["execution_index"] = valid_indices
+        delayed["execution_timestamp"] = [
+            portfolio_df[self.timestamp_column].iloc[int(idx)]
+            for idx in valid_indices
+        ]
+
+        return delayed.sort_values(
+            ["execution_index", "order_index"]
+        ).reset_index(drop=True)
+
+    # ------------------------------------------------------------------
+    # Fix D — apply_slippage
+    # ------------------------------------------------------------------
     def apply_slippage(
         self,
         portfolio_df: pd.DataFrame,
         order_idx: int,
-        order_type: str
+        order_type: str,
     ) -> Tuple[float, float]:
         """
-        Apply slippage to execution price.
-        
+        Apply adverse slippage.
+
         Returns:
-            (execution_price, slippage_amount)
+            execution_price, absolute_slippage_per_unit
         """
-        # Get reference price
+        if not 0 <= int(order_idx) < len(portfolio_df):
+            raise IndexError(f"Invalid execution index: {order_idx}")
+
         if self.open_column in portfolio_df.columns:
-            ref_price = portfolio_df[self.open_column].iloc[order_idx]
+            ref_price = float(
+                portfolio_df[self.open_column].iloc[int(order_idx)]
+            )
         elif self.price_column in portfolio_df.columns:
-            ref_price = portfolio_df[self.price_column].iloc[order_idx]
+            ref_price = float(
+                portfolio_df[self.price_column].iloc[int(order_idx)]
+            )
         else:
-            ref_price = 100.0  # Default fallback
-        
-        # Determine slippage direction
-        if order_type in ["BUY", "OPEN_LONG"]:
-            # Buy orders face positive slippage (pay more)
-            slippage_direction = 1.0
-        elif order_type in ["SELL", "CLOSE_LONG", "CLOSE_SHORT"]:
-            # Sell orders face negative slippage (receive less)
-            slippage_direction = -1.0
+            raise ValueError(
+                "No valid reference price for execution."
+            )
+
+        if not np.isfinite(ref_price) or ref_price <= 0:
+            raise ValueError(
+                f"Invalid reference price: {ref_price}"
+            )
+
+        # Slippage depends on the actual buy/sell side.
+        buy_types = {
+            "BUY",
+            "OPEN_LONG",
+            "COVER",
+            "CLOSE_SHORT",
+        }
+        sell_types = {
+            "SELL",
+            "OPEN_SHORT",
+            "SHORT",
+            "CLOSE_LONG",
+        }
+
+        if order_type in buy_types:
+            direction = 1.0
+        elif order_type in sell_types:
+            direction = -1.0
         else:
-            slippage_direction = 0.0
-        
-        # Calculate slippage
-        slippage_amount = ref_price * self.config.slippage_rate * slippage_direction
-        execution_price = ref_price + slippage_amount
-        
-        return execution_price, abs(slippage_amount)
+            raise ValueError(
+                f"Unknown execution side for slippage: {order_type}"
+            )
+
+        slippage = ref_price * self.config.slippage_rate
+        execution_price = ref_price + direction * slippage
+
+        return float(execution_price), float(slippage)
 
     def apply_commission(self, executed_size: float, execution_price: float) -> float:
         """Apply commission to trade."""
         return executed_size * execution_price * self.config.commission_rate
 
+    # ------------------------------------------------------------------
+    # Fix E — execute_orders (reconcile target vs actual fills)
+    # ------------------------------------------------------------------
     def execute_orders(
         self,
         portfolio_df: pd.DataFrame,
-        delayed_orders: pd.DataFrame
+        delayed_orders: pd.DataFrame,
     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """
-        Execute orders and maintain position history.
+        Reconcile target positions against actual filled positions.
+
+        Every fill changes the actual position by exactly its executed
+        quantity. Reversals create separate close and open fill events.
         """
+        event_columns = [
+            "timestamp",
+            "event_type",
+            "size",
+            "price",
+            "commission",
+            "slippage",
+            "slippage_cost",
+            "position_before",
+            "position_after",
+            "order_index",
+            "order_type",
+            "target_position",
+            "filled",
+        ]
+
+        history_columns = [
+            "timestamp",
+            "position",
+            "event_type",
+            "position_before",
+            "position_after",
+            "target_position",
+            "order_index",
+        ]
+
         if delayed_orders.empty:
-            return pd.DataFrame(), pd.DataFrame()
-        
-        # Initialize position
+            return (
+                pd.DataFrame(columns=event_columns),
+                pd.DataFrame(columns=history_columns),
+            )
+
+        epsilon = 1e-10
         current_position = 0.0
-        position_history = []
-        execution_events = []
-        trades = []
-        trade_id_counter = 0
-        
-        # Create a copy of delayed orders sorted by execution_index
-        delayed_orders = delayed_orders.sort_values('execution_index')
-        
+
+        execution_events: List[Dict[str, Any]] = []
+        position_history: List[Dict[str, Any]] = []
+
+        delayed_orders = delayed_orders.sort_values(
+            ["execution_index", "order_index"]
+        ).reset_index(drop=True)
+
         for _, order in delayed_orders.iterrows():
-            exec_idx = order['execution_index']
-            order_type = order['order_type']
-            size_change = order['size_change']
-            approved_size = order['approved_size']
-            
-            # Check if order is valid
-            if approved_size <= 0:
+            exec_idx = int(order["execution_index"])
+            target = float(order["target_position"])
+
+            delta = target - current_position
+
+            if abs(delta) < epsilon:
+                # Reconciled already; nothing to fill.
                 continue
-            
-            # Get execution price with slippage
-            exec_price, slippage = self.apply_slippage(portfolio_df, exec_idx, order_type)
-            
-            # Calculate commission
-            commission = self.apply_commission(approved_size, exec_price)
-            
-            # Determine event type
-            if order_type == "OPEN_LONG":
-                event_type = "BUY"
-                new_position = current_position + approved_size
-            elif order_type == "OPEN_SHORT":
-                event_type = "SHORT"
-                new_position = current_position - approved_size
-            elif order_type == "CLOSE_LONG":
-                event_type = "SELL"
-                new_position = current_position - approved_size
-            elif order_type == "CLOSE_SHORT":
-                event_type = "COVER"
-                new_position = current_position + approved_size
-            elif order_type == "FLIP":
-                if current_position > 0:
-                    # Close long then open short
-                    # First, close the long
-                    event_type = "SELL"
-                    new_position = current_position - current_position
-                    
-                    # Record the close event
-                    execution_events.append({
-                        'timestamp': portfolio_df[self.timestamp_column].iloc[exec_idx],
-                        'event_type': 'CLOSE_LONG',
-                        'size': current_position,
-                        'price': exec_price,
-                        'commission': commission,
-                        'slippage': slippage,
-                        'position_before': current_position,
-                        'position_after': 0.0
-                    })
-                    
-                    # Then open short
-                    event_type = "SHORT"
-                    new_position = -approved_size
-                    
-                    # Record the open event
-                    execution_events.append({
-                        'timestamp': portfolio_df[self.timestamp_column].iloc[exec_idx],
-                        'event_type': 'OPEN_SHORT',
-                        'size': approved_size,
-                        'price': exec_price,
-                        'commission': commission,
-                        'slippage': slippage,
-                        'position_before': 0.0,
-                        'position_after': -approved_size
-                    })
-                    
-                    # Update position history
-                    position_history.append({
-                        'timestamp': portfolio_df[self.timestamp_column].iloc[exec_idx],
-                        'position': new_position,
-                        'event_type': 'FLIP'
-                    })
-                    
-                    current_position = new_position
-                    continue
-                elif current_position < 0:
-                    # Close short then open long
-                    # First, close the short
-                    event_type = "COVER"
-                    new_position = current_position - current_position
-                    
-                    # Record the close event
-                    execution_events.append({
-                        'timestamp': portfolio_df[self.timestamp_column].iloc[exec_idx],
-                        'event_type': 'CLOSE_SHORT',
-                        'size': abs(current_position),
-                        'price': exec_price,
-                        'commission': commission,
-                        'slippage': slippage,
-                        'position_before': current_position,
-                        'position_after': 0.0
-                    })
-                    
-                    # Then open long
-                    event_type = "BUY"
-                    new_position = approved_size
-                    
-                    # Record the open event
-                    execution_events.append({
-                        'timestamp': portfolio_df[self.timestamp_column].iloc[exec_idx],
-                        'event_type': 'OPEN_LONG',
-                        'size': approved_size,
-                        'price': exec_price,
-                        'commission': commission,
-                        'slippage': slippage,
-                        'position_before': 0.0,
-                        'position_after': approved_size
-                    })
-                    
-                    # Update position history
-                    position_history.append({
-                        'timestamp': portfolio_df[self.timestamp_column].iloc[exec_idx],
-                        'position': new_position,
-                        'event_type': 'FLIP'
-                    })
-                    
-                    current_position = new_position
-                    continue
-                else:
-                    # No position to flip
-                    continue
-            else:
-                # NO_ACTION
-                event_type = "NO_ACTION"
-                new_position = current_position
-            
-            # Record event
+
+            exec_ts = portfolio_df[self.timestamp_column].iloc[exec_idx]
+            order_index = int(order["order_index"])
+
+            # ---------------------------------------------------------
+            # Case 1 — No sign reversal. Single fill in one direction.
+            # ---------------------------------------------------------
+            if (
+                (current_position >= 0 and target >= 0)
+                or (current_position <= 0 and target <= 0)
+            ):
+                side = "BUY" if delta > 0 else "SELL"
+
+                exec_price, slip_per_unit = self.apply_slippage(
+                    portfolio_df,
+                    exec_idx,
+                    side,
+                )
+
+                filled_size = abs(delta)
+                commission = self.apply_commission(filled_size, exec_price)
+                slippage_cost = slip_per_unit * filled_size
+
+                position_before = current_position
+                position_after = target
+
+                execution_events.append({
+                    "timestamp": exec_ts,
+                    "event_type": "OPEN_LONG" if side == "BUY" and current_position == 0
+                                  else "OPEN_SHORT" if side == "SELL" and current_position == 0
+                                  else "BUY" if side == "BUY"
+                                  else "SELL",
+                    "size": float(filled_size),
+                    "price": float(exec_price),
+                    "commission": float(commission),
+                    "slippage": float(slip_per_unit),
+                    "slippage_cost": float(slippage_cost),
+                    "position_before": float(position_before),
+                    "position_after": float(position_after),
+                    "order_index": order_index,
+                    "order_type": order["order_type"],
+                    "target_position": float(target),
+                    "filled": True,
+                })
+
+                position_history.append({
+                    "timestamp": exec_ts,
+                    "position": float(position_after),
+                    "event_type": (
+                        "OPEN_LONG" if side == "BUY" and position_before == 0
+                        else "OPEN_SHORT" if side == "SELL" and position_before == 0
+                        else "BUY" if side == "BUY"
+                        else "SELL"
+                    ),
+                    "position_before": float(position_before),
+                    "position_after": float(position_after),
+                    "target_position": float(target),
+                    "order_index": order_index,
+                })
+
+                current_position = position_after
+                continue
+
+            # ---------------------------------------------------------
+            # Case 2 — Sign reversal. Close then open as separate fills.
+            # ---------------------------------------------------------
+            close_size = abs(current_position)
+            open_size = abs(target)
+
+            # 2a. Close existing position.
+            close_side = "SELL" if current_position > 0 else "BUY"
+
+            close_price, close_slip_per_unit = self.apply_slippage(
+                portfolio_df,
+                exec_idx,
+                close_side,
+            )
+            close_commission = self.apply_commission(close_size, close_price)
+            close_slippage_cost = close_slip_per_unit * close_size
+
+            close_event_type = (
+                "CLOSE_LONG" if current_position > 0 else "CLOSE_SHORT"
+            )
+
+            position_before_close = current_position
+            position_after_close = 0.0
+
             execution_events.append({
-                'timestamp': portfolio_df[self.timestamp_column].iloc[exec_idx],
-                'event_type': event_type,
-                'size': approved_size,
-                'price': exec_price,
-                'commission': commission,
-                'slippage': slippage,
-                'position_before': current_position,
-                'position_after': new_position
+                "timestamp": exec_ts,
+                "event_type": close_event_type,
+                "size": float(close_size),
+                "price": float(close_price),
+                "commission": float(close_commission),
+                "slippage": float(close_slip_per_unit),
+                "slippage_cost": float(close_slippage_cost),
+                "position_before": float(position_before_close),
+                "position_after": float(position_after_close),
+                "order_index": order_index,
+                "order_type": order["order_type"],
+                "target_position": float(target),
+                "filled": True,
             })
-            
-            # Update position history
+
             position_history.append({
-                'timestamp': portfolio_df[self.timestamp_column].iloc[exec_idx],
-                'position': new_position,
-                'event_type': event_type
+                "timestamp": exec_ts,
+                "position": float(position_after_close),
+                "event_type": close_event_type,
+                "position_before": float(position_before_close),
+                "position_after": float(position_after_close),
+                "target_position": float(target),
+                "order_index": order_index,
             })
-            
-            current_position = new_position
-        
-        # Build execution events DataFrame
-        events_df = pd.DataFrame(execution_events)
-        history_df = pd.DataFrame(position_history)
-        
+
+            # 2b. Open the new position.
+            open_side = "BUY" if target > 0 else "SELL"
+
+            open_price, open_slip_per_unit = self.apply_slippage(
+                portfolio_df,
+                exec_idx,
+                open_side,
+            )
+            open_commission = self.apply_commission(open_size, open_price)
+            open_slippage_cost = open_slip_per_unit * open_size
+
+            open_event_type = (
+                "OPEN_LONG" if target > 0 else "OPEN_SHORT"
+            )
+
+            position_before_open = 0.0
+            position_after_open = target
+
+            execution_events.append({
+                "timestamp": exec_ts,
+                "event_type": open_event_type,
+                "size": float(open_size),
+                "price": float(open_price),
+                "commission": float(open_commission),
+                "slippage": float(open_slip_per_unit),
+                "slippage_cost": float(open_slippage_cost),
+                "position_before": float(position_before_open),
+                "position_after": float(position_after_open),
+                "order_index": order_index,
+                "order_type": order["order_type"],
+                "target_position": float(target),
+                "filled": True,
+            })
+
+            position_history.append({
+                "timestamp": exec_ts,
+                "position": float(position_after_open),
+                "event_type": open_event_type,
+                "position_before": float(position_before_open),
+                "position_after": float(position_after_open),
+                "target_position": float(target),
+                "order_index": order_index,
+            })
+
+            current_position = position_after_open
+
+        events_df = pd.DataFrame(
+            execution_events,
+            columns=event_columns,
+        )
+        history_df = pd.DataFrame(
+            position_history,
+            columns=history_columns,
+        )
+
         return events_df, history_df
 
+    # ------------------------------------------------------------------
+    # Fix F — build_trade_log (FIFO partial-close matching)
+    # ------------------------------------------------------------------
     def build_trade_log(
         self,
         execution_events: pd.DataFrame,
-        portfolio_df: pd.DataFrame
+        portfolio_df: pd.DataFrame,
     ) -> pd.DataFrame:
         """
-        Build complete trade log from execution events.
-        """
-        if execution_events.empty:
-            return pd.DataFrame()
-        
-        trades = []
-        open_trades = []
-        trade_id = 0
-        
-        for _, event in execution_events.iterrows():
-            event_type = event['event_type']
-            
-            if event_type in ['OPEN_LONG', 'OPEN_SHORT', 'BUY', 'SHORT']:
-                # Open a new trade
-                open_trades.append({
-                    'trade_id': trade_id,
-                    'entry_time': event['timestamp'],
-                    'entry_price': event['price'],
-                    'direction': 'LONG' if event_type in ['OPEN_LONG', 'BUY'] else 'SHORT',
-                    'size': event['size'],
-                    'entry_commission': event['commission'],
-                    'entry_slippage': event['slippage']
-                })
-                trade_id += 1
-            
-            elif event_type in ['CLOSE_LONG', 'CLOSE_SHORT', 'SELL', 'COVER']:
-                # Close the most recent open trade (FIFO)
-                if open_trades:
-                    open_trade = open_trades.pop(0)
-                    
-                    # Calculate holding period
-                    holding_bars = len(portfolio_df[
-                        (portfolio_df[self.timestamp_column] >= open_trade['entry_time']) &
-                        (portfolio_df[self.timestamp_column] <= event['timestamp'])
-                    ])
-                    
-                    # FIXED: Exit reason depends on the trade being closed,
-                    # not on the raw execution event.
-                    if open_trade["direction"] == "LONG":
-                        exit_reason = "SELL"
-                    else:
-                        exit_reason = "COVER"
-                    
-                    trades.append({
-                        'trade_id': open_trade['trade_id'],
-                        'entry_time': open_trade['entry_time'],
-                        'exit_time': event['timestamp'],
-                        'direction': open_trade['direction'],
-                        'entry_price': open_trade['entry_price'],
-                        'exit_price': event['price'],
-                        'requested_size': open_trade['size'],
-                        'executed_size': open_trade['size'],
-                        'entry_commission': open_trade['entry_commission'],
-                        'exit_commission': event['commission'],
-                        'total_commission': open_trade['entry_commission'] + event['commission'],
-                        'entry_slippage': open_trade['entry_slippage'],
-                        'exit_slippage': event['slippage'],
-                        'total_slippage': open_trade['entry_slippage'] + event['slippage'],
-                        'holding_bars': holding_bars,
-                        'exit_reason': exit_reason
-                    })
-        
-        # DEBUG: Verify exit_reason matches direction
-        trade_log = pd.DataFrame(trades)
-        
-        print("\nDEBUG")
-        if not trade_log.empty and 'direction' in trade_log.columns and 'exit_reason' in trade_log.columns:
-            print(
-                trade_log[
-                    ["trade_id", "direction", "exit_reason"]
-                ]
-            )
-        
-        return trade_log
+        Create one closed-trade row for each matched, closed quantity.
 
+        Partial exits produce multiple rows linked by parent_trade_id.
+        Remaining positions at the end are kept separately as open lots.
+        """
+        trade_columns = [
+            "trade_id",
+            "parent_trade_id",
+            "entry_time",
+            "exit_time",
+            "direction",
+            "entry_price",
+            "exit_price",
+            "requested_size",
+            "executed_size",
+            "entry_commission",
+            "exit_commission",
+            "total_commission",
+            "entry_slippage",
+            "exit_slippage",
+            "total_slippage",
+            "holding_bars",
+            "exit_reason",
+        ]
+
+        if execution_events.empty:
+            self.open_positions_at_end = pd.DataFrame()
+            return pd.DataFrame(columns=trade_columns)
+
+        timestamps = pd.to_datetime(
+            portfolio_df[self.timestamp_column]
+        ).reset_index(drop=True)
+
+        ts_to_index = {ts: i for i, ts in enumerate(timestamps)}
+
+        # Open lots waiting to be closed.
+        open_lots: List[Dict[str, Any]] = []
+
+        closed_trades: List[Dict[str, Any]] = []
+
+        next_lot_id = 0
+        next_trade_id = 0
+
+        epsilon = 1e-9
+
+        # We iterate events in chronological order as produced by execute_orders.
+        for _, event in execution_events.iterrows():
+            event_type = event["event_type"]
+
+            if event_type in (
+                "OPEN_LONG",
+                "OPEN_SHORT",
+            ):
+                direction = (
+                    "LONG" if event_type == "OPEN_LONG" else "SHORT"
+                )
+
+                open_lots.append({
+                    "lot_id": next_lot_id,
+                    "entry_time": event["timestamp"],
+                    "entry_price": float(event["price"]),
+                    "direction": direction,
+                    "remaining": float(event["size"]),
+                    "entry_slippage_per_unit": float(event.get("slippage", 0.0)),
+                    "entry_slippage_total": float(
+                        event.get("slippage_cost", 0.0)
+                    ),
+                    "entry_commission_total": float(
+                        event.get("commission", 0.0)
+                    ),
+                })
+
+                next_lot_id += 1
+                continue
+
+            if event_type in (
+                "CLOSE_LONG",
+                "CLOSE_SHORT",
+            ):
+                close_direction = (
+                    "LONG" if event_type == "CLOSE_LONG" else "SHORT"
+                )
+
+                close_size = float(event["size"])
+                close_price = float(event["price"])
+                close_commission_total = float(event.get("commission", 0.0))
+                close_slippage_total = float(event.get("slippage_cost", 0.0))
+                exit_time = event["timestamp"]
+
+                remaining_to_close = close_size
+
+                # We iterate open lots in insertion order (FIFO).
+                for lot in open_lots:
+                    if remaining_to_close <= epsilon:
+                        break
+
+                    if lot["remaining"] <= epsilon:
+                        continue
+
+                    if lot["direction"] != close_direction:
+                        continue
+
+                    match_size = min(lot["remaining"], remaining_to_close)
+
+                    if match_size <= epsilon:
+                        continue
+
+                    # Allocate a proportional share of costs.
+                    fraction_of_lot = match_size / lot["remaining"]
+
+                    entry_commission = (
+                        lot["entry_commission_total"] * fraction_of_lot
+                    )
+                    entry_slippage = (
+                        lot["entry_slippage_total"] * fraction_of_lot
+                    )
+                    entry_slippage_per_unit = (
+                        lot["entry_slippage_per_unit"]
+                    )
+
+                    exit_commission = (
+                        close_commission_total
+                        * (match_size / close_size)
+                    )
+                    exit_slippage = (
+                        close_slippage_total
+                        * (match_size / close_size)
+                    )
+
+                    # Holding bars from entry_time to exit_time.
+                    entry_ts = pd.to_datetime(lot["entry_time"])
+                    exit_ts = pd.to_datetime(exit_time)
+
+                    entry_idx = ts_to_index.get(entry_ts)
+                    exit_idx = ts_to_index.get(exit_ts)
+
+                    if entry_idx is not None and exit_idx is not None:
+                        holding_bars = int(exit_idx - entry_idx)
+                    else:
+                        holding_bars = int(
+                            timestamps[
+                                (timestamps >= entry_ts)
+                                & (timestamps <= exit_ts)
+                            ].shape[0]
+                        )
+
+                    exit_reason = (
+                        "SELL" if close_direction == "LONG" else "COVER"
+                    )
+
+                    closed_trades.append({
+                        "trade_id": next_trade_id,
+                        "parent_trade_id": lot["lot_id"],
+                        "entry_time": lot["entry_time"],
+                        "exit_time": exit_time,
+                        "direction": lot["direction"],
+                        "entry_price": lot["entry_price"],
+                        "exit_price": close_price,
+                        "requested_size": float(match_size),
+                        "executed_size": float(match_size),
+                        "entry_commission": float(entry_commission),
+                        "exit_commission": float(exit_commission),
+                        "total_commission": float(
+                            entry_commission + exit_commission
+                        ),
+                        "entry_slippage": float(
+                            entry_slippage_per_unit * match_size
+                        ),
+                        "exit_slippage": float(exit_slippage),
+                        "total_slippage": float(
+                            entry_slippage_per_unit * match_size
+                            + exit_slippage
+                        ),
+                        "holding_bars": int(holding_bars),
+                        "exit_reason": exit_reason,
+                    })
+
+                    next_trade_id += 1
+
+                    lot["remaining"] -= match_size
+                    remaining_to_close -= match_size
+
+                if remaining_to_close > epsilon:
+                    raise ValueError(
+                        "Execution events attempted to close "
+                        f"{remaining_to_close:.6f} units that were never opened."
+                    )
+
+        # Any lots still remaining are open positions at the end.
+        open_rows: List[Dict[str, Any]] = []
+        for lot in open_lots:
+            if lot["remaining"] > epsilon:
+                open_rows.append({
+                    "lot_id": lot["lot_id"],
+                    "entry_time": lot["entry_time"],
+                    "entry_price": lot["entry_price"],
+                    "direction": lot["direction"],
+                    "remaining_size": float(lot["remaining"]),
+                })
+
+        self.open_positions_at_end = pd.DataFrame(
+            open_rows,
+            columns=[
+                "lot_id",
+                "entry_time",
+                "entry_price",
+                "direction",
+                "remaining_size",
+            ],
+        )
+
+        return pd.DataFrame(closed_trades, columns=trade_columns)
+
+    # ------------------------------------------------------------------
+    # Fix G — compute_statistics (based on actual fills)
+    # ------------------------------------------------------------------
     def compute_statistics(
         self,
         trade_log: pd.DataFrame,
-        execution_events: pd.DataFrame
+        execution_events: pd.DataFrame,
     ) -> Dict[str, Any]:
-        """
-        Compute execution statistics.
-        """
+        """Calculate execution statistics from actual fills."""
+        events = execution_events.copy()
+
+        if events.empty:
+            fill_events = events.copy()
+        elif "filled" in events.columns:
+            fill_events = events[events["filled"] == True].copy()
+        else:
+            fill_events = events[
+                events["event_type"] != "NO_ACTION"
+            ].copy()
+
+        orders_generated = int(
+            getattr(
+                self,
+                "_orders_generated_count",
+                events["order_index"].nunique()
+                if "order_index" in events.columns and not events.empty
+                else len(events),
+            )
+        )
+
+        orders_executed = int(len(fill_events))
+
+        execution_rate = (
+            orders_executed / orders_generated
+            if orders_generated > 0
+            else 0.0
+        )
+
+        # Total commission from actual fills, not only closed trades.
+        if "commission" in fill_events.columns and not fill_events.empty:
+            total_commission = float(fill_events["commission"].sum())
+        else:
+            total_commission = 0.0
+
+        # Total slippage cost from actual fills.
+        if "slippage_cost" in fill_events.columns and not fill_events.empty:
+            total_slippage_cost = float(fill_events["slippage_cost"].sum())
+        else:
+            total_slippage_cost = 0.0
+
+        # Trade-level stats derived from the closed trade log.
         if trade_log.empty:
-            return {
-                'orders_generated': 0,
-                'orders_executed': 0,
-                'long_trades': 0,
-                'short_trades': 0,
-                'average_holding_bars': 0,
-                'average_slippage': 0,
-                'total_commission': 0,
-                'execution_rate': 0,
-                'cancelled_orders': 0,
-                'execution_delay': 0,
-                'average_executed_size': 0,
-                'total_events': 0
-            }
-        
-        total_orders = len(execution_events)
-        total_trades = len(trade_log)
-        long_trades = len(trade_log[trade_log['direction'] == 'LONG'])
-        short_trades = len(trade_log[trade_log['direction'] == 'SHORT'])
-        
-        # FIXED: Every completed trade requires two execution events (entry + exit)
-        orders_executed = 2 * total_trades
-        execution_rate = orders_executed / total_orders if total_orders > 0 else 0
-        
+            long_trades = 0
+            short_trades = 0
+            average_holding_bars = 0.0
+            average_executed_size = 0.0
+        else:
+            long_trades = int(
+                (trade_log["direction"] == "LONG").sum()
+            )
+            short_trades = int(
+                (trade_log["direction"] == "SHORT").sum()
+            )
+            average_holding_bars = float(
+                trade_log["holding_bars"].mean()
+            )
+            average_executed_size = float(
+                trade_log["executed_size"].mean()
+            )
+
+        unexecuted_count = int(len(self.unexecuted_orders_at_end))
+        open_positions_count = int(len(self.open_positions_at_end))
+
         stats = {
-            'orders_generated': int(total_orders),
-            'orders_executed': int(orders_executed),
-            'long_trades': int(long_trades),
-            'short_trades': int(short_trades),
-            'average_holding_bars': float(trade_log['holding_bars'].mean()),
-            'average_slippage': float(trade_log['total_slippage'].mean()),
-            'total_commission': float(trade_log['total_commission'].sum()),
-            'execution_rate': float(execution_rate),
-            'cancelled_orders': int(total_orders - orders_executed),
-            'execution_delay': 0,  # Placeholder
-            'average_executed_size': float(trade_log['executed_size'].mean()),
-            'total_events': int(total_orders)
+            "orders_generated": int(orders_generated),
+            "orders_executed": int(orders_executed),
+            "long_trades": int(long_trades),
+            "short_trades": int(short_trades),
+            "average_holding_bars": float(average_holding_bars),
+            "average_slippage": float(
+                total_slippage_cost / orders_executed
+                if orders_executed > 0
+                else 0.0
+            ),
+            "total_commission": float(total_commission),
+            "total_slippage_cost": float(total_slippage_cost),
+            "execution_rate": float(execution_rate),
+            "cancelled_orders": 0,
+            "unexecuted_orders": int(unexecuted_count),
+            "open_positions_at_end": int(open_positions_count),
+            "execution_delay": int(self.config.latency_bars),
+            "average_executed_size": float(average_executed_size),
+            "total_events": int(len(fill_events)),
         }
-        
+
         return stats
 
     def save_outputs(
@@ -602,6 +962,32 @@ class ExecutionSimulationEngine:
         print("\n  Saving outputs...")
         self.save_outputs(
             trade_log, execution_events, position_history, stats, output_dir
+        )
+
+        # ------------------------------------------------------------------
+        # Fix H — Export positions still open and unexecuted orders
+        # ------------------------------------------------------------------
+
+        # Export positions still open at the end of the data window.
+        open_positions = getattr(
+            self,
+            "open_positions_at_end",
+            pd.DataFrame(),
+        )
+        open_positions.to_csv(
+            Path(output_dir) / "open_positions_at_end.csv",
+            index=False,
+        )
+
+        # Export orders whose latency pushed their execution beyond the dataset.
+        unexecuted = getattr(
+            self,
+            "unexecuted_orders_at_end",
+            pd.DataFrame(),
+        )
+        unexecuted.to_csv(
+            Path(output_dir) / "unexecuted_orders_at_end.csv",
+            index=False,
         )
         
         print(f"\n  Execution Summary:")
