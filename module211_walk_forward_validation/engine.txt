@@ -16,7 +16,7 @@ import pandas as pd
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, List, Tuple
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -30,6 +30,10 @@ class WalkForwardConfig:
     minimum_trades: int = 30
     overlap: bool = False
     max_windows: Optional[int] = None
+    # Calendar-based windowing (used when set)
+    train_window_days: Optional[int] = None
+    test_window_days: Optional[int] = None
+    step_days: Optional[int] = None
 
 
 @dataclass
@@ -110,48 +114,120 @@ class WalkForwardEngine:
         
         return df
 
-    def generate_windows(self, data: pd.DataFrame) -> List[Tuple[int, int, int, int]]:
+    def generate_windows(
+        self,
+        data: pd.DataFrame
+    ) -> List[Tuple[int, int, int, int]]:
         """
-        Generate walk-forward windows.
-        
+        Generate walk-forward windows based on calendar time.
+
+        Windows are defined by timestamps, not row counts. The row indices
+        returned here are derived from those timestamp boundaries so that
+        downstream slicing continues to work.
+
         Returns:
             List of (train_start_idx, train_end_idx, test_start_idx, test_end_idx)
         """
         n = len(data)
-        train_size = self.config.train_window_bars
-        test_size = self.config.test_window_bars
-        step = self.config.step_size
-        
-        windows = []
-        train_start = 0
-        
-        window_id = 0
-        
+
+        if n == 0:
+            return []
+
+        # Resolve the time column to use for windowing.
+        if self.exit_time_column in data.columns:
+            time_col = self.exit_time_column
+        elif self.entry_time_column in data.columns:
+            time_col = self.entry_time_column
+        elif self.timestamp_column in data.columns:
+            time_col = self.timestamp_column
+        else:
+            raise ValueError(
+                "No usable time column found for calendar-based windowing."
+            )
+
+        times = pd.to_datetime(data[time_col]).reset_index(drop=True)
+
+        # Resolve calendar window sizes. Fall back to bar counts if not set.
+        train_days = self.config.train_window_days
+        test_days = self.config.test_window_days
+        step_days = self.config.step_days
+
+        if train_days is None or test_days is None:
+            raise ValueError(
+                "Calendar-based windowing requires train_window_days and "
+                "test_window_days to be set in WalkForwardConfig."
+            )
+
+        if step_days is None:
+            step_days = test_days
+
+        train_delta = pd.Timedelta(days=train_days)
+        test_delta = pd.Timedelta(days=test_days)
+        step_delta = pd.Timedelta(days=step_days)
+
+        data_start = times.iloc[0]
+        data_end = times.iloc[-1]
+
+        windows: List[Tuple[int, int, int, int]] = []
+
+        # Anchor the first training window at the start of the data.
+        train_start_ts = data_start
+
         while True:
-            train_end = train_start + train_size
-            test_start = train_end
-            test_end = min(test_start + test_size, n)
-            
-            # Check if we have enough data
-            if test_start >= n or test_end <= test_start:
+            train_end_ts = train_start_ts + train_delta
+            test_start_ts = train_end_ts
+            test_end_ts = test_start_ts + test_delta
+
+            # Stop once the test window would run past the data.
+            if test_start_ts >= data_end:
                 break
-            
-            # Check minimum data requirements
-            if train_end - train_start < train_size * 0.5:
+            if test_end_ts > data_end:
+                test_end_ts = data_end
+
+            # Locate row indices for these timestamp boundaries.
+            # searchsorted gives the insertion point; we clamp to [0, n].
+            train_start_idx = int(
+                np.searchsorted(times.values, np.datetime64(train_start_ts), side="left")
+            )
+            train_end_idx = int(
+                np.searchsorted(times.values, np.datetime64(train_end_ts), side="left")
+            )
+            test_start_idx = int(
+                np.searchsorted(times.values, np.datetime64(test_start_ts), side="left")
+            )
+            test_end_idx = int(
+                np.searchsorted(times.values, np.datetime64(test_end_ts), side="right")
+            )
+
+            # Clamp to valid range.
+            train_start_idx = max(0, min(train_start_idx, n))
+            train_end_idx = max(0, min(train_end_idx, n))
+            test_start_idx = max(0, min(test_start_idx, n))
+            test_end_idx = max(0, min(test_end_idx, n))
+
+            # Ensure the training window has content.
+            if train_end_idx <= train_start_idx:
+                train_start_ts = train_start_ts + step_delta
+                continue
+
+            # Ensure the test window has content.
+            if test_end_idx <= test_start_idx:
                 break
-            
-            windows.append((train_start, train_end, test_start, test_end))
-            
-            # Move window forward
+
+            windows.append(
+                (train_start_idx, train_end_idx, test_start_idx, test_end_idx)
+            )
+
+            # Advance the anchor forward.
             if self.config.overlap:
-                train_start += step // 2
+                train_start_ts = train_start_ts + (step_delta / 2)
             else:
-                train_start += step
-            
-            # Check max windows
+                train_start_ts = train_start_ts + step_delta
+
+            # Check max windows.
             if self.config.max_windows and len(windows) >= self.config.max_windows:
                 break
-        
+
         return windows
 
     def compute_window_metrics(
@@ -290,9 +366,14 @@ class WalkForwardEngine:
         Run complete walk-forward validation.
         """
         print("\n  Running Walk-Forward Validation...")
-        print(f"  Train Window: {self.config.train_window_bars} bars")
-        print(f"  Test Window: {self.config.test_window_bars} bars")
-        print(f"  Step Size: {self.config.step_size} bars")
+        if self.config.train_window_days is not None:
+            print(f"  Train Window: {self.config.train_window_days} days")
+            print(f"  Test Window: {self.config.test_window_days} days")
+            print(f"  Step Size: {self.config.step_days or self.config.test_window_days} days")
+        else:
+            print(f"  Train Window: {self.config.train_window_bars} bars")
+            print(f"  Test Window: {self.config.test_window_bars} bars")
+            print(f"  Step Size: {self.config.step_size} bars")
         print(f"  Minimum Trades: {self.config.minimum_trades}")
         
         # Sort by exit time (stable, deterministic ordering)
