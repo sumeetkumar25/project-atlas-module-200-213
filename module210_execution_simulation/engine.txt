@@ -562,7 +562,7 @@ class ExecutionSimulationEngine:
         return events_df, history_df
 
     # ------------------------------------------------------------------
-    # Fix F — build_trade_log (FIFO partial-close matching)
+    # build_trade_log — signed-position-transition classifier
     # ------------------------------------------------------------------
     def build_trade_log(
         self,
@@ -570,11 +570,18 @@ class ExecutionSimulationEngine:
         portfolio_df: pd.DataFrame,
     ) -> pd.DataFrame:
         """
-        Create one closed-trade row for each matched, closed quantity.
+        Build closed trade records from actual signed position transitions.
 
-        Partial exits produce multiple rows linked by parent_trade_id.
-        Remaining positions at the end are kept separately as open lots.
+        BUY/SELL are treated as execution sides, not as proof of whether
+        a trade is opening or closing.
+
+        Position increases create lots. Position reductions close lots
+        FIFO. Remaining quantities are exported as open positions.
         """
+        from collections import deque
+
+        epsilon = 1e-10
+
         trade_columns = [
             "trade_id",
             "parent_trade_id",
@@ -596,7 +603,15 @@ class ExecutionSimulationEngine:
         ]
 
         if execution_events.empty:
-            self.open_positions_at_end = pd.DataFrame()
+            self.open_positions_at_end = pd.DataFrame(
+                columns=[
+                    "lot_id",
+                    "entry_time",
+                    "entry_price",
+                    "direction",
+                    "remaining_size",
+                ]
+            )
             return pd.DataFrame(columns=trade_columns)
 
         timestamps = pd.to_datetime(
@@ -605,162 +620,209 @@ class ExecutionSimulationEngine:
 
         ts_to_index = {ts: i for i, ts in enumerate(timestamps)}
 
-        # Open lots waiting to be closed.
-        open_lots: List[Dict[str, Any]] = []
+        # FIFO queues of open lots, keyed by direction.
+        long_lots: "deque[Dict[str, Any]]" = deque()
+        short_lots: "deque[Dict[str, Any]]" = deque()
 
         closed_trades: List[Dict[str, Any]] = []
 
         next_lot_id = 0
         next_trade_id = 0
 
-        epsilon = 1e-9
-
-        # We iterate events in chronological order as produced by execute_orders.
         for _, event in execution_events.iterrows():
             event_type = event["event_type"]
 
-            if event_type in (
-                "OPEN_LONG",
-                "OPEN_SHORT",
-            ):
-                direction = (
-                    "LONG" if event_type == "OPEN_LONG" else "SHORT"
-                )
+            if event_type == "NO_ACTION":
+                continue
 
-                open_lots.append({
+            size = float(event["size"])
+            if size <= epsilon:
+                continue
+
+            before = float(event["position_before"])
+            after = float(event["position_after"])
+
+            if abs(after - before) <= epsilon:
+                # No actual position change; skip.
+                continue
+
+            price = float(event["price"])
+            entry_time = event["timestamp"]
+            commission = float(event.get("commission", 0.0) or 0.0)
+            slippage_cost = float(event.get("slippage_cost", 0.0) or 0.0)
+            slippage_per_unit = (
+                slippage_cost / size if size > epsilon else 0.0
+            )
+
+            delta = after - before
+
+            # ----------------------------------------------------------
+            # Case 1: Position moved AWAY from zero in the same direction.
+            # This is an OPEN or an ADD to the existing side.
+            # ----------------------------------------------------------
+            if (before >= 0 and after >= 0 and delta > 0) or (
+                before <= 0 and after <= 0 and delta < 0
+            ):
+                direction = "LONG" if delta > 0 else "SHORT"
+
+                lot = {
                     "lot_id": next_lot_id,
-                    "entry_time": event["timestamp"],
-                    "entry_price": float(event["price"]),
+                    "entry_time": entry_time,
+                    "entry_price": price,
                     "direction": direction,
-                    "remaining": float(event["size"]),
-                    "entry_slippage_per_unit": float(event.get("slippage", 0.0)),
-                    "entry_slippage_total": float(
-                        event.get("slippage_cost", 0.0)
-                    ),
-                    "entry_commission_total": float(
-                        event.get("commission", 0.0)
-                    ),
-                })
+                    "remaining": size,
+                    "entry_commission_total": commission,
+                    "entry_slippage_total": slippage_cost,
+                    "entry_slippage_per_unit": slippage_per_unit,
+                }
+
+                if direction == "LONG":
+                    long_lots.append(lot)
+                else:
+                    short_lots.append(lot)
 
                 next_lot_id += 1
                 continue
 
-            if event_type in (
-                "CLOSE_LONG",
-                "CLOSE_SHORT",
-            ):
-                close_direction = (
-                    "LONG" if event_type == "CLOSE_LONG" else "SHORT"
+            # ----------------------------------------------------------
+            # Case 2: Position moved TOWARD zero (partial or full close)
+            # or crossed zero (reversal).
+            #
+            # Any reduction of the same side is matched FIFO against the
+            # open lots of that side. A reversal therefore naturally
+            # produces a close followed by an open, without relying on
+            # the event label.
+            # ----------------------------------------------------------
+            if before > 0 and after >= 0 and delta < 0:
+                # LONG close (possibly partial).
+                self._consume_lots(
+                    side_lots=long_lots,
+                    close_size=abs(delta),
+                    close_price=price,
+                    exit_time=entry_time,
+                    exit_commission=commission,
+                    exit_slippage=slippage_cost,
+                    close_direction="LONG",
+                    exit_reason="SELL",
+                    ts_to_index=ts_to_index,
+                    timestamps=timestamps,
+                    closed_trades=closed_trades,
+                    next_trade_id_ref=[next_trade_id],
                 )
+                # Advance the trade id counter using whatever the helper wrote.
+                next_trade_id = len(closed_trades)
+                continue
 
-                close_size = float(event["size"])
-                close_price = float(event["price"])
-                close_commission_total = float(event.get("commission", 0.0))
-                close_slippage_total = float(event.get("slippage_cost", 0.0))
-                exit_time = event["timestamp"]
+            if before < 0 and after <= 0 and delta > 0:
+                # SHORT close (possibly partial).
+                self._consume_lots(
+                    side_lots=short_lots,
+                    close_size=abs(delta),
+                    close_price=price,
+                    exit_time=entry_time,
+                    exit_commission=commission,
+                    exit_slippage=slippage_cost,
+                    close_direction="SHORT",
+                    exit_reason="COVER",
+                    ts_to_index=ts_to_index,
+                    timestamps=timestamps,
+                    closed_trades=closed_trades,
+                    next_trade_id_ref=[next_trade_id],
+                )
+                next_trade_id = len(closed_trades)
+                continue
 
-                remaining_to_close = close_size
+            # ----------------------------------------------------------
+            # Case 3: Sign reversal. The previous side is fully closed
+            # and the opposite side is opened. We use the actual event
+            # quantities rather than the label.
+            # ----------------------------------------------------------
+            if before > 0 and after < 0:
+                # Close the existing long fully.
+                self._consume_lots(
+                    side_lots=long_lots,
+                    close_size=abs(before),
+                    close_price=price,
+                    exit_time=entry_time,
+                    exit_commission=commission,
+                    exit_slippage=slippage_cost,
+                    close_direction="LONG",
+                    exit_reason="SELL",
+                    ts_to_index=ts_to_index,
+                    timestamps=timestamps,
+                    closed_trades=closed_trades,
+                    next_trade_id_ref=[next_trade_id],
+                )
+                next_trade_id = len(closed_trades)
 
-                # We iterate open lots in insertion order (FIFO).
-                for lot in open_lots:
-                    if remaining_to_close <= epsilon:
-                        break
+                # Open a new short for the residual size.
+                open_size = abs(after)
+                if open_size > epsilon:
+                    lot = {
+                        "lot_id": next_lot_id,
+                        "entry_time": entry_time,
+                        "entry_price": price,
+                        "direction": "SHORT",
+                        "remaining": open_size,
+                        "entry_commission_total": 0.0,
+                        "entry_slippage_total": 0.0,
+                        "entry_slippage_per_unit": 0.0,
+                    }
+                    short_lots.append(lot)
+                    next_lot_id += 1
+                continue
 
-                    if lot["remaining"] <= epsilon:
-                        continue
+            if before < 0 and after > 0:
+                # Close the existing short fully.
+                self._consume_lots(
+                    side_lots=short_lots,
+                    close_size=abs(before),
+                    close_price=price,
+                    exit_time=entry_time,
+                    exit_commission=commission,
+                    exit_slippage=slippage_cost,
+                    close_direction="SHORT",
+                    exit_reason="COVER",
+                    ts_to_index=ts_to_index,
+                    timestamps=timestamps,
+                    closed_trades=closed_trades,
+                    next_trade_id_ref=[next_trade_id],
+                )
+                next_trade_id = len(closed_trades)
 
-                    if lot["direction"] != close_direction:
-                        continue
+                # Open a new long for the residual size.
+                open_size = abs(after)
+                if open_size > epsilon:
+                    lot = {
+                        "lot_id": next_lot_id,
+                        "entry_time": entry_time,
+                        "entry_price": price,
+                        "direction": "LONG",
+                        "remaining": open_size,
+                        "entry_commission_total": 0.0,
+                        "entry_slippage_total": 0.0,
+                        "entry_slippage_per_unit": 0.0,
+                    }
+                    long_lots.append(lot)
+                    next_lot_id += 1
+                continue
 
-                    match_size = min(lot["remaining"], remaining_to_close)
+            # Any other combination (e.g., zero-to-zero) is not a trade.
 
-                    if match_size <= epsilon:
-                        continue
-
-                    # Allocate a proportional share of costs.
-                    fraction_of_lot = match_size / lot["remaining"]
-
-                    entry_commission = (
-                        lot["entry_commission_total"] * fraction_of_lot
-                    )
-                    entry_slippage = (
-                        lot["entry_slippage_total"] * fraction_of_lot
-                    )
-                    entry_slippage_per_unit = (
-                        lot["entry_slippage_per_unit"]
-                    )
-
-                    exit_commission = (
-                        close_commission_total
-                        * (match_size / close_size)
-                    )
-                    exit_slippage = (
-                        close_slippage_total
-                        * (match_size / close_size)
-                    )
-
-                    # Holding bars from entry_time to exit_time.
-                    entry_ts = pd.to_datetime(lot["entry_time"])
-                    exit_ts = pd.to_datetime(exit_time)
-
-                    entry_idx = ts_to_index.get(entry_ts)
-                    exit_idx = ts_to_index.get(exit_ts)
-
-                    if entry_idx is not None and exit_idx is not None:
-                        holding_bars = int(exit_idx - entry_idx)
-                    else:
-                        holding_bars = int(
-                            timestamps[
-                                (timestamps >= entry_ts)
-                                & (timestamps <= exit_ts)
-                            ].shape[0]
-                        )
-
-                    exit_reason = (
-                        "SELL" if close_direction == "LONG" else "COVER"
-                    )
-
-                    closed_trades.append({
-                        "trade_id": next_trade_id,
-                        "parent_trade_id": lot["lot_id"],
-                        "entry_time": lot["entry_time"],
-                        "exit_time": exit_time,
-                        "direction": lot["direction"],
-                        "entry_price": lot["entry_price"],
-                        "exit_price": close_price,
-                        "requested_size": float(match_size),
-                        "executed_size": float(match_size),
-                        "entry_commission": float(entry_commission),
-                        "exit_commission": float(exit_commission),
-                        "total_commission": float(
-                            entry_commission + exit_commission
-                        ),
-                        "entry_slippage": float(
-                            entry_slippage_per_unit * match_size
-                        ),
-                        "exit_slippage": float(exit_slippage),
-                        "total_slippage": float(
-                            entry_slippage_per_unit * match_size
-                            + exit_slippage
-                        ),
-                        "holding_bars": int(holding_bars),
-                        "exit_reason": exit_reason,
-                    })
-
-                    next_trade_id += 1
-
-                    lot["remaining"] -= match_size
-                    remaining_to_close -= match_size
-
-                if remaining_to_close > epsilon:
-                    raise ValueError(
-                        "Execution events attempted to close "
-                        f"{remaining_to_close:.6f} units that were never opened."
-                    )
-
-        # Any lots still remaining are open positions at the end.
+        # Remaining lots are open positions at the end.
         open_rows: List[Dict[str, Any]] = []
-        for lot in open_lots:
+
+        for lot in long_lots:
+            if lot["remaining"] > epsilon:
+                open_rows.append({
+                    "lot_id": lot["lot_id"],
+                    "entry_time": lot["entry_time"],
+                    "entry_price": lot["entry_price"],
+                    "direction": lot["direction"],
+                    "remaining_size": float(lot["remaining"]),
+                })
+
+        for lot in short_lots:
             if lot["remaining"] > epsilon:
                 open_rows.append({
                     "lot_id": lot["lot_id"],
@@ -784,24 +846,155 @@ class ExecutionSimulationEngine:
         return pd.DataFrame(closed_trades, columns=trade_columns)
 
     # ------------------------------------------------------------------
-    # Fix G — compute_statistics (based on actual fills)
+    # Helper: FIFO consume from a lot queue
+    # ------------------------------------------------------------------
+    def _consume_lots(
+        self,
+        side_lots,
+        close_size: float,
+        close_price: float,
+        exit_time,
+        exit_commission: float,
+        exit_slippage: float,
+        close_direction: str,
+        exit_reason: str,
+        ts_to_index: Dict[Any, int],
+        timestamps: pd.Series,
+        closed_trades: List[Dict[str, Any]],
+        next_trade_id_ref: List[int],
+    ) -> None:
+        """Match a close quantity against the oldest open lots FIFO."""
+        epsilon = 1e-10
+
+        remaining_to_close = float(close_size)
+        total_close_size = float(close_size) if close_size > 0 else 1.0
+
+        while remaining_to_close > epsilon and side_lots:
+            lot = side_lots[0]
+
+            if lot["remaining"] <= epsilon:
+                side_lots.popleft()
+                continue
+
+            match_size = min(lot["remaining"], remaining_to_close)
+
+            if match_size <= epsilon:
+                side_lots.popleft()
+                continue
+
+            fraction_of_lot = match_size / lot["remaining"]
+            fraction_of_close = match_size / total_close_size
+
+            entry_commission = (
+                lot["entry_commission_total"] * fraction_of_lot
+            )
+            entry_slippage = (
+                lot["entry_slippage_total"] * fraction_of_lot
+            )
+            entry_slippage_per_unit = lot["entry_slippage_per_unit"]
+
+            allocated_exit_commission = (
+                exit_commission * fraction_of_close
+            )
+            allocated_exit_slippage = (
+                exit_slippage * fraction_of_close
+            )
+
+            entry_ts = pd.to_datetime(lot["entry_time"])
+            exit_ts = pd.to_datetime(exit_time)
+
+            entry_idx = ts_to_index.get(entry_ts)
+            exit_idx = ts_to_index.get(exit_ts)
+
+            if entry_idx is not None and exit_idx is not None:
+                holding_bars = int(exit_idx - entry_idx)
+            else:
+                holding_bars = int(
+                    timestamps[
+                        (timestamps >= entry_ts)
+                        & (timestamps <= exit_ts)
+                    ].shape[0]
+                )
+
+            trade_id = len(closed_trades)
+
+            closed_trades.append({
+                "trade_id": trade_id,
+                "parent_trade_id": lot["lot_id"],
+                "entry_time": lot["entry_time"],
+                "exit_time": exit_time,
+                "direction": lot["direction"],
+                "entry_price": lot["entry_price"],
+                "exit_price": float(close_price),
+                "requested_size": float(match_size),
+                "executed_size": float(match_size),
+                "entry_commission": float(entry_commission),
+                "exit_commission": float(allocated_exit_commission),
+                "total_commission": float(
+                    entry_commission + allocated_exit_commission
+                ),
+                "entry_slippage": float(
+                    entry_slippage_per_unit * match_size
+                ),
+                "exit_slippage": float(allocated_exit_slippage),
+                "total_slippage": float(
+                    entry_slippage_per_unit * match_size
+                    + allocated_exit_slippage
+                ),
+                "holding_bars": int(holding_bars),
+                "exit_reason": exit_reason,
+            })
+
+            lot["remaining"] -= match_size
+            remaining_to_close -= match_size
+
+            if lot["remaining"] <= epsilon:
+                side_lots.popleft()
+
+        if remaining_to_close > epsilon:
+            raise ValueError(
+                "Execution events attempted to close "
+                f"{remaining_to_close:.6f} units of {close_direction} "
+                "that were never opened."
+            )
+
+    # ------------------------------------------------------------------
+    # compute_statistics — average_executed_size from the fill ledger
     # ------------------------------------------------------------------
     def compute_statistics(
         self,
         trade_log: pd.DataFrame,
         execution_events: pd.DataFrame,
     ) -> Dict[str, Any]:
-        """Calculate execution statistics from actual fills."""
+        """Calculate statistics from actual fills and completed trade records."""
         events = execution_events.copy()
 
         if events.empty:
-            fill_events = events.copy()
+            filled = events.copy()
         elif "filled" in events.columns:
-            fill_events = events[events["filled"] == True].copy()
+            filled = events[
+                events["filled"].fillna(False).astype(bool)
+            ].copy()
         else:
-            fill_events = events[
+            filled = events[
                 events["event_type"] != "NO_ACTION"
             ].copy()
+
+        # Events that did not change a position are not actual fills.
+        if not filled.empty:
+            changed = (
+                filled["position_after"].astype(float)
+                - filled["position_before"].astype(float)
+            ).abs() > 1e-10
+
+            filled = filled[changed]
+
+        unexecuted = getattr(
+            self,
+            "unexecuted_orders_at_end",
+            pd.DataFrame(),
+        )
+        unexecuted_count = len(unexecuted)
 
         orders_generated = int(
             getattr(
@@ -813,7 +1006,7 @@ class ExecutionSimulationEngine:
             )
         )
 
-        orders_executed = int(len(fill_events))
+        orders_executed = int(len(filled))
 
         execution_rate = (
             orders_executed / orders_generated
@@ -821,24 +1014,22 @@ class ExecutionSimulationEngine:
             else 0.0
         )
 
-        # Total commission from actual fills, not only closed trades.
-        if "commission" in fill_events.columns and not fill_events.empty:
-            total_commission = float(fill_events["commission"].sum())
+        # Cost totals from actual fills only.
+        if "commission" in filled.columns and not filled.empty:
+            total_commission = float(filled["commission"].sum())
         else:
             total_commission = 0.0
 
-        # Total slippage cost from actual fills.
-        if "slippage_cost" in fill_events.columns and not fill_events.empty:
-            total_slippage_cost = float(fill_events["slippage_cost"].sum())
+        if "slippage_cost" in filled.columns and not filled.empty:
+            total_slippage_cost = float(filled["slippage_cost"].sum())
         else:
             total_slippage_cost = 0.0
 
-        # Trade-level stats derived from the closed trade log.
+        # Trade-level statistics from the closed-trade log.
         if trade_log.empty:
             long_trades = 0
             short_trades = 0
             average_holding_bars = 0.0
-            average_executed_size = 0.0
         else:
             long_trades = int(
                 (trade_log["direction"] == "LONG").sum()
@@ -849,11 +1040,28 @@ class ExecutionSimulationEngine:
             average_holding_bars = float(
                 trade_log["holding_bars"].mean()
             )
-            average_executed_size = float(
-                trade_log["executed_size"].mean()
-            )
 
-        unexecuted_count = int(len(self.unexecuted_orders_at_end))
+        # average_executed_size is measured on the fill ledger so that
+        # open positions at the end of the data are counted.
+        if not filled.empty and "size" in filled.columns:
+            average_executed_size = float(
+                pd.to_numeric(filled["size"], errors="coerce")
+                .astype(float)
+                .mean()
+            )
+        else:
+            average_executed_size = 0.0
+
+        # average_slippage is measured on the fill ledger too.
+        if not filled.empty and "slippage" in filled.columns:
+            average_slippage = float(
+                pd.to_numeric(filled["slippage"], errors="coerce")
+                .astype(float)
+                .mean()
+            )
+        else:
+            average_slippage = 0.0
+
         open_positions_count = int(len(self.open_positions_at_end))
 
         stats = {
@@ -862,11 +1070,7 @@ class ExecutionSimulationEngine:
             "long_trades": int(long_trades),
             "short_trades": int(short_trades),
             "average_holding_bars": float(average_holding_bars),
-            "average_slippage": float(
-                total_slippage_cost / orders_executed
-                if orders_executed > 0
-                else 0.0
-            ),
+            "average_slippage": float(average_slippage),
             "total_commission": float(total_commission),
             "total_slippage_cost": float(total_slippage_cost),
             "execution_rate": float(execution_rate),
@@ -875,7 +1079,7 @@ class ExecutionSimulationEngine:
             "open_positions_at_end": int(open_positions_count),
             "execution_delay": int(self.config.latency_bars),
             "average_executed_size": float(average_executed_size),
-            "total_events": int(len(fill_events)),
+            "total_events": int(len(filled)),
         }
 
         return stats
@@ -965,7 +1169,7 @@ class ExecutionSimulationEngine:
         )
 
         # ------------------------------------------------------------------
-        # Fix H — Export positions still open and unexecuted orders
+        # Export positions still open and unexecuted orders
         # ------------------------------------------------------------------
 
         # Export positions still open at the end of the data window.
