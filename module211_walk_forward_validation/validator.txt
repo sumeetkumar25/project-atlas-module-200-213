@@ -24,7 +24,9 @@ class WalkForwardValidator:
         
         # Check window results
         if result.window_results.empty:
-            warnings.append("No window results available")
+            issues.append(
+                "No walk-forward windows were evaluated."
+            )
         
         # Check equity curves
         if result.equity_curves.empty:
@@ -82,7 +84,9 @@ class WalkForwardValidator:
         
         # Check statistics
         if statistics.n_windows == 0:
-            warnings.append("No windows processed")
+            issues.append(
+                "Walk-forward validation produced zero windows."
+            )
         
         if statistics.avg_return == 0 and statistics.n_windows > 0:
             warnings.append("Average return is zero")
