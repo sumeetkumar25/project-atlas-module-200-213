@@ -3,7 +3,7 @@
 Module 211
 Walk Forward Validation
 
-Validates trading system robustness on unseen data through walk-forward analysis.
+Performs rolling out-of-sample validation of a fixed trading strategy.
 
 Pipeline: load execution data → generate windows → for each window:
           train → test → compute metrics → store results
