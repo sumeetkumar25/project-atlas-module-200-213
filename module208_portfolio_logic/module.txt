@@ -72,7 +72,7 @@ class PortfolioLogicResearch(BaseResearchModule):
             confidence_threshold=confidence_threshold,
             max_position_size=max_position_size,
             allow_position_flip=allow_position_flip,
-            lag_by_one_bar=lag_by_one_bar
+            lag_by_one_bar=lag_by_one_bar,
         )
         
         self.engine = PortfolioLogicEngine(
