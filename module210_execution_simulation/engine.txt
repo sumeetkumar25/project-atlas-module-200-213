@@ -670,6 +670,7 @@ class ExecutionSimulationEngine:
                     "entry_time": entry_time,
                     "entry_price": price,
                     "direction": direction,
+                    "original_size": size,
                     "remaining": size,
                     "entry_commission_total": commission,
                     "entry_slippage_total": slippage_cost,
@@ -751,6 +752,7 @@ class ExecutionSimulationEngine:
                         "entry_time": entry_time,
                         "entry_price": price,
                         "direction": "SHORT",
+                        "original_size": open_size,
                         "remaining": open_size,
                         "entry_commission_total": 0.0,
                         "entry_slippage_total": 0.0,
@@ -784,6 +786,7 @@ class ExecutionSimulationEngine:
                         "entry_time": entry_time,
                         "entry_price": price,
                         "direction": "LONG",
+                        "original_size": open_size,
                         "remaining": open_size,
                         "entry_commission_total": 0.0,
                         "entry_slippage_total": 0.0,
@@ -868,7 +871,9 @@ class ExecutionSimulationEngine:
                 side_lots.popleft()
                 continue
 
-            fraction_of_lot = match_size / lot["remaining"]
+            # Allocate entry costs against the original lot size. Using the
+            # shrinking remaining size over-allocates costs across partial closes.
+            fraction_of_lot = match_size / lot["original_size"]
             fraction_of_close = match_size / total_close_size
 
             entry_commission = (
