@@ -175,13 +175,49 @@ class WalkForwardEngine:
         if n_test < self.config.minimum_trades:
             return None
         
-        # Test period metrics
-        test_pnl = test_trades['exit_price'] - test_trades['entry_price']
-        test_pnl = test_pnl * test_trades['executed_size']
-        
-        # Apply direction
-        direction_multiplier = test_trades['direction'].map({'LONG': 1, 'SHORT': -1})
-        test_pnl = test_pnl * direction_multiplier
+        # Test-period P&L, using actual execution prices.
+        entry_price = pd.to_numeric(
+            test_trades["entry_price"], errors="raise"
+        )
+        exit_price = pd.to_numeric(
+            test_trades["exit_price"], errors="raise"
+        )
+        executed_size = pd.to_numeric(
+            test_trades["executed_size"], errors="raise"
+        )
+        direction_multiplier = (
+            test_trades["direction"]
+            .astype(str)
+            .str.upper()
+            .map({"LONG": 1.0, "SHORT": -1.0})
+        )
+        if direction_multiplier.isna().any():
+            raise ValueError(
+                "Trade log contains an unsupported direction."
+            )
+        if "total_commission" not in test_trades.columns:
+            raise ValueError(
+                "Trade log is missing total_commission; "
+                "net P&L cannot be calculated."
+            )
+        commission = pd.to_numeric(
+            test_trades["total_commission"], errors="raise"
+        )
+        if (
+            commission.isna().any()
+            or (commission < 0).any()
+        ):
+            raise ValueError(
+                "Trade log contains invalid commission values."
+            )
+        test_pnl = (
+            (exit_price - entry_price)
+            * executed_size
+            * direction_multiplier
+        )
+        # Execution prices already include slippage.
+        # Subtract commission once to obtain net P&L.
+        test_pnl = test_pnl - commission
         
         # Net profit
         net_profit = test_pnl.sum()
