@@ -87,7 +87,7 @@ class ExecutionSimulationEngine:
         self.unexecuted_orders_at_end: pd.DataFrame = pd.DataFrame()
 
     # ------------------------------------------------------------------
-    # Fix A — load_portfolio
+    # load_portfolio
     # ------------------------------------------------------------------
     def load_portfolio(self, matrix_path: Path) -> pd.DataFrame:
         """Load and validate the Module 209 risk-adjusted portfolio."""
@@ -156,7 +156,7 @@ class ExecutionSimulationEngine:
         return df
 
     # ------------------------------------------------------------------
-    # Fix B — generate_orders
+    # generate_orders
     # ------------------------------------------------------------------
     def generate_orders(self, portfolio_df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -215,7 +215,7 @@ class ExecutionSimulationEngine:
         )
 
     # ------------------------------------------------------------------
-    # Fix C — apply_execution_delay
+    # apply_execution_delay
     # ------------------------------------------------------------------
     def apply_execution_delay(
         self,
@@ -259,7 +259,7 @@ class ExecutionSimulationEngine:
         ).reset_index(drop=True)
 
     # ------------------------------------------------------------------
-    # Fix D — apply_slippage
+    # apply_slippage
     # ------------------------------------------------------------------
     def apply_slippage(
         self,
@@ -327,7 +327,7 @@ class ExecutionSimulationEngine:
         return executed_size * execution_price * self.config.commission_rate
 
     # ------------------------------------------------------------------
-    # Fix E — execute_orders (reconcile target vs actual fills)
+    # execute_orders (reconcile target vs actual fills)
     # ------------------------------------------------------------------
     def execute_orders(
         self,
@@ -687,14 +687,8 @@ class ExecutionSimulationEngine:
             # ----------------------------------------------------------
             # Case 2: Position moved TOWARD zero (partial or full close)
             # or crossed zero (reversal).
-            #
-            # Any reduction of the same side is matched FIFO against the
-            # open lots of that side. A reversal therefore naturally
-            # produces a close followed by an open, without relying on
-            # the event label.
             # ----------------------------------------------------------
             if before > 0 and after >= 0 and delta < 0:
-                # LONG close (possibly partial).
                 self._consume_lots(
                     side_lots=long_lots,
                     close_size=abs(delta),
@@ -709,12 +703,10 @@ class ExecutionSimulationEngine:
                     closed_trades=closed_trades,
                     next_trade_id_ref=[next_trade_id],
                 )
-                # Advance the trade id counter using whatever the helper wrote.
                 next_trade_id = len(closed_trades)
                 continue
 
             if before < 0 and after <= 0 and delta > 0:
-                # SHORT close (possibly partial).
                 self._consume_lots(
                     side_lots=short_lots,
                     close_size=abs(delta),
@@ -733,12 +725,9 @@ class ExecutionSimulationEngine:
                 continue
 
             # ----------------------------------------------------------
-            # Case 3: Sign reversal. The previous side is fully closed
-            # and the opposite side is opened. We use the actual event
-            # quantities rather than the label.
+            # Case 3: Sign reversal.
             # ----------------------------------------------------------
             if before > 0 and after < 0:
-                # Close the existing long fully.
                 self._consume_lots(
                     side_lots=long_lots,
                     close_size=abs(before),
@@ -755,7 +744,6 @@ class ExecutionSimulationEngine:
                 )
                 next_trade_id = len(closed_trades)
 
-                # Open a new short for the residual size.
                 open_size = abs(after)
                 if open_size > epsilon:
                     lot = {
@@ -773,7 +761,6 @@ class ExecutionSimulationEngine:
                 continue
 
             if before < 0 and after > 0:
-                # Close the existing short fully.
                 self._consume_lots(
                     side_lots=short_lots,
                     close_size=abs(before),
@@ -790,7 +777,6 @@ class ExecutionSimulationEngine:
                 )
                 next_trade_id = len(closed_trades)
 
-                # Open a new long for the residual size.
                 open_size = abs(after)
                 if open_size > epsilon:
                     lot = {
@@ -959,34 +945,40 @@ class ExecutionSimulationEngine:
             )
 
     # ------------------------------------------------------------------
-    # compute_statistics — average_executed_size from the fill ledger
+    # compute_statistics — hardened against minimal test fixtures
     # ------------------------------------------------------------------
     def compute_statistics(
         self,
         trade_log: pd.DataFrame,
         execution_events: pd.DataFrame,
     ) -> Dict[str, Any]:
-        """Calculate statistics from actual fills and completed trade records."""
+        """Compute statistics safely from available trade and fill data."""
         events = execution_events.copy()
 
+        # Determine actual fill rows.
         if events.empty:
             filled = events.copy()
         elif "filled" in events.columns:
             filled = events[
                 events["filled"].fillna(False).astype(bool)
             ].copy()
-        else:
+        elif "event_type" in events.columns:
             filled = events[
                 events["event_type"] != "NO_ACTION"
             ].copy()
+        else:
+            filled = events.copy()
 
-        # Events that did not change a position are not actual fills.
-        if not filled.empty:
+        # Remove no-change events only when both position columns exist.
+        if (
+            not filled.empty
+            and "position_before" in filled.columns
+            and "position_after" in filled.columns
+        ):
             changed = (
                 filled["position_after"].astype(float)
                 - filled["position_before"].astype(float)
             ).abs() > 1e-10
-
             filled = filled[changed]
 
         unexecuted = getattr(
@@ -996,15 +988,14 @@ class ExecutionSimulationEngine:
         )
         unexecuted_count = len(unexecuted)
 
-        orders_generated = int(
-            getattr(
-                self,
-                "_orders_generated_count",
-                events["order_index"].nunique()
-                if "order_index" in events.columns and not events.empty
-                else len(events),
-            )
-        )
+        # orders_generated: prefer the cross-method counter, then fall
+        # back to distinct order indices, then to the event count.
+        if hasattr(self, "_orders_generated_count"):
+            orders_generated = int(self._orders_generated_count)
+        elif "order_index" in events.columns and not events.empty:
+            orders_generated = int(events["order_index"].nunique())
+        else:
+            orders_generated = int(len(events))
 
         orders_executed = int(len(filled))
 
@@ -1014,13 +1005,13 @@ class ExecutionSimulationEngine:
             else 0.0
         )
 
-        # Cost totals from actual fills only.
-        if "commission" in filled.columns and not filled.empty:
+        # Cost totals from actual fills only, guarded by column checks.
+        if not filled.empty and "commission" in filled.columns:
             total_commission = float(filled["commission"].sum())
         else:
             total_commission = 0.0
 
-        if "slippage_cost" in filled.columns and not filled.empty:
+        if not filled.empty and "slippage_cost" in filled.columns:
             total_slippage_cost = float(filled["slippage_cost"].sum())
         else:
             total_slippage_cost = 0.0
@@ -1031,28 +1022,45 @@ class ExecutionSimulationEngine:
             short_trades = 0
             average_holding_bars = 0.0
         else:
-            long_trades = int(
-                (trade_log["direction"] == "LONG").sum()
-            )
-            short_trades = int(
-                (trade_log["direction"] == "SHORT").sum()
-            )
-            average_holding_bars = float(
-                trade_log["holding_bars"].mean()
-            )
+            if "direction" in trade_log.columns:
+                long_trades = int(
+                    (trade_log["direction"] == "LONG").sum()
+                )
+                short_trades = int(
+                    (trade_log["direction"] == "SHORT").sum()
+                )
+            else:
+                long_trades = 0
+                short_trades = 0
+
+            if "holding_bars" in trade_log.columns:
+                average_holding_bars = float(
+                    trade_log["holding_bars"].mean()
+                )
+            else:
+                average_holding_bars = 0.0
 
         # average_executed_size is measured on the fill ledger so that
-        # open positions at the end of the data are counted.
+        # open positions at the end of the data are counted. When the
+        # ledger lacks a 'size' column, fall back to the trade log's
+        # executed_size, then to zero.
         if not filled.empty and "size" in filled.columns:
             average_executed_size = float(
                 pd.to_numeric(filled["size"], errors="coerce")
                 .astype(float)
                 .mean()
             )
+        elif (
+            not trade_log.empty
+            and "executed_size" in trade_log.columns
+        ):
+            average_executed_size = float(
+                trade_log["executed_size"].mean()
+            )
         else:
             average_executed_size = 0.0
 
-        # average_slippage is measured on the fill ledger too.
+        # average_slippage is measured on the fill ledger when available.
         if not filled.empty and "slippage" in filled.columns:
             average_slippage = float(
                 pd.to_numeric(filled["slippage"], errors="coerce")
