@@ -149,10 +149,16 @@ class SignalConfidenceResearch(BaseResearchModule):
         self.result.artifacts["confidence_distribution"] = self.result_data.confidence_distribution
         
         # Store signal confidence
-        conf_df = pd.DataFrame({
-            'confidence': self.result_data.signal_confidence.values
-        })
-        self.result.artifacts["signal_confidence"] = conf_df
+        confidence_columns = [
+            self.engine.timestamp_column,
+            self.engine.signal_column,
+            "confidence",
+        ]
+        self.result.artifacts["signal_confidence"] = (
+            self.result_data.confidence_matrix[
+                confidence_columns
+            ].copy()
+        )
         
         # Store summary
         stats_df = pd.DataFrame([self.result_data.confidence_statistics])
