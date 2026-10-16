@@ -359,13 +359,28 @@ class SignalConfidenceEngine:
         print(f"  Saved confidence matrix to {matrix_path}")
         
         # Signal confidence
-        conf_df = pd.DataFrame({
-            'timestamp': signal.index,
-            self.signal_column: signal.values,
-            'confidence': confidence.values
-        })
-        if self.timestamp_column in conf_df.columns:
-            conf_df = conf_df.rename(columns={'timestamp': self.timestamp_column})
+        required_columns = [
+            self.timestamp_column,
+            self.signal_column,
+            "confidence",
+        ]
+
+        missing_columns = [
+            column
+            for column in required_columns
+            if column not in confidence_matrix.columns
+        ]
+
+        if missing_columns:
+            raise ValueError(
+                "Confidence matrix missing output columns: "
+                f"{missing_columns}"
+            )
+
+        # Reuse the matrix containing the actual market timestamps.
+        conf_df = confidence_matrix[required_columns].copy()
+        conf_df = conf_df.reset_index(drop=True)
+
         conf_path = output_dir / "signal_confidence.csv"
         conf_df.to_csv(conf_path, index=False)
         print(f"  Saved signal confidence to {conf_path}")
