@@ -182,38 +182,36 @@ class PerformanceAttributionEngine:
         return pd.DataFrame(results)
 
     def attribute_session(self, df: pd.DataFrame) -> pd.DataFrame:
-        """2. Session attribution."""
-        results = []
-        
-        # Determine session based on hour
-        def get_session(hour):
-            if hour in self.config.session_hours['Asia']:
-                return 'Asia'
-            elif hour in self.config.session_hours['Europe']:
-                return 'Europe'
-            elif hour in self.config.session_hours['US']:
-                return 'US'
-            else:
-                return 'Other'
-        
+        """Mutually exclusive session attribution plus separate overlap."""
         df_copy = df.copy()
-        df_copy['hour'] = df_copy['entry_time'].dt.hour
-        df_copy['session'] = df_copy['hour'].apply(get_session)
-        
-        for session in self.config.sessions:
-            subset = df_copy[df_copy['session'] == session]
+        df_copy["hour"] = df_copy["entry_time"].dt.hour
+
+        def get_session(hour):
+            if hour in self.config.session_hours["Asia"]:
+                return "Asia"
+            if hour in self.config.session_hours["Europe"]:
+                return "Europe"
+            if hour in self.config.session_hours["US"]:
+                return "US"
+            return "Other"
+
+        df_copy["session"] = df_copy["hour"].apply(get_session)
+
+        results = []
+
+        for session in ["Asia", "Europe", "US", "Other"]:
+            subset = df_copy[df_copy["session"] == session]
             metrics = self.compute_metrics(subset)
-            metrics['session'] = session
+            metrics["session"] = session
             results.append(metrics)
-        
-        # Add overlap
-        overlap_hours = self.config.session_hours.get('Overlap', [])
-        overlap_subset = df_copy[df_copy['hour'].isin(overlap_hours)]
-        if not overlap_subset.empty:
-            metrics = self.compute_metrics(overlap_subset)
-            metrics['session'] = 'Overlap'
-            results.append(metrics)
-        
+
+        # Overlap is supplementary and intentionally overlaps Europe/US.
+        overlap_hours = self.config.session_hours.get("Overlap", [])
+        overlap_subset = df_copy[df_copy["hour"].isin(overlap_hours)]
+        metrics = self.compute_metrics(overlap_subset)
+        metrics["session"] = "Overlap (supplementary)"
+        results.append(metrics)
+
         return pd.DataFrame(results)
 
     def attribute_hour(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -305,63 +303,74 @@ class PerformanceAttributionEngine:
         return pd.DataFrame(results)
 
     def attribute_volatility(self, df: pd.DataFrame) -> pd.DataFrame:
-        """7. Volatility attribution."""
+        """Attribute trades by genuine, supplied volatility percentile."""
+        if "volatility_percentile" not in df.columns:
+            return pd.DataFrame([{
+                "volatility_bin": "UNAVAILABLE",
+                "trades": len(df),
+                "reason": "No genuine volatility_percentile supplied",
+            }])
+
+        values = pd.to_numeric(
+            df["volatility_percentile"],
+            errors="coerce"
+        )
+
+        valid = values.notna() & values.between(0, 1)
+        df_copy = df.loc[valid].copy()
+        df_copy["volatility_percentile"] = values.loc[valid]
+
         results = []
-        
-        if 'volatility_percentile' not in df.columns:
-            # If not available, create dummy volatility based on returns
-            df_copy = df.copy()
-            pnl = df['net_pnl'] if 'net_pnl' in df.columns else df['total_pnl']
-            df_copy['volatility_percentile'] = pd.qcut(pnl.abs(), q=4, labels=False) / 3
-        else:
-            df_copy = df.copy()
-        
-        for i in range(len(self.config.volatility_bins)):
-            if i == 0:
-                continue
-            lower = self.config.volatility_bins[i-1]
-            upper = self.config.volatility_bins[i]
-            
-            subset = df_copy[
-                (df_copy['volatility_percentile'] >= lower) & 
-                (df_copy['volatility_percentile'] < upper)
-            ]
-            
+        bins = self.config.volatility_bins
+
+        for i in range(len(bins) - 1):
+            lower = bins[i]
+            upper = bins[i + 1]
+
+            if i == len(bins) - 2:
+                mask = (
+                    (df_copy["volatility_percentile"] >= lower)
+                    & (df_copy["volatility_percentile"] <= upper)
+                )
+            else:
+                mask = (
+                    (df_copy["volatility_percentile"] >= lower)
+                    & (df_copy["volatility_percentile"] < upper)
+                )
+
+            subset = df_copy[mask]
             metrics = self.compute_metrics(subset)
-            metrics['volatility_bin'] = f"{lower:.0%}-{upper:.0%}"
+            metrics["volatility_bin"] = f"{lower:.0%}-{upper:.0%}"
             results.append(metrics)
-        
-        # Add max bin
-        subset = df_copy[df_copy['volatility_percentile'] >= self.config.volatility_bins[-1]]
-        metrics = self.compute_metrics(subset)
-        metrics['volatility_bin'] = f"{self.config.volatility_bins[-1]:.0%}+"
-        results.append(metrics)
-        
+
         return pd.DataFrame(results)
 
     def attribute_regime(self, df: pd.DataFrame) -> pd.DataFrame:
-        """8. Regime attribution."""
+        """Attribute trades by genuine, supplied market regime."""
+        if "market_regime" not in df.columns:
+            return pd.DataFrame([{
+                "regime": "UNAVAILABLE",
+                "trades": len(df),
+                "reason": "No genuine market_regime supplied",
+            }])
+
+        df_copy = df.copy()
+        regimes = df_copy["market_regime"].dropna().unique()
+
+        if len(regimes) == 0:
+            return pd.DataFrame([{
+                "regime": "UNAVAILABLE",
+                "trades": len(df),
+                "reason": "market_regime column is empty",
+            }])
+
         results = []
-        
-        if 'market_regime' not in df.columns:
-            # If not available, create dummy regime based on returns
-            df_copy = df.copy()
-            pnl = df['net_pnl'] if 'net_pnl' in df.columns else df['total_pnl']
-            df_copy['market_regime'] = pd.cut(
-                pnl, 
-                bins=[-np.inf, -0.5, 0.5, np.inf],
-                labels=['Bearish', 'Neutral', 'Bullish']
-            )
-        else:
-            df_copy = df.copy()
-        
-        regimes = df_copy['market_regime'].unique()
         for regime in regimes:
-            subset = df_copy[df_copy['market_regime'] == regime]
+            subset = df_copy[df_copy["market_regime"] == regime]
             metrics = self.compute_metrics(subset)
-            metrics['regime'] = regime
+            metrics["regime"] = regime
             results.append(metrics)
-        
+
         return pd.DataFrame(results)
 
     def attribute_commission(self, df: pd.DataFrame) -> pd.DataFrame:
