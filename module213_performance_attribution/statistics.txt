@@ -3,7 +3,10 @@ Module 213 - Performance Attribution Statistics
 """
 
 from dataclasses import dataclass, asdict
+import math
+
 import pandas as pd
+
 from .engine import AttributionResult
 
 
@@ -32,97 +35,178 @@ class AttributionStatistics:
 
 class AttributionStatisticsEngine:
     """Engine for generating high-level statistics."""
-    
+
     METADATA = {
         "module": 213,
         "name": "Performance Attribution",
-        "version": "1.0.0",
-        "description": "Decomposes strategy performance into measurable components"
+        "version": "1.0.1",
+        "description": "Decomposes strategy performance into measurable components",
     }
-    
+
+    # Candidate attribute names on AttributionResult that may hold
+    # the trade-level DataFrame. Checked in order.
+    _TRADE_ATTR_CANDIDATES = (
+        "trades",
+        "trade_log",
+        "trades_df",
+        "trade_data",
+        "trade_log_df",
+    )
+
+    def _extract_trade_pnls(self, result: AttributionResult) -> pd.Series:
+        """
+        Extract the per-trade net PnL series from the result object.
+
+        Returns an empty Series if no trade-level DataFrame is available.
+        """
+        for attr_name in self._TRADE_ATTR_CANDIDATES:
+            candidate = getattr(result, attr_name, None)
+
+            if not isinstance(candidate, pd.DataFrame) or candidate.empty:
+                continue
+
+            for pnl_col in ("net_pnl", "total_pnl"):
+                if pnl_col in candidate.columns:
+                    pnl = candidate[pnl_col].astype(float).dropna()
+                    if not pnl.empty:
+                        return pnl
+
+        return pd.Series(dtype=float)
+
     def analyze(self, result: AttributionResult) -> AttributionStatistics:
-        """Analyze results and generate high-level statistics."""
-        overall = result.overall_summary.iloc[0] if not result.overall_summary.empty else None
-        
+        """Calculate high-level statistics from actual trade-level results."""
+        overall = (
+            result.overall_summary.iloc[0]
+            if not result.overall_summary.empty
+            else None
+        )
+
         if overall is None:
-            return AttributionStatistics(
-                total_trades=0,
-                net_profit=0.0,
-                gross_profit=0.0,
-                gross_loss=0.0,
-                profit_factor=0.0,
-                sharpe=0.0,
-                sortino=0.0,
-                win_rate=0.0,
-                avg_trade=0.0,
-                largest_winner=0.0,
-                largest_loser=0.0,
-                avg_holding=0.0,
-                commission_pct=0.0,
-                slippage_pct=0.0,
-                best_direction='',
-                best_session='',
-                best_hour=0,
-                worst_hour=0
-            )
-        
-        # Find best direction
+            raise ValueError("Module 213 produced no overall trade summary.")
+
+        # ------------------------------------------------------------
+        # Best direction — exclude the aggregate OVERALL row
+        # ------------------------------------------------------------
         direction_df = result.direction_attribution
-        if not direction_df.empty:
-            dir_perf = direction_df[direction_df['direction'] != 'OVERALL']
-            if not dir_perf.empty:
-                best_dir = dir_perf.loc[dir_perf['net_pnl'].idxmax(), 'direction']
-            else:
-                best_dir = 'N/A'
-        else:
-            best_dir = 'N/A'
-        
-        # Find best session
+
+        if direction_df is not None and not direction_df.empty:
+            direction_df = direction_df[
+                direction_df["direction"] != "OVERALL"
+            ]
+
+        best_dir = "N/A"
+        if (
+            direction_df is not None
+            and not direction_df.empty
+            and "net_pnl" in direction_df.columns
+        ):
+            best_dir = str(
+                direction_df.loc[
+                    direction_df["net_pnl"].idxmax(), "direction"
+                ]
+            )
+
+        # ------------------------------------------------------------
+        # Best session — exclude the supplementary overlap bucket
+        # ------------------------------------------------------------
         session_df = result.session_attribution
-        if not session_df.empty:
-            best_session = session_df.loc[session_df['net_pnl'].idxmax(), 'session']
-        else:
-            best_session = 'N/A'
-        
-        # Find best and worst hour
+
+        if session_df is not None and not session_df.empty:
+            session_df = session_df[
+                session_df["session"] != "Overlap (supplementary)"
+            ]
+
+        best_session = "N/A"
+        if (
+            session_df is not None
+            and not session_df.empty
+            and "net_pnl" in session_df.columns
+        ):
+            best_session = str(
+                session_df.loc[
+                    session_df["net_pnl"].idxmax(), "session"
+                ]
+            )
+
+        # ------------------------------------------------------------
+        # Best / worst hour
+        # ------------------------------------------------------------
         hour_df = result.hour_attribution
-        if not hour_df.empty and 'net_pnl' in hour_df.columns:
-            best_hour = int(hour_df.loc[hour_df['net_pnl'].idxmax(), 'hour'])
-            worst_hour = int(hour_df.loc[hour_df['net_pnl'].idxmin(), 'hour'])
+
+        if (
+            hour_df is not None
+            and not hour_df.empty
+            and "net_pnl" in hour_df.columns
+        ):
+            best_hour = int(hour_df.loc[hour_df["net_pnl"].idxmax(), "hour"])
+            worst_hour = int(hour_df.loc[hour_df["net_pnl"].idxmin(), "hour"])
         else:
             best_hour = 0
             worst_hour = 0
-        
-        # Calculate Sortino (downside deviation)
-        pnl_col = 'net_pnl' if 'net_pnl' in overall.index else 'total_pnl'
-        pnl_value = overall.get(pnl_col, 0)
-        
-        # Use overall summary data
+
+        # ------------------------------------------------------------
+        # Trade-level metrics — these are the actual values,
+        # not per-trade averages of aggregates.
+        # ------------------------------------------------------------
+        pnl_series = self._extract_trade_pnls(result)
+
+        if pnl_series.empty:
+            raise ValueError(
+                "Module 213 statistics requires trade-level PnL data, "
+                "but no trades DataFrame with a 'net_pnl' or 'total_pnl' "
+                "column was found on AttributionResult. Cannot compute "
+                "largest_winner, largest_loser, or sortino accurately."
+            )
+
+        actual_trade_count = int(len(pnl_series))
+
+        # Actual largest winning and losing trades (signed PnL).
+        # When no losers exist, min() returns the smallest winner —
+        # still the true "worst trade" as a signed value.
+        largest_winner = float(pnl_series.max())
+        largest_loser = float(pnl_series.min())
+
+        mean_pnl = float(pnl_series.mean())
+
+        # Downside deviation: sqrt(mean of squared negative PnLs)
+        downside = pnl_series[pnl_series < 0]
+
+        if not downside.empty:
+            downside_deviation = float(math.sqrt((downside ** 2).mean()))
+        else:
+            downside_deviation = 0.0
+
+        sortino = (
+            mean_pnl / downside_deviation
+            if downside_deviation > 0
+            else 0.0
+        )
+
         return AttributionStatistics(
-            total_trades=int(overall.get('trades', 0)),
-            net_profit=float(overall.get('net_pnl', 0)),
-            gross_profit=float(overall.get('gross_profit', 0)),
-            gross_loss=float(overall.get('gross_loss', 0)),
-            profit_factor=float(overall.get('profit_factor', 0)),
-            sharpe=float(overall.get('sharpe', 0)),
-            sortino=float(overall.get('sharpe', 0)) * 0.8,  # Approximate
-            win_rate=float(overall.get('win_rate', 0)),
-            avg_trade=float(overall.get('avg_pnl', 0)),
-            largest_winner=float(overall.get('gross_profit', 0)) / float(overall.get('trades', 1)) if overall.get('trades', 0) > 0 else 0,
-            largest_loser=float(overall.get('gross_loss', 0)) / float(overall.get('trades', 1)) if overall.get('trades', 0) > 0 else 0,
-            avg_holding=float(overall.get('avg_holding', 0)),
-            commission_pct=float(overall.get('commission_pct', 0)),
-            slippage_pct=float(overall.get('slippage_pct', 0)),
+            total_trades=actual_trade_count,
+            net_profit=float(overall.get("net_pnl", 0)),
+            gross_profit=float(overall.get("gross_profit", 0)),
+            gross_loss=float(overall.get("gross_loss", 0)),
+            profit_factor=float(overall.get("profit_factor", 0)),
+            sharpe=float(overall.get("sharpe", 0)),
+            sortino=sortino,
+            win_rate=float(overall.get("win_rate", 0)),
+            avg_trade=float(overall.get("avg_pnl", mean_pnl)),
+            largest_winner=largest_winner,
+            largest_loser=largest_loser,
+            avg_holding=float(overall.get("avg_holding", 0)),
+            commission_pct=float(overall.get("commission_pct", 0)),
+            slippage_pct=float(overall.get("slippage_pct", 0)),
             best_direction=best_dir,
             best_session=best_session,
             best_hour=best_hour,
-            worst_hour=worst_hour
+            worst_hour=worst_hour,
         )
-    
+
     def summary_dataframe(self, stats: AttributionStatistics) -> pd.DataFrame:
         """Convert statistics to DataFrame."""
         return pd.DataFrame([asdict(stats)])
-    
+
     def summary_dict(self, stats: AttributionStatistics) -> dict:
         """Convert statistics to dictionary."""
         return asdict(stats)
