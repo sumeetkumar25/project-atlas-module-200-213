@@ -32,7 +32,12 @@ class ExecutionSimulationResearch(BaseResearchModule):
     def __init__(
         self,
         registry: Optional[AtlasRegistry] = None,
-        commission_rate: float = 0.0004,
+        starting_capital_inr: float = 5000.0,
+        leverage: float = 5.0,
+        inr_per_usd: float = 90.0,
+        contract_lot_size: float = 0.001,
+        commission_rate: float = 0.0005,
+        gst_rate: float = 0.18,
         slippage_rate: float = 0.0001,
         latency_bars: int = 1,
         partial_fills: bool = False,
@@ -49,7 +54,12 @@ class ExecutionSimulationResearch(BaseResearchModule):
         
         Args:
             registry: Optional Atlas registry
-            commission_rate: Commission rate (e.g., 0.0004 = 0.04%)
+            starting_capital_inr: Starting capital in INR
+            leverage: Leverage multiplier applied to the account
+            inr_per_usd: INR per USD conversion assumption
+            contract_lot_size: Contract lot size in BTC
+            commission_rate: Commission rate (e.g., 0.0005 = 0.05%)
+            gst_rate: GST rate applied on top of commission (e.g., 0.18 = 18%)
             slippage_rate: Slippage rate (e.g., 0.0001 = 0.01%)
             latency_bars: Number of bars delay for execution
             partial_fills: Whether partial fills are allowed
@@ -69,12 +79,17 @@ class ExecutionSimulationResearch(BaseResearchModule):
         self.registry = registry or AtlasRegistry()
         
         self.config = ExecutionConfig(
+            starting_capital_inr=starting_capital_inr,
+            leverage=leverage,
+            inr_per_usd=inr_per_usd,
+            contract_lot_size=contract_lot_size,
             commission_rate=commission_rate,
+            gst_rate=gst_rate,
             slippage_rate=slippage_rate,
             latency_bars=latency_bars,
             partial_fills=partial_fills,
             unlimited_liquidity=unlimited_liquidity,
-            max_position_size=max_position_size
+            max_position_size=max_position_size,
         )
         
         self.engine = ExecutionSimulationEngine(
@@ -218,7 +233,12 @@ class ExecutionSimulationResearch(BaseResearchModule):
             "module": self.MODULE_OUTPUT,
             "version": self.METADATA.get("version", "1.0.0"),
             "dataset": self.result.dataset_identifier,
+            "starting_capital_inr": self.config.starting_capital_inr,
+            "leverage": self.config.leverage,
+            "inr_per_usd_assumption": self.config.inr_per_usd,
+            "contract_lot_size": self.config.contract_lot_size,
             "commission_rate": self.config.commission_rate,
+            "gst_rate": self.config.gst_rate,
             "slippage_rate": self.config.slippage_rate,
             "latency_bars": self.config.latency_bars,
             "trades_executed": len(self.result_data.executed_trade_log)
