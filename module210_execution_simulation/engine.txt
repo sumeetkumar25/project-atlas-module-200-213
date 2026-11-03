@@ -23,13 +23,32 @@ warnings.filterwarnings('ignore')
 
 @dataclass
 class ExecutionConfig:
-    """Configuration for execution simulation."""
-    commission_rate: float = 0.0004  # 0.04%
-    slippage_rate: float = 0.0001    # 0.01%
-    latency_bars: int = 1            # One bar delay
+    """Delta Exchange India BTCUSD execution configuration."""
+    # Account
+    starting_capital_inr: float = 5000.0
+    leverage: float = 5.0
+    # Explicit FX assumption; not historical FX data.
+    inr_per_usd: float = 90.0
+    # Delta India BTCUSD contract
+    contract_lot_size: float = 0.001
+    # Taker fee and GST on the fee
+    commission_rate: float = 0.0005
+    gst_rate: float = 0.18
+    # Execution assumptions
+    slippage_rate: float = 0.0001
+    latency_bars: int = 1
     partial_fills: bool = False
     unlimited_liquidity: bool = True
+    # Fractional exposure limit from Module 209
     max_position_size: float = 1.0
+
+    def __post_init__(self):
+        if self.starting_capital_inr <= 0:
+            raise ValueError("starting_capital_inr must be positive.")
+        if self.leverage <= 0:
+            raise ValueError("leverage must be positive.")
+        if self.inr_per_usd <= 0:
+            raise ValueError("inr_per_usd must be positive.")
 
 
 @dataclass
@@ -46,7 +65,7 @@ class ExecutionSimulationEngine:
 
     # Execution states
     STATES = ["FLAT", "ORDER_PENDING", "LONG", "SHORT", "EXIT_PENDING", "CLOSED"]
-    
+
     # Execution event types
     EVENT_TYPES = [
         "BUY", "SELL", "SHORT", "COVER",
@@ -65,7 +84,7 @@ class ExecutionSimulationEngine:
     ):
         """
         Initialize the execution simulation engine.
-        
+
         Args:
             config: ExecutionConfig with execution parameters
             timestamp_column: Name of the timestamp column
@@ -85,6 +104,53 @@ class ExecutionSimulationEngine:
         self._orders_generated_count: int = 0
         self.open_positions_at_end: pd.DataFrame = pd.DataFrame()
         self.unexecuted_orders_at_end: pd.DataFrame = pd.DataFrame()
+
+    # ------------------------------------------------------------------
+    # calculate_target_lots
+    # ------------------------------------------------------------------
+    def calculate_target_lots(
+        self,
+        approved_fraction: float,
+        btcusd_price: float,
+    ) -> int:
+        """
+        Convert Module 209 fractional exposure into signed BTCUSD lots.
+
+        approved_fraction:
+            Signed exposure from Module 209, normally -1 to +1.
+
+        Returns:
+            Signed integer number of Delta Exchange BTCUSD lots.
+        """
+        if not np.isfinite(approved_fraction):
+            raise ValueError("Invalid approved_position.")
+        if not np.isfinite(btcusd_price) or btcusd_price <= 0:
+            raise ValueError("Invalid BTCUSD sizing price.")
+
+        if abs(approved_fraction) > self.config.max_position_size + 1e-9:
+            raise ValueError(
+                "approved_position exceeds configured max_position_size."
+            )
+
+        equity_usd = (
+            self.config.starting_capital_inr
+            / self.config.inr_per_usd
+        )
+        maximum_notional_usd = (
+            equity_usd * self.config.leverage
+        )
+        target_notional_usd = (
+            maximum_notional_usd * abs(approved_fraction)
+        )
+        target_btc = target_notional_usd / btcusd_price
+
+        lots = int(
+            np.floor(
+                target_btc / self.config.contract_lot_size + 1e-12
+            )
+        )
+
+        return int(np.sign(approved_fraction) * lots)
 
     # ------------------------------------------------------------------
     # load_portfolio
@@ -156,48 +222,66 @@ class ExecutionSimulationEngine:
         return df
 
     # ------------------------------------------------------------------
-    # generate_orders
+    # generate_orders — convert fractions into signed BTCUSD target lots
     # ------------------------------------------------------------------
     def generate_orders(self, portfolio_df: pd.DataFrame) -> pd.DataFrame:
         """
-        Convert approved_position changes into target-position orders.
+        Convert Module 209 approved fractional exposures into
+        Delta Exchange BTCUSD target lots.
 
-        The target is the desired signed position, not an instruction to
-        add the target size to the existing position.
+        A target-change order is emitted only when the integer lot count
+        changes between consecutive bars. The order carries the raw
+        approved fraction so execute_orders() can re-size at the actual
+        execution price.
         """
         if "approved_position" not in portfolio_df.columns:
+            raise ValueError("Missing approved_position column.")
+        if self.price_column not in portfolio_df.columns:
             raise ValueError(
-                "Missing required column: approved_position"
+                f"Missing BTCUSD sizing price column: {self.price_column}"
             )
 
-        targets = pd.to_numeric(
+        fractions = pd.to_numeric(
             portfolio_df["approved_position"],
             errors="raise",
         ).to_numpy(dtype=float)
+        prices = pd.to_numeric(
+            portfolio_df[self.price_column],
+            errors="raise",
+        ).to_numpy(dtype=float)
 
-        if not np.isfinite(targets).all():
-            raise ValueError("Approved positions contain invalid values.")
+        if not np.isfinite(fractions).all():
+            raise ValueError("Invalid approved_position values.")
+        if not np.isfinite(prices).all() or (prices <= 0).any():
+            raise ValueError("Invalid BTCUSD prices.")
 
-        orders = []
+        target_lots = np.array(
+            [
+                self.calculate_target_lots(fraction, price)
+                for fraction, price in zip(fractions, prices)
+            ],
+            dtype=np.int64,
+        )
 
-        for i, target in enumerate(targets):
-            previous_target = 0.0 if i == 0 else float(targets[i - 1])
+        orders: List[Dict[str, Any]] = []
+        previous_lots = 0
 
-            if np.isclose(target, previous_target, atol=1e-10, rtol=0):
+        for i, current_lots in enumerate(target_lots):
+            if int(current_lots) == int(previous_lots):
                 continue
 
             orders.append({
                 "timestamp": portfolio_df[self.timestamp_column].iloc[i],
                 "order_index": i,
-                "prev_position": previous_target,
-                "current_position": float(target),
-                "target_position": float(target),
-                "size_change": float(target - previous_target),
+                "prev_target_lots": int(previous_lots),
+                "current_target_lots": int(current_lots),
+                "size_change_lots": int(current_lots - previous_lots),
+                "target_fraction": float(fractions[i]),
                 "order_type": "TARGET_CHANGE",
-                "approved_size": float(abs(target - previous_target)),
+                "approved_size": int(abs(current_lots - previous_lots)),
             })
+            previous_lots = int(current_lots)
 
-        # Statistics use the total number of submitted target changes.
         self._orders_generated_count = len(orders)
 
         return pd.DataFrame(
@@ -205,10 +289,10 @@ class ExecutionSimulationEngine:
             columns=[
                 "timestamp",
                 "order_index",
-                "prev_position",
-                "current_position",
-                "target_position",
-                "size_change",
+                "prev_target_lots",
+                "current_target_lots",
+                "size_change_lots",
+                "target_fraction",
                 "order_type",
                 "approved_size",
             ],
@@ -322,9 +406,32 @@ class ExecutionSimulationEngine:
 
         return float(execution_price), float(slippage)
 
-    def apply_commission(self, executed_size: float, execution_price: float) -> float:
-        """Apply commission to trade."""
-        return executed_size * execution_price * self.config.commission_rate
+    # ------------------------------------------------------------------
+    # apply_commission — lots * lot_size * price * rate * (1 + GST)
+    # ------------------------------------------------------------------
+    def apply_commission(
+        self,
+        executed_size: float,
+        execution_price: float,
+    ) -> float:
+        """
+        Calculate commission in USD.
+
+        executed_size is measured in contracts/lots.
+        BTC quantity = lots * contract_lot_size.
+        GST is applied to the trading fee.
+        """
+        btc_quantity = (
+            abs(executed_size) * self.config.contract_lot_size
+        )
+        notional_usd = btc_quantity * execution_price
+
+        trading_fee_usd = (
+            notional_usd * self.config.commission_rate
+        )
+        gst_usd = trading_fee_usd * self.config.gst_rate
+
+        return float(trading_fee_usd + gst_usd)
 
     # ------------------------------------------------------------------
     # execute_orders (reconcile target vs actual fills)
@@ -384,7 +491,27 @@ class ExecutionSimulationEngine:
 
         for _, order in delayed_orders.iterrows():
             exec_idx = int(order["execution_index"])
-            target = float(order["target_position"])
+
+            # Recalculate target lots using the actual execution-bar
+            # reference price. This prevents a price gap from increasing
+            # notional above the configured cap.
+            target_fraction = float(order["target_fraction"])
+
+            if self.open_column in portfolio_df.columns:
+                sizing_price = float(
+                    portfolio_df[self.open_column].iloc[exec_idx]
+                )
+            else:
+                sizing_price = float(
+                    portfolio_df[self.price_column].iloc[exec_idx]
+                )
+
+            target = float(
+                self.calculate_target_lots(
+                    target_fraction,
+                    sizing_price,
+                )
+            )
 
             delta = target - current_position
 
@@ -412,7 +539,11 @@ class ExecutionSimulationEngine:
 
                 filled_size = abs(delta)
                 commission = self.apply_commission(filled_size, exec_price)
-                slippage_cost = slip_per_unit * filled_size
+                slippage_cost = (
+                    slip_per_unit
+                    * filled_size
+                    * self.config.contract_lot_size
+                )
 
                 position_before = current_position
                 position_after = target
@@ -469,7 +600,11 @@ class ExecutionSimulationEngine:
                 close_side,
             )
             close_commission = self.apply_commission(close_size, close_price)
-            close_slippage_cost = close_slip_per_unit * close_size
+            close_slippage_cost = (
+                close_slip_per_unit
+                * close_size
+                * self.config.contract_lot_size
+            )
 
             close_event_type = (
                 "CLOSE_LONG" if current_position > 0 else "CLOSE_SHORT"
@@ -513,7 +648,11 @@ class ExecutionSimulationEngine:
                 open_side,
             )
             open_commission = self.apply_commission(open_size, open_price)
-            open_slippage_cost = open_slip_per_unit * open_size
+            open_slippage_cost = (
+                open_slip_per_unit
+                * open_size
+                * self.config.contract_lot_size
+            )
 
             open_event_type = (
                 "OPEN_LONG" if target > 0 else "OPEN_SHORT"
@@ -590,14 +729,23 @@ class ExecutionSimulationEngine:
             "direction",
             "entry_price",
             "exit_price",
+            # Position quantity
             "requested_size",
             "executed_size",
+            "executed_btc",
+            # Trading costs, in USD
             "entry_commission",
             "exit_commission",
             "total_commission",
             "entry_slippage",
             "exit_slippage",
             "total_slippage",
+            # Realized PnL
+            "gross_pnl_usd",
+            "net_pnl_usd",
+            "net_pnl_inr_est",
+            "pnl_currency",
+            "pnl_inr_basis_rate",
             "holding_bars",
             "exit_reason",
         ]
@@ -882,7 +1030,6 @@ class ExecutionSimulationEngine:
             entry_slippage = (
                 lot["entry_slippage_total"] * fraction_of_lot
             )
-            entry_slippage_per_unit = lot["entry_slippage_per_unit"]
 
             allocated_exit_commission = (
                 exit_commission * fraction_of_close
@@ -907,8 +1054,35 @@ class ExecutionSimulationEngine:
                     ].shape[0]
                 )
 
-            trade_id = len(closed_trades)
+            # ------------------------------------------------------
+            # Realized PnL (USD) from actual fill prices.
+            # Fill prices already include adverse slippage, so we do
+            # NOT subtract slippage again here.
+            # ------------------------------------------------------
+            btc_quantity = (
+                match_size * self.config.contract_lot_size
+            )
+            total_trade_commission = (
+                entry_commission + allocated_exit_commission
+            )
 
+            if lot["direction"] == "LONG":
+                gross_pnl_usd = (
+                    close_price - lot["entry_price"]
+                ) * btc_quantity
+            else:
+                gross_pnl_usd = (
+                    lot["entry_price"] - close_price
+                ) * btc_quantity
+
+            net_pnl_usd = (
+                gross_pnl_usd - total_trade_commission
+            )
+            net_pnl_inr_est = (
+                net_pnl_usd * self.config.inr_per_usd
+            )
+
+            trade_id = len(closed_trades)
             closed_trades.append({
                 "trade_id": trade_id,
                 "parent_trade_id": lot["lot_id"],
@@ -919,19 +1093,20 @@ class ExecutionSimulationEngine:
                 "exit_price": float(close_price),
                 "requested_size": float(match_size),
                 "executed_size": float(match_size),
+                "executed_btc": float(btc_quantity),
                 "entry_commission": float(entry_commission),
                 "exit_commission": float(allocated_exit_commission),
-                "total_commission": float(
-                    entry_commission + allocated_exit_commission
-                ),
-                "entry_slippage": float(
-                    entry_slippage_per_unit * match_size
-                ),
+                "total_commission": float(total_trade_commission),
+                "entry_slippage": float(entry_slippage),
                 "exit_slippage": float(allocated_exit_slippage),
                 "total_slippage": float(
-                    entry_slippage_per_unit * match_size
-                    + allocated_exit_slippage
+                    entry_slippage + allocated_exit_slippage
                 ),
+                "gross_pnl_usd": float(gross_pnl_usd),
+                "net_pnl_usd": float(net_pnl_usd),
+                "net_pnl_inr_est": float(net_pnl_inr_est),
+                "pnl_currency": "USD",
+                "pnl_inr_basis_rate": float(self.config.inr_per_usd),
                 "holding_bars": int(holding_bars),
                 "exit_reason": exit_reason,
             })
@@ -1102,6 +1277,50 @@ class ExecutionSimulationEngine:
             # total_events reports fill events, kept separate from the
             # order-level counts above.
             "total_events": int(len(filled)),
+
+            # ----------------------------------------------------------
+            # Account and exchange parameters (Patch 5)
+            # ----------------------------------------------------------
+            "starting_capital_inr": float(
+                self.config.starting_capital_inr
+            ),
+            "leverage": float(self.config.leverage),
+            "maximum_notional_inr": float(
+                self.config.starting_capital_inr
+                * self.config.leverage
+            ),
+            "inr_per_usd_assumption": float(
+                self.config.inr_per_usd
+            ),
+            "contract_lot_size_btc": float(
+                self.config.contract_lot_size
+            ),
+            "commission_rate": float(
+                self.config.commission_rate
+            ),
+            "gst_rate": float(self.config.gst_rate),
+
+            # ----------------------------------------------------------
+            # Realized PnL totals (Patch 5)
+            # ----------------------------------------------------------
+            "total_gross_pnl_usd": float(
+                trade_log["gross_pnl_usd"].sum()
+            ) if (
+                not trade_log.empty
+                and "gross_pnl_usd" in trade_log.columns
+            ) else 0.0,
+            "total_net_pnl_usd": float(
+                trade_log["net_pnl_usd"].sum()
+            ) if (
+                not trade_log.empty
+                and "net_pnl_usd" in trade_log.columns
+            ) else 0.0,
+            "total_net_pnl_inr_est": float(
+                trade_log["net_pnl_inr_est"].sum()
+            ) if (
+                not trade_log.empty
+                and "net_pnl_inr_est" in trade_log.columns
+            ) else 0.0,
         }
 
         return stats
@@ -1116,22 +1335,22 @@ class ExecutionSimulationEngine:
     ) -> None:
         """Save all outputs."""
         output_dir.mkdir(parents=True, exist_ok=True)
-        
+
         # Trade log
         trade_path = output_dir / "executed_trade_log.parquet"
         trade_log.to_parquet(trade_path, index=False)
         print(f"  Saved trade log to {trade_path}")
-        
+
         # Execution events
         events_path = output_dir / "execution_events.csv"
         execution_events.to_csv(events_path, index=False)
         print(f"  Saved execution events to {events_path}")
-        
+
         # Position history
         history_path = output_dir / "position_history.csv"
         position_history.to_csv(history_path, index=False)
         print(f"  Saved position history to {history_path}")
-        
+
         # Statistics
         stats_df = pd.DataFrame([stats])
         stats_path = output_dir / "execution_statistics.csv"
@@ -1147,43 +1366,48 @@ class ExecutionSimulationEngine:
         Main computation method.
         """
         print("\n  Computing Execution Simulation...")
+        print(f"  Starting Capital: {self.config.starting_capital_inr:.2f} INR")
+        print(f"  Leverage: {self.config.leverage:.1f}x")
+        print(f"  INR/USD: {self.config.inr_per_usd:.2f}")
+        print(f"  Contract Lot: {self.config.contract_lot_size} BTC")
         print(f"  Commission Rate: {self.config.commission_rate:.4%}")
+        print(f"  GST Rate: {self.config.gst_rate:.2%}")
         print(f"  Slippage Rate: {self.config.slippage_rate:.4%}")
         print(f"  Latency: {self.config.latency_bars} bar(s)")
-        
+
         if output_dir is None:
             output_dir = Path("data/feature_store/execution")
-        
+
         # Load portfolio
         print(f"  Loading portfolio from: {portfolio_matrix_path}")
         portfolio_df = self.load_portfolio(portfolio_matrix_path)
         print(f"  Shape: {portfolio_df.shape}")
-        
+
         # Generate orders
         print("  Generating orders...")
         orders_df = self.generate_orders(portfolio_df)
         print(f"  Generated {len(orders_df)} orders")
-        
+
         # Apply execution delay
         print("  Applying execution delay...")
         delayed_orders = self.apply_execution_delay(orders_df, portfolio_df)
-        
+
         # Execute orders
         print("  Executing orders...")
         execution_events, position_history = self.execute_orders(
             portfolio_df, delayed_orders
         )
         print(f"  Generated {len(execution_events)} execution events")
-        
+
         # Build trade log
         print("  Building trade log...")
         trade_log = self.build_trade_log(execution_events, portfolio_df)
         print(f"  Created {len(trade_log)} trades")
-        
+
         # Compute statistics
         print("  Computing execution statistics...")
         stats = self.compute_statistics(trade_log, execution_events)
-        
+
         # Save outputs
         print("\n  Saving outputs...")
         self.save_outputs(
@@ -1215,15 +1439,19 @@ class ExecutionSimulationEngine:
             Path(output_dir) / "unexecuted_orders_at_end.csv",
             index=False,
         )
-        
+
         print(f"\n  Execution Summary:")
         print(f"    Trades Executed: {len(trade_log)}")
         print(f"    Long Trades: {stats['long_trades']}")
         print(f"    Short Trades: {stats['short_trades']}")
         print(f"    Avg Holding Bars: {stats['average_holding_bars']:.1f}")
-        print(f"    Total Commission: {stats['total_commission']:.4f}")
+        print(f"    Total Commission (USD): {stats['total_commission']:.6f}")
+        print(f"    Total Slippage (USD): {stats['total_slippage_cost']:.6f}")
+        print(f"    Total Gross PnL (USD): {stats['total_gross_pnl_usd']:.4f}")
+        print(f"    Total Net PnL (USD): {stats['total_net_pnl_usd']:.4f}")
+        print(f"    Total Net PnL (INR est): {stats['total_net_pnl_inr_est']:.2f}")
         print(f"    Execution Rate: {stats['execution_rate']:.1%}")
-        
+
         return ExecutionResult(
             executed_trade_log=trade_log,
             execution_events=execution_events,
