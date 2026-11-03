@@ -30,6 +30,32 @@ class ExecutionSimulationReport:
         lines.append(f"  Execution Rate: {statistics.execution_rate:.1%}")
         lines.append(f"  Cancelled Orders: {statistics.cancelled_orders}")
         
+        # Account and Realized PnL
+        lines.append("\n" + "-" * 45)
+        lines.append("ACCOUNT AND REALIZED PNL")
+        lines.append("-" * 45)
+        lines.append(
+            f"  Starting Capital: ₹{statistics.starting_capital_inr:,.2f}"
+        )
+        lines.append(
+            f"  Leverage: {statistics.leverage:.1f}x"
+        )
+        lines.append(
+            f"  Maximum Notional: ₹{statistics.maximum_notional_inr:,.2f}"
+        )
+        lines.append(
+            f"  USD/INR Assumption: {statistics.inr_per_usd_assumption:.2f}"
+        )
+        lines.append(
+            f"  Gross Realized PnL: ${statistics.total_gross_pnl_usd:,.4f}"
+        )
+        lines.append(
+            f"  Net Realized PnL: ${statistics.total_net_pnl_usd:,.4f}"
+        )
+        lines.append(
+            f"  Estimated Net PnL: ₹{statistics.total_net_pnl_inr_est:,.2f}"
+        )
+        
         # Trade Breakdown
         lines.append("\n" + "-" * 45)
         lines.append("TRADE BREAKDOWN")
@@ -45,7 +71,9 @@ class ExecutionSimulationReport:
         lines.append(f"  Avg Holding Bars: {statistics.average_holding_bars:.1f}")
         lines.append(f"  Avg Executed Size: {statistics.average_executed_size:.3f}")
         lines.append(f"  Avg Slippage: {statistics.average_slippage:.6f}")
-        lines.append(f"  Total Commission: {statistics.total_commission:.4f}")
+        lines.append(
+            f"  Total Commission (USD): ${statistics.total_commission:.6f}"
+        )
         lines.append(f"  Execution Delay: {statistics.execution_delay} bars")
         
         # Interpretation
