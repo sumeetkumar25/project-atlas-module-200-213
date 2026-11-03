@@ -88,6 +88,19 @@ class PerformanceAttributionEngine:
         else:
             df = pd.read_csv(filepath)
         
+        # Normalize Module 210 PnL schema.
+        # Keep original source columns unchanged.
+        if "net_pnl" not in df.columns:
+            if "net_pnl_usd" in df.columns:
+                df["net_pnl"] = pd.to_numeric(
+                    df["net_pnl_usd"],
+                    errors="raise"
+                )
+            else:
+                raise ValueError(
+                    "Trade log requires net_pnl or net_pnl_usd"
+                )
+        
         # Ensure datetime columns
         if 'entry_time' in df.columns:
             df['entry_time'] = pd.to_datetime(df['entry_time'])
