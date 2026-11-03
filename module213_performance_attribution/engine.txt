@@ -85,6 +85,28 @@ class PerformanceAttributionEngine:
         self.config = config or AttributionConfig()
 
     # ------------------------------------------------------------------
+    # PnL column resolution
+    # ------------------------------------------------------------------
+    def _resolve_pnl_column(self, df: pd.DataFrame) -> str:
+        """
+        Locate the PnL column regardless of caller-side naming.
+
+        Order of preference:
+          1. 'net_pnl'      — internal canonical name, set by load_trade_log()
+          2. 'net_pnl_usd'  — Module 210's raw export column
+          3. 'total_pnl'    — legacy alias used by older callers
+        """
+        if "net_pnl" in df.columns:
+            return "net_pnl"
+        if "net_pnl_usd" in df.columns:
+            return "net_pnl_usd"
+        if "total_pnl" in df.columns:
+            return "total_pnl"
+        raise ValueError(
+            "Trade log must contain net_pnl, net_pnl_usd, or total_pnl"
+        )
+
+    # ------------------------------------------------------------------
     # Trade-log loading
     # ------------------------------------------------------------------
     def load_trade_log(self, filepath: Path) -> pd.DataFrame:
@@ -176,7 +198,9 @@ class PerformanceAttributionEngine:
                 "slippage_pct": 0.0,
             }
 
-        pnl = pd.to_numeric(df["net_pnl"], errors="raise")
+        # Accept net_pnl, net_pnl_usd, or total_pnl — see _resolve_pnl_column().
+        pnl_col = self._resolve_pnl_column(df)
+        pnl = pd.to_numeric(df[pnl_col], errors="raise")
 
         gross_profit = float(pnl[pnl > 0].sum())
         gross_loss = float(abs(pnl[pnl < 0].sum()))
@@ -584,25 +608,37 @@ class PerformanceAttributionEngine:
     # ------------------------------------------------------------------
     def find_top_contributors(self, df: pd.DataFrame, n: int = 10) -> pd.DataFrame:
         """Find top contributing trades."""
-        pnl_col = 'net_pnl' if 'net_pnl' in df.columns else 'total_pnl'
-        return df.nlargest(n, pnl_col)[['trade_id', 'direction', pnl_col, 'holding_bars']]
+        pnl_col = self._resolve_pnl_column(df)
+        result = df.nlargest(n, pnl_col)[
+            ['trade_id', 'direction', pnl_col, 'holding_bars']
+        ].copy()
+        return result.rename(columns={pnl_col: 'net_pnl'})
 
     def find_worst_contributors(self, df: pd.DataFrame, n: int = 10) -> pd.DataFrame:
         """Find worst contributing trades."""
-        pnl_col = 'net_pnl' if 'net_pnl' in df.columns else 'total_pnl'
-        return df.nsmallest(n, pnl_col)[['trade_id', 'direction', pnl_col, 'holding_bars']]
+        pnl_col = self._resolve_pnl_column(df)
+        result = df.nsmallest(n, pnl_col)[
+            ['trade_id', 'direction', pnl_col, 'holding_bars']
+        ].copy()
+        return result.rename(columns={pnl_col: 'net_pnl'})
 
     def find_largest_gains(self, df: pd.DataFrame, n: int = 10) -> pd.DataFrame:
         """Find largest gain trades."""
-        pnl_col = 'net_pnl' if 'net_pnl' in df.columns else 'total_pnl'
+        pnl_col = self._resolve_pnl_column(df)
         winners = df[df[pnl_col] > 0]
-        return winners.nlargest(n, pnl_col)[['trade_id', 'direction', pnl_col, 'holding_bars']]
+        result = winners.nlargest(n, pnl_col)[
+            ['trade_id', 'direction', pnl_col, 'holding_bars']
+        ].copy()
+        return result.rename(columns={pnl_col: 'net_pnl'})
 
     def find_largest_losses(self, df: pd.DataFrame, n: int = 10) -> pd.DataFrame:
         """Find largest loss trades."""
-        pnl_col = 'net_pnl' if 'net_pnl' in df.columns else 'total_pnl'
+        pnl_col = self._resolve_pnl_column(df)
         losers = df[df[pnl_col] < 0]
-        return losers.nsmallest(n, pnl_col)[['trade_id', 'direction', pnl_col, 'holding_bars']]
+        result = losers.nsmallest(n, pnl_col)[
+            ['trade_id', 'direction', pnl_col, 'holding_bars']
+        ].copy()
+        return result.rename(columns={pnl_col: 'net_pnl'})
 
     # ------------------------------------------------------------------
     # Full attribution
