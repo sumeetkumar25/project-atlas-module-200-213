@@ -798,8 +798,17 @@ class ExecutionSimulationEngine:
             entry_time = event["timestamp"]
             commission = float(event.get("commission", 0.0) or 0.0)
             slippage_cost = float(event.get("slippage_cost", 0.0) or 0.0)
+
+            # Store slippage in USD per BTC unit, not per contract lot.
+            # This ensures entry_slippage_per_unit * match_size
+            # * contract_lot_size yields slippage in USD.
+            btc_quantity_for_event = (
+                size * self.config.contract_lot_size
+            )
             slippage_per_unit = (
-                slippage_cost / size if size > epsilon else 0.0
+                slippage_cost / btc_quantity_for_event
+                if btc_quantity_for_event > epsilon
+                else 0.0
             )
 
             delta = after - before
@@ -1027,8 +1036,15 @@ class ExecutionSimulationEngine:
             entry_commission = (
                 lot["entry_commission_total"] * fraction_of_lot
             )
+
+            # Entry slippage is stored per BTC unit, so we must scale
+            # by the matched lot quantity and the contract lot size to
+            # produce a USD-denominated entry slippage cost.
+            entry_slippage_per_unit = lot["entry_slippage_per_unit"]
             entry_slippage = (
-                lot["entry_slippage_total"] * fraction_of_lot
+                entry_slippage_per_unit
+                * match_size
+                * self.config.contract_lot_size
             )
 
             allocated_exit_commission = (
@@ -1097,10 +1113,19 @@ class ExecutionSimulationEngine:
                 "entry_commission": float(entry_commission),
                 "exit_commission": float(allocated_exit_commission),
                 "total_commission": float(total_trade_commission),
-                "entry_slippage": float(entry_slippage),
+                # Entry slippage in USD, computed from the per-BTC
+                # unit slippage stored on the lot.
+                "entry_slippage": float(
+                    entry_slippage_per_unit
+                    * match_size
+                    * self.config.contract_lot_size
+                ),
                 "exit_slippage": float(allocated_exit_slippage),
                 "total_slippage": float(
-                    entry_slippage + allocated_exit_slippage
+                    entry_slippage_per_unit
+                    * match_size
+                    * self.config.contract_lot_size
+                    + allocated_exit_slippage
                 ),
                 "gross_pnl_usd": float(gross_pnl_usd),
                 "net_pnl_usd": float(net_pnl_usd),
@@ -1197,6 +1222,49 @@ class ExecutionSimulationEngine:
             total_commission = float(filled["commission"].sum())
         else:
             total_commission = 0.0
+
+        # --------------------------------------------------------------
+        # Separate closed-trade PnL from open-position entry costs.
+        # closed_trade_commission reflects commissions already realised
+        # by closed trades. The remainder of total_commission is entry
+        # commission paid on positions that remain open at end-of-data.
+        # This does NOT calculate unrealised PnL on those open positions.
+        # --------------------------------------------------------------
+        closed_trade_commission = (
+            float(trade_log["total_commission"].sum())
+            if (
+                not trade_log.empty
+                and "total_commission" in trade_log.columns
+            )
+            else 0.0
+        )
+
+        open_position_entry_commission = max(
+            0.0,
+            total_commission - closed_trade_commission,
+        )
+
+        closed_gross_pnl = (
+            float(trade_log["gross_pnl_usd"].sum())
+            if (
+                not trade_log.empty
+                and "gross_pnl_usd" in trade_log.columns
+            )
+            else 0.0
+        )
+
+        closed_net_pnl = (
+            float(trade_log["net_pnl_usd"].sum())
+            if (
+                not trade_log.empty
+                and "net_pnl_usd" in trade_log.columns
+            )
+            else 0.0
+        )
+
+        net_pnl_after_all_fees = (
+            closed_gross_pnl - total_commission
+        )
 
         if not filled.empty and "slippage_cost" in filled.columns:
             total_slippage_cost = float(filled["slippage_cost"].sum())
@@ -1321,6 +1389,18 @@ class ExecutionSimulationEngine:
                 not trade_log.empty
                 and "net_pnl_inr_est" in trade_log.columns
             ) else 0.0,
+
+            # ----------------------------------------------------------
+            # Closed-trade vs open-position accounting split
+            # ----------------------------------------------------------
+            "closed_trade_commission_usd": closed_trade_commission,
+            "open_position_entry_commission_usd": (
+                open_position_entry_commission
+            ),
+            "closed_trade_net_pnl_usd": closed_net_pnl,
+            "net_pnl_after_all_fees_usd": (
+                net_pnl_after_all_fees
+            ),
         }
 
         return stats
