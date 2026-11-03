@@ -61,6 +61,9 @@ class AttributionResult:
     worst_contributors: pd.DataFrame
     largest_losses: pd.DataFrame
     largest_gains: pd.DataFrame
+    trade_log: pd.DataFrame = field(
+        default_factory=pd.DataFrame
+    )
 
 
 class PerformanceAttributionEngine:
@@ -580,7 +583,8 @@ class PerformanceAttributionEngine:
             top_contributors=top_contributors,
             worst_contributors=worst_contributors,
             largest_losses=largest_losses,
-            largest_gains=largest_gains
+            largest_gains=largest_gains,
+            trade_log=df.copy(),
         )
 
     def save_outputs(
