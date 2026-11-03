@@ -107,10 +107,10 @@ class PerformanceAttributionEngine:
         )
 
     # ------------------------------------------------------------------
-    # Trade-log loading
+    # Trade-log loading — structural + financial validation
     # ------------------------------------------------------------------
     def load_trade_log(self, filepath: Path) -> pd.DataFrame:
-        """Load and validate the actual Module 210 closed-trade log."""
+        """Load and validate executed trade log from Module 210."""
         if not filepath.exists():
             raise FileNotFoundError(f"Trade log not found: {filepath}")
 
@@ -119,7 +119,15 @@ class PerformanceAttributionEngine:
         else:
             df = pd.read_csv(filepath)
 
-        required = {
+        # ------------------------------------------------------------
+        # Structural required columns
+        #
+        # Downstream attribution methods (session, hour, day, holding,
+        # size, slippage, contributor finders) all read these. Missing
+        # any of them here would surface as a KeyError deep inside an
+        # attribution method — far from the actual cause.
+        # ------------------------------------------------------------
+        required_structural = {
             "trade_id",
             "entry_time",
             "exit_time",
@@ -127,39 +135,90 @@ class PerformanceAttributionEngine:
             "entry_price",
             "exit_price",
             "executed_btc",
-            "gross_pnl_usd",
-            "net_pnl_usd",
-            "total_commission",
             "total_slippage",
             "holding_bars",
         }
-
-        missing = required - set(df.columns)
-        if missing:
+        missing_structural = required_structural - set(df.columns)
+        if missing_structural:
             raise ValueError(
                 f"Module 210 trade log missing required columns: "
-                f"{sorted(missing)}"
+                f"{sorted(missing_structural)}"
+            )
+
+        # ------------------------------------------------------------
+        # Required Module 210 financial fields
+        # ------------------------------------------------------------
+        required_financial = {
+            "net_pnl_usd",
+            "gross_pnl_usd",
+            "total_commission",
+        }
+        missing_financial = required_financial - set(df.columns)
+        if missing_financial:
+            raise ValueError(
+                f"Trade log missing required financial columns: "
+                f"{sorted(missing_financial)}"
             )
 
         if df.empty:
             raise ValueError("Module 210 trade log contains no closed trades.")
 
+        # ------------------------------------------------------------
+        # Convert financial values to numeric
+        # ------------------------------------------------------------
+        for col in required_financial:
+            df[col] = pd.to_numeric(df[col], errors="raise")
+
+        # ------------------------------------------------------------
+        # Reject missing or non-finite financial values
+        # ------------------------------------------------------------
+        financial_array = df[list(required_financial)].to_numpy(dtype=float)
+
+        if not np.isfinite(financial_array).all():
+            raise ValueError(
+                "Trade log contains missing or non-finite financial values."
+            )
+
+        # ------------------------------------------------------------
+        # Verify Module 210 accounting:
+        #   Net PnL = Gross PnL - Commission
+        #
+        # Slippage is NOT subtracted here. Module 210's gross PnL
+        # already reflects executed fill prices, which include adverse
+        # slippage. Subtracting total_slippage again would double-count
+        # the execution cost.
+        # ------------------------------------------------------------
+        expected_net = df["gross_pnl_usd"] - df["total_commission"]
+        residual = (df["net_pnl_usd"] - expected_net).abs()
+
+        tolerance = 1e-6
+
+        if (residual > tolerance).any():
+            bad_rows = int((residual > tolerance).sum())
+            worst_residual = float(residual.max())
+            raise ValueError(
+                f"Trade log net_pnl_usd does not reconcile with "
+                f"gross_pnl_usd - total_commission on {bad_rows} row(s); "
+                f"max residual = {worst_residual:.10f} (tolerance={tolerance})."
+            )
+
+        # ------------------------------------------------------------
+        # Duplicate trade_id check
+        # ------------------------------------------------------------
         if df["trade_id"].duplicated().any():
             raise ValueError(
                 "Module 210 trade log contains duplicate trade_id values."
             )
 
-        # Create the legacy `net_pnl` column from Module 210's `net_pnl_usd`
-        # so downstream attribution and contributor lookups continue to work
-        # without changing their column selector.
+        # ------------------------------------------------------------
+        # Normalize the legacy net_pnl alias
+        # ------------------------------------------------------------
         if "net_pnl" not in df.columns:
-            df["net_pnl"] = pd.to_numeric(
-                df["net_pnl_usd"],
-                errors="raise"
-            )
+            df["net_pnl"] = df["net_pnl_usd"].astype(float)
 
-        # Standardise timestamps to UTC. Session attribution is therefore
-        # interpreted in UTC rather than local Indian time.
+        # ------------------------------------------------------------
+        # Standardize timestamps to UTC
+        # ------------------------------------------------------------
         df["entry_time"] = pd.to_datetime(
             df["entry_time"],
             utc=True,
