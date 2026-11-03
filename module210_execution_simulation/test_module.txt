@@ -91,7 +91,11 @@ def test_engine_generate_orders():
     
     assert not orders_df.empty
     assert 'order_type' in orders_df.columns
-    assert 'size_change' in orders_df.columns
+    # Patch 2 of engine.py renamed size_change -> size_change_lots,
+    # because Module 210 now emits integer-lot target changes rather
+    # than fractional-exposure deltas.
+    assert 'size_change_lots' in orders_df.columns
+    assert 'target_fraction' in orders_df.columns
     
     print(f"  Generated {len(orders_df)} orders")
     print("  ✓ Generate orders test passed")
@@ -152,21 +156,31 @@ def test_engine_slippage():
 
 
 def test_engine_commission():
-    """Test 5: Commission."""
+    """Test 5: Delta India taker commission plus GST."""
     print("\n" + "=" * 60)
     print("TEST 5: Commission")
     print("=" * 60)
     
-    config = ExecutionConfig(commission_rate=0.0004)
+    config = ExecutionConfig(
+        commission_rate=0.0005,
+        gst_rate=0.18,
+        contract_lot_size=0.001,
+    )
     engine = ExecutionSimulationEngine(config=config)
     
+    # 1 lot = 0.001 BTC
+    # Notional = 0.001 * $100 = $0.10
+    # Fee = $0.10 * 0.05% = $0.00005
+    # GST = $0.00005 * 18% = $0.000009
     commission = engine.apply_commission(1.0, 100.0)
-    assert commission == 0.04
+    assert np.isclose(commission, 0.000059)
     
+    # 2.5 lots = 0.0025 BTC
+    # Notional = 0.0025 * $50 = $0.125
     commission = engine.apply_commission(2.5, 50.0)
-    assert commission == 0.05
+    assert np.isclose(commission, 0.00007375)
     
-    print("  ✓ Commission test passed")
+    print("  ✓ Commission plus GST test passed")
     return True
 
 
@@ -265,11 +279,22 @@ def test_engine_trade_lifecycle():
         assert 'exit_price' in trade_log.columns
         assert 'executed_size' in trade_log.columns
         
+        # Patch 5 added realized PnL columns
+        assert 'gross_pnl_usd' in trade_log.columns
+        assert 'net_pnl_usd' in trade_log.columns
+        assert 'net_pnl_inr_est' in trade_log.columns
+        assert 'executed_btc' in trade_log.columns
+        
         # Check fractional positions
         for _, trade in trade_log.iterrows():
             assert trade['executed_size'] > 0
             # Size should be a float (0.5, 0.3, 0.75, etc.)
             assert isinstance(trade['executed_size'], float)
+            # BTC quantity must equal lots * contract_lot_size
+            assert np.isclose(
+                trade['executed_btc'],
+                trade['executed_size'] * engine.config.contract_lot_size
+            )
     
     print("  ✓ Trade lifecycle test passed")
     return True
@@ -427,9 +452,14 @@ def test_pipeline():
     data['portfolio_matrix'].to_parquet(matrix_path, index=False)
     
     research = ExecutionSimulationResearch(
-        commission_rate=0.0004,
+        starting_capital_inr=5000.0,
+        leverage=5.0,
+        inr_per_usd=90.0,
+        contract_lot_size=0.001,
+        commission_rate=0.0005,
+        gst_rate=0.18,
         slippage_rate=0.0001,
-        latency_bars=1
+        latency_bars=1,
     )
     
     result = research.run_execution(
@@ -458,6 +488,47 @@ def test_pipeline():
     return True
 
 
+def test_delta_contract_sizing():
+    """Test 14: INR capital, leverage and BTCUSD contract conversion."""
+    print("\n" + "=" * 60)
+    print("TEST 14: Delta Contract Sizing")
+    print("=" * 60)
+    
+    config = ExecutionConfig(
+        starting_capital_inr=5000.0,
+        leverage=5.0,
+        inr_per_usd=90.0,
+        contract_lot_size=0.001,
+    )
+    engine = ExecutionSimulationEngine(config=config)
+    
+    # ₹5,000 / 90 = $55.5556
+    # Maximum notional = $55.5556 * 5 = $277.7778
+    # At BTCUSD $100,000:
+    # BTC quantity = 0.0027778 BTC
+    # Rounded down to 2 lots = 0.002 BTC
+    lots = engine.calculate_target_lots(
+        approved_fraction=1.0,
+        btcusd_price=100000.0,
+    )
+    assert lots == 2
+    
+    short_lots = engine.calculate_target_lots(
+        approved_fraction=-1.0,
+        btcusd_price=100000.0,
+    )
+    assert short_lots == -2
+    
+    flat_lots = engine.calculate_target_lots(
+        approved_fraction=0.0,
+        btcusd_price=100000.0,
+    )
+    assert flat_lots == 0
+    
+    print("  ✓ Delta contract sizing test passed")
+    return True
+
+
 def main():
     """Run all tests."""
     print("\n" + "=" * 70)
@@ -480,6 +551,7 @@ def main():
     results["statistics_engine"] = test_statistics()
     results["validator"] = test_validator()
     results["pipeline"] = test_pipeline()
+    results["delta_contract_sizing"] = test_delta_contract_sizing()
     
     print("\n" + "=" * 70)
     print("RESULTS")
