@@ -57,6 +57,11 @@ class AttributionStatisticsEngine:
         """
         Extract the per-trade net PnL series from the result object.
 
+        Accepts both the internal canonical name ('net_pnl') and Module
+        210's raw export name ('net_pnl_usd'), so the statistics engine
+        works whether or not the caller went through load_trade_log()'s
+        column-normalization step.
+
         Returns an empty Series if no trade-level DataFrame is available.
         """
         for attr_name in self._TRADE_ATTR_CANDIDATES:
@@ -65,9 +70,12 @@ class AttributionStatisticsEngine:
             if not isinstance(candidate, pd.DataFrame) or candidate.empty:
                 continue
 
-            for pnl_col in ("net_pnl", "total_pnl"):
+            for pnl_col in ("net_pnl", "net_pnl_usd", "total_pnl"):
                 if pnl_col in candidate.columns:
-                    pnl = candidate[pnl_col].astype(float).dropna()
+                    pnl = pd.to_numeric(
+                        candidate[pnl_col],
+                        errors="raise"
+                    ).dropna()
                     if not pnl.empty:
                         return pnl
 
@@ -153,8 +161,9 @@ class AttributionStatisticsEngine:
         if pnl_series.empty:
             raise ValueError(
                 "Module 213 statistics requires trade-level PnL data, "
-                "but no trades DataFrame with a 'net_pnl' or 'total_pnl' "
-                "column was found on AttributionResult. Cannot compute "
+                "but no trades DataFrame with a 'net_pnl', "
+                "'net_pnl_usd', or 'total_pnl' column was found "
+                "on AttributionResult. Cannot compute "
                 "largest_winner, largest_loser, or sortino accurately."
             )
 
