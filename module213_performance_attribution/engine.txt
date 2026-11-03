@@ -32,7 +32,10 @@ warnings.filterwarnings('ignore')
 class AttributionConfig:
     """Configuration for performance attribution."""
     holding_bins: List[int] = field(default_factory=lambda: [1, 5, 10, 20, 50])
-    size_bins: List[float] = field(default_factory=lambda: [0, 0.25, 0.5, 0.75, 1.0])
+    # BTC quantities, not contract counts.
+    size_bins: List[float] = field(
+        default_factory=lambda: [0.0, 0.001, 0.002, 0.003, 0.005]
+    )
     volatility_bins: List[float] = field(default_factory=lambda: [0, 0.25, 0.5, 0.75, 1.0])
     sessions: List[str] = field(default_factory=lambda: ['Asia', 'Europe', 'US', 'Overlap'])
     session_hours: Dict[str, List[int]] = field(default_factory=lambda: {
@@ -81,105 +84,197 @@ class PerformanceAttributionEngine:
         """
         self.config = config or AttributionConfig()
 
+    # ------------------------------------------------------------------
+    # Trade-log loading
+    # ------------------------------------------------------------------
     def load_trade_log(self, filepath: Path) -> pd.DataFrame:
-        """Load executed trade log from Module 210."""
+        """Load and validate the actual Module 210 closed-trade log."""
         if not filepath.exists():
             raise FileNotFoundError(f"Trade log not found: {filepath}")
-        
-        if filepath.suffix == '.parquet':
+
+        if filepath.suffix.lower() == ".parquet":
             df = pd.read_parquet(filepath)
         else:
             df = pd.read_csv(filepath)
-        
-        # Normalize Module 210 PnL schema.
-        # Keep original source columns unchanged.
-        if "net_pnl" not in df.columns:
-            if "net_pnl_usd" in df.columns:
-                df["net_pnl"] = pd.to_numeric(
-                    df["net_pnl_usd"],
-                    errors="raise"
-                )
-            else:
-                raise ValueError(
-                    "Trade log requires net_pnl or net_pnl_usd"
-                )
-        
-        # Ensure datetime columns
-        if 'entry_time' in df.columns:
-            df['entry_time'] = pd.to_datetime(df['entry_time'])
-        if 'exit_time' in df.columns:
-            df['exit_time'] = pd.to_datetime(df['exit_time'])
-        
-        return df
 
-    def compute_metrics(self, df: pd.DataFrame) -> Dict[str, Any]:
-        """Compute comprehensive metrics for a DataFrame."""
-        if df.empty:
-            return {
-                'trades': 0,
-                'net_pnl': 0.0,
-                'gross_profit': 0.0,
-                'gross_loss': 0.0,
-                'profit_factor': 0.0,
-                'win_rate': 0.0,
-                'avg_pnl': 0.0,
-                'sharpe': 0.0,
-                'max_drawdown': 0.0,
-                'avg_holding': 0.0,
-                'commission': 0.0,
-                'slippage': 0.0,
-                'commission_pct': 0.0,
-                'slippage_pct': 0.0
-            }
-        
-        pnl_col = 'net_pnl' if 'net_pnl' in df.columns else 'total_pnl'
-        pnl = df[pnl_col]
-        
-        gross_profit = pnl[pnl > 0].sum()
-        gross_loss = abs(pnl[pnl < 0].sum())
-        
-        profit_factor = gross_profit / gross_loss if gross_loss > 0 else np.inf
-        win_rate = (pnl > 0).mean()
-        avg_pnl = pnl.mean()
-        
-        # Sharpe ratio
-        if pnl.std() > 0:
-            sharpe = (pnl.mean() / pnl.std()) * np.sqrt(252)
-        else:
-            sharpe = 0.0
-        
-        # Max drawdown on equity curve
-        equity = pnl.cumsum()
-        running_max = equity.expanding().max()
-        drawdown = (equity - running_max)
-        max_drawdown = abs(drawdown.min()) if not drawdown.empty else 0.0
-        
-        # Commission and slippage
-        commission = df['total_commission'].sum() if 'total_commission' in df.columns else 0.0
-        slippage = df['total_slippage'].sum() if 'total_slippage' in df.columns else 0.0
-        
-        # Percentages
-        total_trade_value = abs(pnl).sum() if abs(pnl).sum() > 0 else 1.0
-        commission_pct = (commission / total_trade_value) * 100
-        slippage_pct = (slippage / total_trade_value) * 100
-        
-        return {
-            'trades': len(df),
-            'net_pnl': float(pnl.sum()),
-            'gross_profit': float(gross_profit),
-            'gross_loss': float(gross_loss),
-            'profit_factor': float(profit_factor),
-            'win_rate': float(win_rate),
-            'avg_pnl': float(avg_pnl),
-            'sharpe': float(sharpe),
-            'max_drawdown': float(max_drawdown),
-            'avg_holding': float(df['holding_bars'].mean()) if 'holding_bars' in df.columns else 0.0,
-            'commission': float(commission),
-            'slippage': float(slippage),
-            'commission_pct': float(commission_pct),
-            'slippage_pct': float(slippage_pct)
+        required = {
+            "trade_id",
+            "entry_time",
+            "exit_time",
+            "direction",
+            "entry_price",
+            "exit_price",
+            "executed_btc",
+            "gross_pnl_usd",
+            "net_pnl_usd",
+            "total_commission",
+            "total_slippage",
+            "holding_bars",
         }
 
+        missing = required - set(df.columns)
+        if missing:
+            raise ValueError(
+                f"Module 210 trade log missing required columns: "
+                f"{sorted(missing)}"
+            )
+
+        if df.empty:
+            raise ValueError("Module 210 trade log contains no closed trades.")
+
+        if df["trade_id"].duplicated().any():
+            raise ValueError(
+                "Module 210 trade log contains duplicate trade_id values."
+            )
+
+        # Create the legacy `net_pnl` column from Module 210's `net_pnl_usd`
+        # so downstream attribution and contributor lookups continue to work
+        # without changing their column selector.
+        if "net_pnl" not in df.columns:
+            df["net_pnl"] = pd.to_numeric(
+                df["net_pnl_usd"],
+                errors="raise"
+            )
+
+        # Standardise timestamps to UTC. Session attribution is therefore
+        # interpreted in UTC rather than local Indian time.
+        df["entry_time"] = pd.to_datetime(
+            df["entry_time"],
+            utc=True,
+            errors="raise",
+        )
+        df["exit_time"] = pd.to_datetime(
+            df["exit_time"],
+            utc=True,
+            errors="raise",
+        )
+
+        return df
+
+    # ------------------------------------------------------------------
+    # Trade-level metrics
+    # ------------------------------------------------------------------
+    def compute_metrics(self, df: pd.DataFrame) -> Dict[str, Any]:
+        """Compute trade-level performance metrics."""
+        if df.empty:
+            return {
+                "trades": 0,
+                "net_pnl": 0.0,
+                "gross_profit": 0.0,
+                "gross_loss": 0.0,
+                "profit_factor": 0.0,
+                "win_rate": 0.0,
+                "avg_pnl": 0.0,
+                "sharpe": 0.0,
+                "sharpe_basis": "per_trade_unannualized",
+                "max_drawdown": 0.0,
+                "avg_holding": 0.0,
+                "commission": 0.0,
+                "slippage": 0.0,
+                "traded_notional_usd": 0.0,
+                "commission_pct": 0.0,
+                "slippage_pct": 0.0,
+            }
+
+        pnl = pd.to_numeric(df["net_pnl"], errors="raise")
+
+        gross_profit = float(pnl[pnl > 0].sum())
+        gross_loss = float(abs(pnl[pnl < 0].sum()))
+
+        profit_factor = (
+            gross_profit / gross_loss
+            if gross_loss > 0
+            else (float("inf") if gross_profit > 0 else 0.0)
+        )
+
+        win_rate = float((pnl > 0).mean())
+        avg_pnl = float(pnl.mean())
+
+        # Trade-level, unannualised Sharpe ratio.
+        # Do NOT multiply by √252 here; per-trade PnL is not a daily return.
+        if pnl.std() > 0:
+            sharpe = float(pnl.mean() / pnl.std())
+        else:
+            sharpe = 0.0
+
+        # Max drawdown on trade-level cumulative equity, seeded with a
+        # zero-equity baseline so the first trade's drawdown is measured
+        # against the starting capital-at-risk baseline.
+        equity = pd.concat(
+            [pd.Series([0.0]), pnl.reset_index(drop=True)],
+            ignore_index=True,
+        ).cumsum()
+        running_max = equity.expanding().max()
+        drawdown = equity - running_max
+        max_drawdown = (
+            float(abs(drawdown.min()))
+            if not drawdown.empty
+            else 0.0
+        )
+
+        commission = (
+            float(df["total_commission"].sum())
+            if "total_commission" in df.columns
+            else 0.0
+        )
+        slippage = (
+            float(df["total_slippage"].sum())
+            if "total_slippage" in df.columns
+            else 0.0
+        )
+
+        traded_notional_usd = 0.0
+        if (
+            "executed_btc" in df.columns
+            and "entry_price" in df.columns
+            and "exit_price" in df.columns
+        ):
+            traded_notional_usd = float(
+                (
+                    df["executed_btc"]
+                    * (df["entry_price"] + df["exit_price"])
+                ).sum()
+            )
+
+        commission_pct = (
+            commission / traded_notional_usd * 100
+            if traded_notional_usd > 0
+            else 0.0
+        )
+        slippage_pct = (
+            slippage / traded_notional_usd * 100
+            if traded_notional_usd > 0
+            else 0.0
+        )
+
+        avg_holding = (
+            float(df["holding_bars"].mean())
+            if "holding_bars" in df.columns
+            else 0.0
+        )
+
+        return {
+            "trades": len(df),
+            "net_pnl": float(pnl.sum()),
+            "gross_profit": gross_profit,
+            "gross_loss": gross_loss,
+            "profit_factor": float(profit_factor),
+            "win_rate": win_rate,
+            "avg_pnl": avg_pnl,
+            "sharpe": sharpe,
+            "sharpe_basis": "per_trade_unannualized",
+            "max_drawdown": max_drawdown,
+            "avg_holding": avg_holding,
+            "commission": commission,
+            "slippage": slippage,
+            "traded_notional_usd": traded_notional_usd,
+            "commission_pct": commission_pct,
+            "slippage_pct": slippage_pct,
+        }
+
+    # ------------------------------------------------------------------
+    # Attribution by direction
+    # ------------------------------------------------------------------
     def attribute_direction(self, df: pd.DataFrame) -> pd.DataFrame:
         """1. Long vs Short attribution."""
         results = []
@@ -197,6 +292,9 @@ class PerformanceAttributionEngine:
         
         return pd.DataFrame(results)
 
+    # ------------------------------------------------------------------
+    # Attribution by session
+    # ------------------------------------------------------------------
     def attribute_session(self, df: pd.DataFrame) -> pd.DataFrame:
         """Mutually exclusive session attribution plus separate overlap."""
         df_copy = df.copy()
@@ -230,6 +328,9 @@ class PerformanceAttributionEngine:
 
         return pd.DataFrame(results)
 
+    # ------------------------------------------------------------------
+    # Attribution by hour
+    # ------------------------------------------------------------------
     def attribute_hour(self, df: pd.DataFrame) -> pd.DataFrame:
         """3. Time-of-Day attribution."""
         results = []
@@ -245,6 +346,9 @@ class PerformanceAttributionEngine:
         
         return pd.DataFrame(results)
 
+    # ------------------------------------------------------------------
+    # Attribution by day of week
+    # ------------------------------------------------------------------
     def attribute_day(self, df: pd.DataFrame) -> pd.DataFrame:
         """4. Day-of-Week attribution."""
         results = []
@@ -260,6 +364,9 @@ class PerformanceAttributionEngine:
         
         return pd.DataFrame(results)
 
+    # ------------------------------------------------------------------
+    # Attribution by holding time
+    # ------------------------------------------------------------------
     def attribute_holding_time(self, df: pd.DataFrame) -> pd.DataFrame:
         """5. Holding Time attribution."""
         results = []
@@ -289,35 +396,48 @@ class PerformanceAttributionEngine:
         
         return pd.DataFrame(results)
 
+    # ------------------------------------------------------------------
+    # Attribution by trade size (BTC)
+    # ------------------------------------------------------------------
     def attribute_size(self, df: pd.DataFrame) -> pd.DataFrame:
-        """6. Trade Size attribution."""
+        """Attribute performance by executed BTC quantity."""
+        if "executed_btc" not in df.columns:
+            return pd.DataFrame([{
+                "size_bin": "UNAVAILABLE",
+                "trades": len(df),
+                "reason": "executed_btc column missing",
+            }])
+
         results = []
-        
-        df_copy = df.copy()
-        
-        for i in range(len(self.config.size_bins)):
-            if i == 0:
-                continue
-            lower = self.config.size_bins[i-1]
-            upper = self.config.size_bins[i]
-            
-            subset = df_copy[
-                (df_copy['executed_size'] >= lower) & 
-                (df_copy['executed_size'] < upper)
+        bins = self.config.size_bins
+
+        if len(bins) < 2 or sorted(bins) != bins:
+            raise ValueError("size_bins must be an ascending list.")
+
+        for i in range(len(bins) - 1):
+            lower = bins[i]
+            upper = bins[i + 1]
+
+            subset = df[
+                (df["executed_btc"] >= lower)
+                & (df["executed_btc"] < upper)
             ]
-            
+
             metrics = self.compute_metrics(subset)
-            metrics['size_bin'] = f"{lower:.2f}-{upper:.2f}"
+            metrics["size_bin"] = f"{lower:.6f}-{upper:.6f} BTC"
             results.append(metrics)
-        
-        # Add max bin
-        subset = df_copy[df_copy['executed_size'] >= self.config.size_bins[-1]]
+
+        # Include the upper endpoint in the final bucket.
+        subset = df[df["executed_btc"] >= bins[-1]]
         metrics = self.compute_metrics(subset)
-        metrics['size_bin'] = f"{self.config.size_bins[-1]:.2f}+"
+        metrics["size_bin"] = f"{bins[-1]:.6f}+ BTC"
         results.append(metrics)
-        
+
         return pd.DataFrame(results)
 
+    # ------------------------------------------------------------------
+    # Attribution by volatility
+    # ------------------------------------------------------------------
     def attribute_volatility(self, df: pd.DataFrame) -> pd.DataFrame:
         """Attribute trades by genuine, supplied volatility percentile."""
         if "volatility_percentile" not in df.columns:
@@ -361,6 +481,9 @@ class PerformanceAttributionEngine:
 
         return pd.DataFrame(results)
 
+    # ------------------------------------------------------------------
+    # Attribution by market regime
+    # ------------------------------------------------------------------
     def attribute_regime(self, df: pd.DataFrame) -> pd.DataFrame:
         """Attribute trades by genuine, supplied market regime."""
         if "market_regime" not in df.columns:
@@ -389,102 +512,76 @@ class PerformanceAttributionEngine:
 
         return pd.DataFrame(results)
 
+    # ------------------------------------------------------------------
+    # Commission attribution
+    # ------------------------------------------------------------------
     def attribute_commission(self, df: pd.DataFrame) -> pd.DataFrame:
-        """9. Commission attribution."""
-        results = []
-        
-        pnl_col = 'net_pnl' if 'net_pnl' in df.columns else 'total_pnl'
-        pnl = df[pnl_col]
-        
-        # Calculate gross PnL (before commission and slippage)
-        if 'total_commission' in df.columns and 'total_slippage' in df.columns:
-            gross_pnl = pnl + df['total_commission'] + df['total_slippage']
-        else:
-            gross_pnl = pnl
-        
-        results.append({
-            'metric': 'Gross PnL',
-            'value': float(gross_pnl.sum())
-        })
-        
-        results.append({
-            'metric': 'Commission',
-            'value': float(df['total_commission'].sum()) if 'total_commission' in df.columns else 0.0
-        })
-        
-        results.append({
-            'metric': 'Slippage',
-            'value': float(df['total_slippage'].sum()) if 'total_slippage' in df.columns else 0.0
-        })
-        
-        results.append({
-            'metric': 'Net PnL',
-            'value': float(pnl.sum())
-        })
-        
-        total_value = abs(gross_pnl).sum() if abs(gross_pnl).sum() > 0 else 1.0
-        commission_pct = (df['total_commission'].sum() / total_value * 100) if 'total_commission' in df.columns else 0.0
-        slippage_pct = (df['total_slippage'].sum() / total_value * 100) if 'total_slippage' in df.columns else 0.0
-        
-        results.append({
-            'metric': 'Commission %',
-            'value': float(commission_pct)
-        })
-        
-        results.append({
-            'metric': 'Slippage %',
-            'value': float(slippage_pct)
-        })
-        
-        return pd.DataFrame(results)
+        """Reconcile gross PnL, commission and net PnL."""
+        gross = float(df["gross_pnl_usd"].sum())
+        commission = float(df["total_commission"].sum())
+        slippage = float(df["total_slippage"].sum())
+        net = float(df["net_pnl_usd"].sum())
 
+        traded_notional = float(
+            (
+                df["executed_btc"]
+                * (df["entry_price"] + df["exit_price"])
+            ).sum()
+        )
+
+        reconciliation = gross - commission - net
+
+        return pd.DataFrame([
+            {"metric": "Gross PnL USD", "value": gross},
+            {"metric": "Commission USD", "value": commission},
+            {"metric": "Slippage USD (reported execution impact)", "value": slippage},
+            {"metric": "Net PnL USD", "value": net},
+            {"metric": "Reconciliation Residual USD", "value": reconciliation},
+            {
+                "metric": "Commission % of Round Trip Notional",
+                "value": commission / traded_notional * 100
+                if traded_notional > 0 else 0.0,
+            },
+            {
+                "metric": "Slippage % of Round Trip Notional",
+                "value": slippage / traded_notional * 100
+                if traded_notional > 0 else 0.0,
+            },
+        ])
+
+    # ------------------------------------------------------------------
+    # Slippage attribution
+    # ------------------------------------------------------------------
     def attribute_slippage(self, df: pd.DataFrame) -> pd.DataFrame:
-        """10. Slippage attribution."""
+        """Report slippage without deducting it twice from realised PnL."""
         results = []
-        
-        pnl_col = 'net_pnl' if 'net_pnl' in df.columns else 'total_pnl'
-        pnl = df[pnl_col]
-        
-        # Calculate expected PnL (before slippage)
-        if 'total_slippage' in df.columns:
-            expected_pnl = pnl + df['total_slippage']
-        else:
-            expected_pnl = pnl
-        
-        results.append({
-            'metric': 'Expected PnL',
-            'value': float(expected_pnl.sum())
-        })
-        
-        results.append({
-            'metric': 'Actual PnL',
-            'value': float(pnl.sum())
-        })
-        
-        slippage_loss = expected_pnl.sum() - pnl.sum()
-        results.append({
-            'metric': 'Slippage Loss',
-            'value': float(slippage_loss)
-        })
-        
-        # By direction
-        for direction in ['LONG', 'SHORT']:
-            subset = df[df['direction'] == direction]
-            subset_pnl = subset[pnl_col]
-            if 'total_slippage' in subset.columns:
-                subset_expected = subset_pnl + subset['total_slippage']
-            else:
-                subset_expected = subset_pnl
-            
-            subset_slippage = subset_expected.sum() - subset_pnl.sum()
-            
-            results.append({
-                'metric': f'Slippage Loss ({direction})',
-                'value': float(subset_slippage)
-            })
-        
+
+        for direction in ["LONG", "SHORT", "OVERALL"]:
+            subset = (
+                df if direction == "OVERALL"
+                else df[df["direction"] == direction]
+            )
+
+            results.extend([
+                {
+                    "metric": f"Executed Gross PnL ({direction})",
+                    "value": float(subset["gross_pnl_usd"].sum()),
+                },
+                {
+                    "metric": f"Reported Slippage Cost ({direction})",
+                    "value": float(subset["total_slippage"].sum()),
+                },
+                {
+                    "metric": f"Net PnL After Commission ({direction})",
+                    "value": float(subset["net_pnl_usd"].sum()),
+                },
+            ])
+
         return pd.DataFrame(results)
 
+    # ------------------------------------------------------------------
+    # Contributor lookups
+    # ------------------------------------------------------------------
     def find_top_contributors(self, df: pd.DataFrame, n: int = 10) -> pd.DataFrame:
         """Find top contributing trades."""
         pnl_col = 'net_pnl' if 'net_pnl' in df.columns else 'total_pnl'
@@ -507,6 +604,9 @@ class PerformanceAttributionEngine:
         losers = df[df[pnl_col] < 0]
         return losers.nsmallest(n, pnl_col)[['trade_id', 'direction', pnl_col, 'holding_bars']]
 
+    # ------------------------------------------------------------------
+    # Full attribution
+    # ------------------------------------------------------------------
     def compute_attribution(self, df: pd.DataFrame) -> AttributionResult:
         """
         Run complete performance attribution.
@@ -587,6 +687,9 @@ class PerformanceAttributionEngine:
             trade_log=df.copy(),
         )
 
+    # ------------------------------------------------------------------
+    # Save outputs
+    # ------------------------------------------------------------------
     def save_outputs(
         self,
         result: AttributionResult,
@@ -620,6 +723,9 @@ class PerformanceAttributionEngine:
                 df.to_csv(filepath, index=False)
                 print(f"  Saved {name} to {filepath}")
 
+    # ------------------------------------------------------------------
+    # Main computation entry point
+    # ------------------------------------------------------------------
     def compute(
         self,
         trade_log_path: Path,
@@ -651,7 +757,8 @@ class PerformanceAttributionEngine:
             print(f"    Net PnL: {overall['net_pnl']:.2f}")
             print(f"    Profit Factor: {overall['profit_factor']:.3f}")
             print(f"    Win Rate: {overall['win_rate']:.1%}")
-            print(f"    Sharpe: {overall['sharpe']:.3f}")
+            print(f"    Sharpe (per-trade, unannualised): {overall['sharpe']:.3f}")
+            print(f"    Max Drawdown (USD absolute): {overall['max_drawdown']:.2f}")
             print(f"    Commission %: {overall['commission_pct']:.2f}%")
             print(f"    Slippage %: {overall['slippage_pct']:.2f}%")
         
