@@ -74,6 +74,7 @@ class PerformanceAttribution(BaseResearchModule):
         self.statistics = None
         self._output_dir = None
         self._paths = None
+        self.validation_passed = False
 
     def _register_pipeline_steps(self):
         """Register pipeline steps."""
@@ -149,11 +150,25 @@ class PerformanceAttribution(BaseResearchModule):
         return self.stats_engine.summary_dict(self.statistics)
     
     def _validate(self) -> Dict[str, Any]:
-        """Step 3: Validation."""
+        """Step 3: Validate performance attribution."""
         self.logger.info("Step 3: Validation")
-        passed = run_validation(self.result_data, self.statistics, str(self._output_dir))
-        self.logger.success("Validation complete")
-        return {"software_validation_passed": passed}
+        
+        passed = run_validation(
+            self.result_data,
+            self.statistics,
+            str(self._output_dir),
+        )
+        
+        self.validation_passed = bool(passed)
+        
+        if passed:
+            self.logger.success("Validation passed")
+        else:
+            self.logger.error("Validation failed")
+        
+        return {
+            "software_validation_passed": self.validation_passed
+        }
     
     def _export_results(self) -> Dict[str, Any]:
         """Step 4: Export."""
@@ -182,6 +197,7 @@ class PerformanceAttribution(BaseResearchModule):
             self.result_data,
             metadata=self.METADATA,
             dataset_name=self.result.dataset_identifier,
+            validation_passed=self.validation_passed,
         )
         
         # Save report to disk
