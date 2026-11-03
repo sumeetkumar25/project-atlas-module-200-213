@@ -23,6 +23,13 @@ class ExecutionStatistics:
     execution_delay: int
     average_executed_size: float
     total_events: int
+    starting_capital_inr: float
+    leverage: float
+    maximum_notional_inr: float
+    inr_per_usd_assumption: float
+    total_gross_pnl_usd: float
+    total_net_pnl_usd: float
+    total_net_pnl_inr_est: float
 
 
 class ExecutionStatisticsEngine:
@@ -49,7 +56,26 @@ class ExecutionStatisticsEngine:
             cancelled_orders=result.summary_statistics['cancelled_orders'],
             execution_delay=result.summary_statistics['execution_delay'],
             average_executed_size=result.summary_statistics['average_executed_size'],
-            total_events=result.summary_statistics['total_events']
+            total_events=result.summary_statistics['total_events'],
+            starting_capital_inr=result.summary_statistics[
+                "starting_capital_inr"
+            ],
+            leverage=result.summary_statistics["leverage"],
+            maximum_notional_inr=result.summary_statistics[
+                "maximum_notional_inr"
+            ],
+            inr_per_usd_assumption=result.summary_statistics[
+                "inr_per_usd_assumption"
+            ],
+            total_gross_pnl_usd=result.summary_statistics[
+                "total_gross_pnl_usd"
+            ],
+            total_net_pnl_usd=result.summary_statistics[
+                "total_net_pnl_usd"
+            ],
+            total_net_pnl_inr_est=result.summary_statistics[
+                "total_net_pnl_inr_est"
+            ]
         )
     
     def summary_dataframe(self, stats: ExecutionStatistics) -> pd.DataFrame:
