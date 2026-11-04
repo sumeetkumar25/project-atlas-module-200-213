@@ -209,10 +209,16 @@ class PerformanceAttribution(BaseResearchModule):
         self.logger.metric("Artifacts", str(len(self.result.artifacts)))
         self.logger.success("Export complete")
         
+        # Report the actual trade count from the statistics engine.
+        #
+        # The previous version reported len(self.result_data.top_contributors),
+        # which is capped at find_top_contributors()'s default n=10 and
+        # therefore always reported 10 (or fewer) regardless of how many
+        # trades were actually analysed.
         return {
             "export_status": "complete",
             "artifact_count": len(self.result.artifacts),
-            "trades": len(self.result_data.top_contributors) if not self.result_data.top_contributors.empty else 0
+            "trades": int(self.statistics.total_trades)
         }
     
     def compute(self) -> Dict[str, Any]:
