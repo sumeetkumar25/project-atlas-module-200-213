@@ -18,10 +18,13 @@ Analyses:
 """
 
 from typing import Optional, Dict, Any
+from datetime import datetime
+import time
 import pandas as pd
 from pathlib import Path
 
 from atlas.core.base_research_module import BaseResearchModule
+from atlas.core.research_result import ResearchResult
 from atlas.framework.registry import AtlasRegistry
 
 from .engine import PerformanceAttributionEngine, AttributionConfig
@@ -74,6 +77,7 @@ class PerformanceAttribution(BaseResearchModule):
         self.statistics = None
         self._output_dir = None
         self._paths = None
+        self._dataset_id = "performance_attribution"
         self.validation_passed = False
 
     def _register_pipeline_steps(self):
@@ -225,8 +229,20 @@ class PerformanceAttribution(BaseResearchModule):
         """Run the full computation pipeline."""
         self.logger.section("Performance Attribution Pipeline")
         results = self.execute_pipeline()
-        self.result.status = "completed"
-        self.logger.success("Module 213 complete")
+        
+        # Validation status must determine the final module status.
+        #
+        # "completed" means the module ran to completion AND passed its
+        # own validation gate. "partial" signals that the pipeline ran
+        # but a validation check failed — the runner's mandatory gate
+        # will still reject the module, but the status is truthful.
+        self.result.status = (
+            "completed" if self.validation_passed else "partial"
+        )
+        
+        self.logger.success(
+            "Module 213 computation pipeline finished"
+        )
         return results
     
     def run(self, filepath: str, output_dir=None):
@@ -239,6 +255,57 @@ class PerformanceAttribution(BaseResearchModule):
         self._output_dir = Path(output_dir) if output_dir else None
         return super().run_dataframe(df, dataset_id, output_dir)
     
+    def _execute_attribution_workflow(self):
+        """
+        Execute Module 213 directly from the Module 210 trade log.
+
+        This deliberately bypasses BaseResearchModule's OHLCV
+        validation because Module 213 consumes executed trades,
+        not market OHLCV data.
+        """
+        if self._paths is None or "trade_log" not in self._paths:
+            raise ValueError("Module 210 trade log path is missing.")
+        if self._output_dir is None:
+            raise ValueError("Module 213 output directory is missing.")
+        
+        self._output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Reset market-data fields: this module does not consume OHLCV.
+        self.market_df = None
+        self.feature_df = None
+        self.df = None
+        self.result_data = None
+        self.statistics = None
+        self.validation_passed = False
+        
+        # Initialize the standard result object without fake market data.
+        #
+        # timestamp_start / timestamp_end are "N/A" because the module
+        # operates on a trade log, not a bar-aligned market DataFrame.
+        # The actual trade-date span is exposed via the trade log itself
+        # and through the statistics dict.
+        self.result = ResearchResult(
+            module_name=self.module_name,
+            module_version=self.module_version,
+            dataset_identifier=str(self._dataset_id),
+            timestamp_start="N/A",
+            timestamp_end="N/A",
+            execution_timestamp=datetime.now().strftime(
+                "%Y-%m-%d %H:%M:%S"
+            ),
+            status="pending",
+            statistics={},
+            artifacts={},
+        )
+        
+        # Run the pipeline. self.compute() invokes execute_pipeline(),
+        # which runs each step in sequence, populating self.result_data,
+        # self.statistics, self.validation_passed, and self.result.
+        # compute() then sets the final status from validation outcome.
+        self.compute()
+        
+        return self.result
+    
     def run_attribution(
         self,
         trade_log_path: Path,
@@ -246,31 +313,25 @@ class PerformanceAttribution(BaseResearchModule):
         output_dir: Optional[Path] = None
     ) -> Any:
         """
-        Run the performance attribution.
-        
-        Args:
-            trade_log_path: Path to executed_trade_log.parquet from Module 210
-            dataset_id: Identifier for the dataset
-            output_dir: Output directory for results
+        Run performance attribution directly from Module 210 trades.
         """
         self._paths = {
-            "trade_log": trade_log_path
+            "trade_log": Path(trade_log_path)
         }
         
+        self._dataset_id = dataset_id
+        
+        if not self._paths["trade_log"].exists():
+            raise FileNotFoundError(
+                f"Module 210 trade log not found: "
+                f"{self._paths['trade_log']}"
+            )
+        
         if output_dir is None:
-            self._output_dir = Path("data/feature_store/performance_attribution")
+            self._output_dir = Path(
+                "data/feature_store/performance_attribution"
+            )
         else:
             self._output_dir = Path(output_dir)
         
-        # Create a dummy DataFrame to satisfy BaseResearchModule
-        dummy = pd.DataFrame(
-            {
-                "timestamp": [pd.Timestamp("2000-01-01")]
-            }
-        )
-        
-        return super().run_dataframe(
-            dummy,
-            dataset_id=dataset_id,
-            output_dir=self._output_dir
-        )
+        return self._execute_attribution_workflow()
