@@ -204,6 +204,20 @@ class PerformanceAttribution(BaseResearchModule):
             validation_passed=self.validation_passed,
         )
         
+        # Register the four standard BaseResearchModule artifacts.
+        # Module 213 does not generate market-feature data, so features
+        # is intentionally empty rather than containing fabricated data.
+        self.result.artifacts["features"] = pd.DataFrame()
+        self.result.artifacts["statistics"] = pd.DataFrame([
+            self.stats_engine.summary_dict(self.statistics)
+        ])
+        self.result.artifacts["report"] = main_report
+        self.result.artifacts["validation"] = {
+            "passed": bool(self.validation_passed),
+            "errors": list(self.result.errors),
+            "warnings": list(self.result.warnings),
+        }
+        
         # Save report to disk
         report_path = self._output_dir / "performance_attribution_report.txt"
         AttributionExporter.export_report(main_report, report_path)
