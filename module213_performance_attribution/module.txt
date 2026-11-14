@@ -227,16 +227,24 @@ class PerformanceAttribution(BaseResearchModule):
         self.logger.metric("Artifacts", str(len(self.result.artifacts)))
         self.logger.success("Export complete")
         
-        # Report the actual trade count from the statistics engine.
+        # Report the actual trade count from the engine's overall summary.
         #
-        # The previous version reported len(self.result_data.top_contributors),
-        # which is capped at find_top_contributors()'s default n=10 and
-        # therefore always reported 10 (or fewer) regardless of how many
-        # trades were actually analysed.
+        # This is the true number of closed trades the attribution engine
+        # analysed — NOT len(top_contributors) (capped at 10) and NOT a
+        # row count that might include statistics metadata. Both
+        # statistics.total_trades and overall_summary["trades"] are
+        # equivalent in normal operation; we use the summary value here
+        # because it comes directly from the engine's canonical metrics.
         return {
             "export_status": "complete",
             "artifact_count": len(self.result.artifacts),
-            "trades": int(self.statistics.total_trades)
+            "trades": (
+                int(
+                    self.result_data.overall_summary.iloc[0]["trades"]
+                )
+                if not self.result_data.overall_summary.empty
+                else 0
+            ),
         }
     
     def compute(self) -> Dict[str, Any]:
@@ -276,6 +284,12 @@ class PerformanceAttribution(BaseResearchModule):
         This deliberately bypasses BaseResearchModule's OHLCV
         validation because Module 213 consumes executed trades,
         not market OHLCV data.
+
+        NOTE: This method is now a fallback. run_attribution() prefers
+        the standard BaseResearchModule workflow (load_dataframe +
+        _execute_workflow) so that ResearchResult carries the real
+        trade-log timestamps. Retained in case a caller needs to
+        bypass normalize_research_frame's OHLCV contract.
         """
         if self._paths is None or "trade_log" not in self._paths:
             raise ValueError("Module 210 trade log path is missing.")
@@ -293,11 +307,6 @@ class PerformanceAttribution(BaseResearchModule):
         self.validation_passed = False
         
         # Initialize the standard result object without fake market data.
-        #
-        # timestamp_start / timestamp_end are "N/A" because the module
-        # operates on a trade log, not a bar-aligned market DataFrame.
-        # The actual trade-date span is exposed via the trade log itself
-        # and through the statistics dict.
         self.result = ResearchResult(
             module_name=self.module_name,
             module_version=self.module_version,
@@ -312,10 +321,6 @@ class PerformanceAttribution(BaseResearchModule):
             artifacts={},
         )
         
-        # Run the pipeline. self.compute() invokes execute_pipeline(),
-        # which runs each step in sequence, populating self.result_data,
-        # self.statistics, self.validation_passed, and self.result.
-        # compute() then sets the final status from validation outcome.
         self.compute()
         
         return self.result
@@ -347,5 +352,40 @@ class PerformanceAttribution(BaseResearchModule):
             )
         else:
             self._output_dir = Path(output_dir)
-        
-        return self._execute_attribution_workflow()
+
+        # ----------------------------------------------------------
+        # Load the trade log so Module 213 diagnostics see the real
+        # rows (timestamps, per-trade data) instead of a one-row
+        # placeholder. The engine's _run_attribution() step re-reads
+        # the file from disk for its own computation — this load is
+        # exclusively for ResearchResult metadata and for any
+        # downstream consumer that inspects self.market_df.
+        # ----------------------------------------------------------
+        trade_log = self.engine.load_trade_log(trade_log_path)
+
+        if "timestamp" not in trade_log.columns:
+            if "entry_time" not in trade_log.columns:
+                raise ValueError(
+                    "Module 213 trade log requires timestamp or entry_time."
+                )
+
+            trade_log.insert(
+                0,
+                "timestamp",
+                pd.to_datetime(
+                    trade_log["entry_time"],
+                    errors="coerce",
+                ),
+            )
+
+        if trade_log["timestamp"].isna().any():
+            raise ValueError(
+                "Module 213 trade log contains invalid timestamps."
+            )
+
+        self.load_dataframe(
+            trade_log,
+            dataset_id=dataset_id,
+        )
+
+        return self._execute_workflow(self._output_dir)
