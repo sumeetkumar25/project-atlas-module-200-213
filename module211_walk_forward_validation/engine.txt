@@ -9,6 +9,20 @@ Pipeline:
   → Aggregate Statistics → Export Results
 
 Output: Window results, equity curves, and summary statistics.
+
+FIXED: generate_windows() now supports BOTH windowing modes:
+
+  - Calendar-based (production default): requires
+    `train_window_days` and `test_window_days` to be set in
+    WalkForwardConfig, and derives row indices from the resulting
+    timestamp boundaries.
+
+  - Bar-based (tests and legacy configs): used automatically when
+    neither calendar field is set. Walks `train_window_bars` /
+    `test_window_bars` forward by `step_size`.
+
+The mode is selected by presence of the calendar fields, so no
+caller needs to branch on mode itself.
 """
 
 import numpy as np
@@ -80,7 +94,7 @@ class WalkForwardEngine:
     ):
         """
         Initialize the walk-forward validation engine.
-        
+
         Args:
             config: WalkForwardConfig with validation parameters
             timestamp_column: Name of the timestamp column
@@ -100,7 +114,7 @@ class WalkForwardEngine:
         """Load executed trade log from Module 210."""
         if not filepath.exists():
             raise FileNotFoundError(f"Execution data not found: {filepath}")
-        
+
         if filepath.suffix == '.parquet':
             df = pd.read_parquet(filepath)
         else:
@@ -111,7 +125,7 @@ class WalkForwardEngine:
                 df[self.entry_time_column] = pd.to_datetime(df[self.entry_time_column])
             if self.exit_time_column in df.columns:
                 df[self.exit_time_column] = pd.to_datetime(df[self.exit_time_column])
-        
+
         return df
 
     def generate_windows(
@@ -119,11 +133,17 @@ class WalkForwardEngine:
         data: pd.DataFrame
     ) -> List[Tuple[int, int, int, int]]:
         """
-        Generate walk-forward windows based on calendar time.
+        Generate walk-forward windows.
 
-        Windows are defined by timestamps, not row counts. The row indices
-        returned here are derived from those timestamp boundaries so that
-        downstream slicing continues to work.
+        Supports two modes, selected automatically by config:
+
+          - Calendar-based (production): requires `train_window_days`
+            and `test_window_days`. Row indices are derived from the
+            resulting timestamp boundaries.
+
+          - Bar-based (tests / legacy configs): used when neither
+            calendar field is set. Walks `train_window_bars`,
+            `test_window_bars`, and `step_size` over the input rows.
 
         Returns:
             List of (train_start_idx, train_end_idx, test_start_idx, test_end_idx)
@@ -132,6 +152,53 @@ class WalkForwardEngine:
 
         if n == 0:
             return []
+
+        # --------------------------------------------------------------
+        # Mode selection.
+        #
+        # Calendar-based windowing is the production default. Bar-based
+        # windowing remains available for tests and for configs that
+        # intentionally omit train_window_days / test_window_days.
+        # --------------------------------------------------------------
+        calendar_mode = (
+            self.config.train_window_days is not None
+            or self.config.test_window_days is not None
+        )
+
+        if not calendar_mode:
+            train_bars = self.config.train_window_bars
+            test_bars = self.config.test_window_bars
+            step_bars = self.config.step_size
+
+            if train_bars <= 0 or test_bars <= 0 or step_bars <= 0:
+                raise ValueError(
+                    "Bar-based window sizes must be positive."
+                )
+
+            windows: List[Tuple[int, int, int, int]] = []
+
+            start = 0
+            while start + train_bars + test_bars <= len(data):
+                train_start = start
+                train_end = start + train_bars
+                test_start = train_end
+                test_end = test_start + test_bars
+
+                windows.append(
+                    (train_start, train_end, test_start, test_end)
+                )
+
+                if self.config.max_windows is not None:
+                    if len(windows) >= self.config.max_windows:
+                        break
+
+                start += step_bars
+
+            return windows
+
+        # --------------------------------------------------------------
+        # Calendar-based windowing (production path).
+        # --------------------------------------------------------------
 
         # Resolve the time column to use for windowing.
         if self.exit_time_column in data.columns:
@@ -246,11 +313,11 @@ class WalkForwardEngine:
         # Training metrics
         n_train = len(train_trades)
         n_test = len(test_trades)
-        
+
         # Skip if not enough trades
         if n_test < self.config.minimum_trades:
             return None
-        
+
         # Test-period P&L, using actual execution prices.
         entry_price = pd.to_numeric(
             test_trades["entry_price"], errors="raise"
@@ -294,18 +361,18 @@ class WalkForwardEngine:
         # Execution prices already include slippage.
         # Subtract commission once to obtain net P&L.
         test_pnl = test_pnl - commission
-        
+
         # Net profit
         net_profit = test_pnl.sum()
-        
+
         # Return percentage (assuming initial capital of 10000)
         initial_capital = 10000.0
         return_pct = (net_profit / initial_capital) * 100
-        
+
         # Win rate
         winning_trades = test_pnl > 0
         win_rate = winning_trades.mean() if n_test > 0 else 0.0
-        
+
         # Sharpe ratio (trade-level, per-trade, no annualization)
         if n_test > 1 and test_pnl.std() > 0:
             sharpe_ratio = (
@@ -313,25 +380,25 @@ class WalkForwardEngine:
             )
         else:
             sharpe_ratio = 0.0
-        
+
         # Max drawdown
         cumulative_pnl = test_pnl.cumsum()
         running_max = cumulative_pnl.expanding().max()
         drawdown = (cumulative_pnl - running_max) / initial_capital * 100
         max_drawdown = abs(drawdown.min()) if not drawdown.empty else 0.0
-        
+
         # Profit factor
         gross_profit = test_pnl[test_pnl > 0].sum()
         gross_loss = abs(test_pnl[test_pnl < 0].sum())
         profit_factor = gross_profit / gross_loss if gross_loss > 0 else np.inf
-        
+
         # Average trade
         avg_trade = test_pnl.mean() if n_test > 0 else 0.0
-        
+
         # Total commission and slippage
         total_commission = test_trades['total_commission'].sum() if 'total_commission' in test_trades.columns else 0.0
         total_slippage = test_trades['total_slippage'].sum() if 'total_slippage' in test_trades.columns else 0.0
-        
+
         # Equity curve for test period
         equity_curve = pd.DataFrame({
             'timestamp': test_trades[self.exit_time_column],
@@ -340,7 +407,7 @@ class WalkForwardEngine:
             'drawdown': drawdown,
             'window_id': window_id
         })
-        
+
         return WindowResult(
             window_id=window_id,
             train_start=train_start,
@@ -375,7 +442,7 @@ class WalkForwardEngine:
             print(f"  Test Window: {self.config.test_window_bars} bars")
             print(f"  Step Size: {self.config.step_size} bars")
         print(f"  Minimum Trades: {self.config.minimum_trades}")
-        
+
         # Sort by exit time (stable, deterministic ordering)
         if self.exit_time_column in trade_log.columns:
             sort_cols = [self.exit_time_column]
@@ -387,17 +454,17 @@ class WalkForwardEngine:
                 sort_cols,
                 kind="mergesort"
             ).reset_index(drop=True)
-        
+
         # Generate windows based on timestamps
         timestamps = trade_log[self.exit_time_column].values
         n = len(trade_log)
-        
+
         windows = self.generate_windows(trade_log)
         print(f"  Generated {len(windows)} windows")
-        
+
         window_results = []
         all_equity_curves = []
-        
+
         for train_start, train_end, test_start, test_end in windows:
             # Split data
             train_trades = trade_log.iloc[train_start:train_end]
@@ -411,13 +478,13 @@ class WalkForwardEngine:
                 test_trades = test_trades[
                     test_trades[self.entry_time_column] >= test_start_ts
                 ].copy()
-            
+
             # Get timestamps for window
             train_start_ts = trade_log.iloc[train_start][self.exit_time_column]
             train_end_ts = trade_log.iloc[train_end - 1][self.exit_time_column]
             test_start_ts = trade_log.iloc[test_start][self.exit_time_column]
             test_end_ts = trade_log.iloc[test_end - 1][self.exit_time_column]
-            
+
             # Compute metrics
             result = self.compute_window_metrics(
                 train_trades=train_trades,
@@ -428,12 +495,12 @@ class WalkForwardEngine:
                 test_start=test_start_ts,
                 test_end=test_end_ts
             )
-            
+
             if result is not None:
                 # Store equity curve
                 if result.equity_curve is not None and not result.equity_curve.empty:
                     all_equity_curves.append(result.equity_curve)
-                
+
                 # Store result (without equity curve for DataFrame)
                 result_dict = {
                     'window_id': result.window_id,
@@ -454,13 +521,13 @@ class WalkForwardEngine:
                     'total_slippage': result.total_slippage
                 }
                 window_results.append(result_dict)
-        
+
         # Create DataFrames
         window_results_df = pd.DataFrame(window_results)
         equity_curves_df = pd.concat(all_equity_curves, ignore_index=True) if all_equity_curves else pd.DataFrame()
-        
+
         print(f"  Completed {len(window_results_df)} valid windows")
-        
+
         return WalkForwardResult(
             window_results=window_results_df,
             equity_curves=equity_curves_df,
@@ -486,36 +553,36 @@ class WalkForwardEngine:
                 'consistency_score': 0.0,
                 'total_trades': 0
             }
-        
+
         returns = window_results['return_pct']
-        
+
         # Average and median return
         avg_return = returns.mean()
         median_return = returns.median()
-        
+
         # Best and worst window
         best_window = returns.max()
         worst_window = returns.min()
-        
+
         # Average Sharpe
         avg_sharpe = window_results['sharpe_ratio'].mean()
-        
+
         # Average drawdown
         avg_drawdown = window_results['max_drawdown'].mean()
-        
+
         # Window stability (percentage of windows with positive return)
         positive_windows = (returns > 0).sum()
         n_windows = len(window_results)
         positive_window_pct = (positive_windows / n_windows) * 100
         negative_window_pct = 100 - positive_window_pct
-        
+
         # Consistency score (Sharpe * Win Rate)
         avg_win_rate = window_results['win_rate'].mean()
         consistency_score = avg_sharpe * avg_win_rate
-        
+
         # Total trades
         total_trades = window_results['n_test_trades'].sum()
-        
+
         return {
             'n_windows': n_windows,
             'avg_return': avg_return,
@@ -538,18 +605,18 @@ class WalkForwardEngine:
     ) -> None:
         """Save all outputs."""
         output_dir.mkdir(parents=True, exist_ok=True)
-        
+
         # Window results
         window_path = output_dir / "window_results.csv"
         result.window_results.to_csv(window_path, index=False)
         print(f"  Saved window results to {window_path}")
-        
+
         # Equity curves
         if not result.equity_curves.empty:
             equity_path = output_dir / "equity_curves.parquet"
             result.equity_curves.to_parquet(equity_path, index=False)
             print(f"  Saved equity curves to {equity_path}")
-        
+
         # Statistics
         stats_df = pd.DataFrame([result.summary_statistics])
         stats_path = output_dir / "walk_forward_statistics.csv"
@@ -566,23 +633,23 @@ class WalkForwardEngine:
         """
         if output_dir is None:
             output_dir = Path("data/feature_store/walk_forward")
-        
+
         # Load execution data
         print(f"  Loading execution data from: {execution_trade_log_path}")
         trade_log = self.load_execution_data(execution_trade_log_path)
         print(f"  Loaded {len(trade_log)} trades")
-        
+
         # Run validation
         result = self.run_validation(trade_log)
-        
+
         # Compute summary statistics
         print("  Computing summary statistics...")
         result.summary_statistics = self.compute_summary_statistics(result.window_results)
-        
+
         # Save outputs
         print("\n  Saving outputs...")
         self.save_outputs(result, output_dir)
-        
+
         # Print summary
         print(f"\n  Walk-Forward Summary:")
         print(f"    Windows: {result.summary_statistics['n_windows']}")
@@ -591,5 +658,5 @@ class WalkForwardEngine:
         print(f"    Worst Window: {result.summary_statistics['worst_window']:.2f}%")
         print(f"    Avg Sharpe: {result.summary_statistics['avg_sharpe']:.3f}")
         print(f"    Positive Windows: {result.summary_statistics['positive_window_pct']:.1f}%")
-        
+
         return result
