@@ -23,34 +23,34 @@ from atlas.modules.module211_walk_forward_validation.module import WalkForwardVa
 def create_test_trade_log(n=1000, seed=42):
     """Create synthetic trade log for testing."""
     np.random.seed(seed)
-    
+
     # Generate timestamps
     start_date = datetime(2020, 1, 1)
     timestamps = [start_date + timedelta(hours=i) for i in range(n)]
-    
+
     # Generate trades with varying performance
     directions = np.random.choice(['LONG', 'SHORT'], n, p=[0.6, 0.4])
     entry_prices = 100 + np.random.randn(n) * 10
     exit_prices = entry_prices + np.random.randn(n) * 5
-    
+
     # Add some trend to make it interesting
     trend = np.linspace(0, 20, n)
     exit_prices += trend * 0.1
-    
+
     # Ensure some profitable trades
     pnl = (exit_prices - entry_prices) * 0.5
     pnl *= np.where(directions == 'LONG', 1, -1)
-    
+
     # Randomly assign some profitable and losing trades
     pnl += np.random.randn(n) * 2
-    
+
     # Adjust prices based on PnL
     exit_prices = entry_prices + pnl / 0.5
-    
+
     sizes = np.random.uniform(0.1, 1.0, n)
     commissions = np.random.uniform(0.01, 0.05, n)
     slippages = np.random.uniform(0.001, 0.01, n)
-    
+
     trade_log = pd.DataFrame({
         'trade_id': range(n),
         'entry_time': timestamps,
@@ -63,7 +63,7 @@ def create_test_trade_log(n=1000, seed=42):
         'total_slippage': slippages,
         'holding_bars': np.random.randint(1, 20, n)
     })
-    
+
     return trade_log
 
 
@@ -72,24 +72,24 @@ def test_window_generation():
     print("\n" + "=" * 60)
     print("TEST 1: Window Generation")
     print("=" * 60)
-    
+
     config = WalkForwardConfig(
         train_window_bars=100,
         test_window_bars=50,
         step_size=50
     )
     engine = WalkForwardEngine(config=config)
-    
+
     data = pd.DataFrame({'dummy': range(500)})
     windows = engine.generate_windows(data)
-    
+
     assert len(windows) > 0
     for train_start, train_end, test_start, test_end in windows:
         assert train_start < train_end
         assert test_start < test_end
         assert train_end <= test_start
         assert test_end <= len(data)
-    
+
     print(f"  Generated {len(windows)} windows")
     print("  ✓ Window generation test passed")
     return True
@@ -100,7 +100,7 @@ def test_train_test_split():
     print("\n" + "=" * 60)
     print("TEST 2: Train/Test Split")
     print("=" * 60)
-    
+
     trade_log = create_test_trade_log(n=500)
     config = WalkForwardConfig(
         train_window_bars=100,
@@ -109,15 +109,15 @@ def test_train_test_split():
         minimum_trades=10
     )
     engine = WalkForwardEngine(config=config)
-    
+
     result = engine.run_validation(trade_log)
-    
+
     assert not result.window_results.empty
-    
+
     # Check each window has enough trades
     for _, window in result.window_results.iterrows():
         assert window['n_test_trades'] >= config.minimum_trades
-    
+
     print(f"  Processed {len(result.window_results)} windows")
     print("  ✓ Train/Test split test passed")
     return True
@@ -128,7 +128,7 @@ def test_no_overlap():
     print("\n" + "=" * 60)
     print("TEST 3: No Overlap")
     print("=" * 60)
-    
+
     config = WalkForwardConfig(
         train_window_bars=100,
         test_window_bars=50,
@@ -136,16 +136,16 @@ def test_no_overlap():
         overlap=False
     )
     engine = WalkForwardEngine(config=config)
-    
+
     trade_log = create_test_trade_log(n=500)
     result = engine.run_validation(trade_log)
-    
+
     # Check no overlap
     for i in range(len(result.window_results) - 1):
         current = result.window_results.iloc[i]
         next_window = result.window_results.iloc[i + 1]
         assert current['test_end'] <= next_window['test_start']
-    
+
     print("  ✓ No overlap test passed")
     return True
 
@@ -155,7 +155,7 @@ def test_statistics():
     print("\n" + "=" * 60)
     print("TEST 4: Statistics")
     print("=" * 60)
-    
+
     config = WalkForwardConfig(
         train_window_bars=100,
         test_window_bars=50,
@@ -164,17 +164,17 @@ def test_statistics():
     )
     engine = WalkForwardEngine(config=config)
     stats_engine = WalkForwardStatisticsEngine()
-    
+
     trade_log = create_test_trade_log(n=500)
     result = engine.run_validation(trade_log)
-    
+
     # Compute statistics
     result.summary_statistics = engine.compute_summary_statistics(result.window_results)
     stats = stats_engine.analyze(result)
-    
+
     assert stats.n_windows > 0
     assert stats.total_trades > 0
-    
+
     print(f"  n_windows: {stats.n_windows}")
     print(f"  avg_return: {stats.avg_return:.2f}%")
     print(f"  avg_sharpe: {stats.avg_sharpe:.3f}")
@@ -188,7 +188,7 @@ def test_validator():
     print("\n" + "=" * 60)
     print("TEST 5: Validator")
     print("=" * 60)
-    
+
     config = WalkForwardConfig(
         train_window_bars=100,
         test_window_bars=50,
@@ -197,15 +197,15 @@ def test_validator():
     )
     engine = WalkForwardEngine(config=config)
     stats_engine = WalkForwardStatisticsEngine()
-    
+
     trade_log = create_test_trade_log(n=500)
     result = engine.run_validation(trade_log)
     result.summary_statistics = engine.compute_summary_statistics(result.window_results)
     stats = stats_engine.analyze(result)
-    
+
     passed = run_validation(result, stats)
     assert passed
-    
+
     print("  ✓ Validator test passed")
     return True
 
@@ -215,7 +215,7 @@ def test_full_engine():
     print("\n" + "=" * 60)
     print("TEST 6: Full Engine")
     print("=" * 60)
-    
+
     config = WalkForwardConfig(
         train_window_bars=100,
         test_window_bars=50,
@@ -223,29 +223,29 @@ def test_full_engine():
         minimum_trades=10
     )
     engine = WalkForwardEngine(config=config)
-    
+
     trade_log = create_test_trade_log(n=500)
-    
+
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_path = Path(tmpdir)
         output_dir = tmp_path / "output"
-        
+
         # Save trade log
         trade_log_path = tmp_path / "trade_log.parquet"
         trade_log.to_parquet(trade_log_path, index=False)
-        
+
         result = engine.compute(
             execution_trade_log_path=trade_log_path,
             output_dir=output_dir
         )
-        
+
         assert not result.window_results.empty
         assert result.summary_statistics.get('n_windows', 0) > 0
-        
+
         # Check outputs were saved
         assert (output_dir / "window_results.csv").exists()
         assert (output_dir / "walk_forward_statistics.csv").exists()
-    
+
     print("  ✓ Full engine test passed")
     return True
 
@@ -255,41 +255,42 @@ def test_pipeline():
     print("\n" + "=" * 60)
     print("TEST 7: Full Pipeline")
     print("=" * 60)
-    
+
     trade_log = create_test_trade_log(n=500)
-    
+
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_path = Path(tmpdir)
         output_dir = tmp_path / "output"
-        
+
         # Save trade log
         trade_log_path = tmp_path / "trade_log.parquet"
         trade_log.to_parquet(trade_log_path, index=False)
-        
+
         research = WalkForwardValidation(
             train_window_bars=100,
             test_window_bars=50,
             step_size=50,
-            minimum_trades=10
+            minimum_trades=10,
+            use_calendar_windows=False,
         )
-        
+
         result = research.run_validation(
             execution_trade_log_path=trade_log_path,
             dataset_id="pipeline_test",
             output_dir=output_dir
         )
-        
+
         assert result.status == "completed"
         assert "window_results" in result.artifacts
         assert "walk_forward_statistics" in result.artifacts
         assert "walk_forward_report" in result.artifacts
         assert result.statistics.get("software_validation_passed") == True
-        
+
         # Check outputs were saved
         assert (output_dir / "window_results.csv").exists()
         assert (output_dir / "walk_forward_statistics.csv").exists()
         assert (output_dir / "walk_forward_report.txt").exists()
-    
+
     print("  ✓ Full pipeline test passed")
     return True
 
@@ -299,7 +300,7 @@ def test_export():
     print("\n" + "=" * 60)
     print("TEST 8: Export")
     print("=" * 60)
-    
+
     config = WalkForwardConfig(
         train_window_bars=100,
         test_window_bars=50,
@@ -307,28 +308,28 @@ def test_export():
         minimum_trades=10
     )
     engine = WalkForwardEngine(config=config)
-    
+
     trade_log = create_test_trade_log(n=500)
     result = engine.run_validation(trade_log)
     result.summary_statistics = engine.compute_summary_statistics(result.window_results)
-    
+
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_path = Path(tmpdir)
         output_dir = tmp_path / "output"
-        
+
         engine.save_outputs(result, output_dir)
-        
+
         # Check all exports
         assert (output_dir / "window_results.csv").exists()
         assert (output_dir / "walk_forward_statistics.csv").exists()
-        
+
         # Check content
         window_df = pd.read_csv(output_dir / "window_results.csv")
         assert not window_df.empty
-        
+
         stats_df = pd.read_csv(output_dir / "walk_forward_statistics.csv")
         assert not stats_df.empty
-    
+
     print("  ✓ Export test passed")
     return True
 
@@ -338,7 +339,7 @@ def test_configuration():
     print("\n" + "=" * 60)
     print("TEST 9: Configuration")
     print("=" * 60)
-    
+
     config = WalkForwardConfig(
         train_window_bars=200,
         test_window_bars=100,
@@ -347,14 +348,14 @@ def test_configuration():
         overlap=True,
         max_windows=5
     )
-    
+
     assert config.train_window_bars == 200
     assert config.test_window_bars == 100
     assert config.step_size == 100
     assert config.minimum_trades == 50
     assert config.overlap == True
     assert config.max_windows == 5
-    
+
     print("  ✓ Configuration test passed")
     return True
 
@@ -364,7 +365,7 @@ def test_walk_forward_consistency():
     print("\n" + "=" * 60)
     print("TEST 10: Walk-Forward Consistency")
     print("=" * 60)
-    
+
     config = WalkForwardConfig(
         train_window_bars=100,
         test_window_bars=50,
@@ -372,24 +373,24 @@ def test_walk_forward_consistency():
         minimum_trades=10
     )
     engine = WalkForwardEngine(config=config)
-    
+
     trade_log = create_test_trade_log(n=1000)
     result = engine.run_validation(trade_log)
-    
+
     # Check consistency across windows
     if len(result.window_results) > 1:
         returns = result.window_results['return_pct']
-        
+
         # Check that returns are not all identical
         assert returns.std() > 0
-        
+
         # Check consistency score
         result.summary_statistics = engine.compute_summary_statistics(result.window_results)
         consistency = result.summary_statistics.get('consistency_score', 0)
-        
+
         print(f"  Consistency Score: {consistency:.3f}")
         print(f"  Positive Windows: {result.summary_statistics.get('positive_window_pct', 0):.1f}%")
-    
+
     print("  ✓ Walk-forward consistency test passed")
     return True
 
@@ -400,9 +401,9 @@ def main():
     print("PROJECT ATLAS - MODULE 211 INTEGRATION TEST")
     print("Walk Forward Validation")
     print("=" * 70)
-    
+
     results = {}
-    
+
     results["window_generation"] = test_window_generation()
     results["train_test_split"] = test_train_test_split()
     results["no_overlap"] = test_no_overlap()
@@ -413,19 +414,19 @@ def main():
     results["export"] = test_export()
     results["configuration"] = test_configuration()
     results["consistency"] = test_walk_forward_consistency()
-    
+
     print("\n" + "=" * 70)
     print("RESULTS")
     print("=" * 70)
-    
+
     for name, ok in results.items():
         print(f"  {'✓' if ok else '✗'} {name}")
-    
+
     passed = sum(results.values())
     total = len(results)
-    
+
     print(f"\n  {passed}/{total} tests passed")
-    
+
     if passed == total:
         print("\n✓ Module 211 VALIDATED")
         return 0
