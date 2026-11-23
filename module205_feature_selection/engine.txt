@@ -77,7 +77,7 @@ class FeatureSelectionEngine:
     ):
         """
         Initialize the feature selection engine.
-        
+
         Args:
             predictive_threshold: Minimum raw predictive score to keep
             stability_threshold: Minimum raw stability score to keep
@@ -91,21 +91,21 @@ class FeatureSelectionEngine:
         """Load the predictive feature matrix."""
         if not matrix_path.exists():
             raise FileNotFoundError(f"Predictive matrix not found: {matrix_path}")
-        
+
         if matrix_path.suffix == '.parquet':
             df = pd.read_parquet(matrix_path)
         else:
             df = pd.read_csv(matrix_path)
             if self.timestamp_column in df.columns:
                 df[self.timestamp_column] = pd.to_datetime(df[self.timestamp_column])
-        
+
         return df
 
     def load_stability_scores(self, filepath: Path) -> pd.DataFrame:
         """Load stability scores from Module 202."""
         if not filepath.exists():
             raise FileNotFoundError(f"Stability scores not found: {filepath}")
-        
+
         df = pd.read_csv(filepath)
         return df
 
@@ -113,7 +113,7 @@ class FeatureSelectionEngine:
         """Load interaction statistics from Module 203."""
         if not filepath.exists():
             raise FileNotFoundError(f"Interaction scores not found: {filepath}")
-        
+
         df = pd.read_csv(filepath)
         return df
 
@@ -121,7 +121,7 @@ class FeatureSelectionEngine:
         """Load redundancy data from Module 204."""
         if not filepath.exists():
             raise FileNotFoundError(f"Redundancy data not found: {filepath}")
-        
+
         df = pd.read_csv(filepath)
         return df
 
@@ -129,7 +129,7 @@ class FeatureSelectionEngine:
         """Load removed features from Module 204."""
         if not filepath.exists():
             return []
-        
+
         df = pd.read_csv(filepath)
         if 'removed_features' in df.columns:
             return df['removed_features'].tolist()
@@ -202,7 +202,7 @@ class FeatureSelectionEngine:
         inter_norm = self.normalize_scores(interaction_scores)
         syn_norm = self.normalize_scores(synergy_scores)
         red_norm = self.normalize_scores(redundancy_scores)
-        
+
         # Combine with weights
         final_scores = (
             self.SCORING_WEIGHTS["predictive"] * pred_norm +
@@ -211,10 +211,10 @@ class FeatureSelectionEngine:
             self.SCORING_WEIGHTS["synergy"] * syn_norm +
             self.SCORING_WEIGHTS["redundancy"] * red_norm
         )
-        
+
         # Clip to [0, 1]
         final_scores = np.clip(final_scores, 0.0, 1.0)
-        
+
         # Create DataFrame
         result_df = pd.DataFrame({
             "feature": features,
@@ -238,7 +238,7 @@ class FeatureSelectionEngine:
 
             "final_score": final_scores.values,
         })
-        
+
         return result_df
 
     def apply_hard_filters(
@@ -365,23 +365,38 @@ class FeatureSelectionEngine:
 
     def rank_features(self, scores_df: pd.DataFrame) -> pd.DataFrame:
         """
-        Rank features by predictive score.
+        Rank features for the audit trail.
 
-        IMPORTANT:
-        - The ranking MUST include every scored feature, not only the
-          selected subset. A feature that was rejected by the hard
-          filters is still part of the audit trail, and its predictive
-          score is still meaningful for downstream reporting.
-        - The ranking MUST contain a 'predictive_score' column. The
-          score column is resolved with a fallback chain so that the
-          ranking is robust to schema drift in the upstream scores
-          DataFrame:
-              predictive_score → final_score → score
-          If none of these exist, the method raises KeyError.
+        The ranking order is driven by `final_score` when it is
+        available. `final_score` is the composite metric produced by
+        compute_final_scores() and is the metric the downstream
+        validator inspects, so the ordering it observes here must
+        reflect that same column. `predictive_score` is only used as
+        a fallback when `final_score` is absent (e.g. legacy score
+        frames with a narrower schema).
+
+        Determinism:
+            Ties are broken by feature name (ascending), and the sort
+            uses `mergesort` (stable) so that identical input always
+            yields identical output ordering regardless of the
+            pandas version or the internal row order of the input
+            DataFrame.
+
+        Audit trail:
+            The ranking includes every scored feature — including
+            features rejected by the hard filters — because each of
+            them still carries meaningful score evidence that belongs
+            in the persisted ranking artifact.
+
+        The `rank` column is re-sequenced to 1..N after sorting so
+        that rank is authoritative over the final row order.
         """
 
         feature_ranking = scores_df.copy()
 
+        # Backward-compatible schema hardening: ensure a
+        # predictive_score column exists even when the upstream
+        # frame only shipped final_score or a generic score column.
         if "predictive_score" not in feature_ranking.columns:
             if "final_score" in feature_ranking.columns:
                 feature_ranking["predictive_score"] = feature_ranking["final_score"]
@@ -393,15 +408,34 @@ class FeatureSelectionEngine:
                     "no predictive_score, final_score, or score column exists"
                 )
 
+        # Prefer the composite final_score as the ranking key.
+        # Fall back to predictive_score for narrower schemas.
+        ranking_column = (
+            "final_score"
+            if "final_score" in feature_ranking.columns
+            else "predictive_score"
+        )
+
         feature_ranking["rank"] = (
-            feature_ranking["predictive_score"]
+            feature_ranking[ranking_column]
             .rank(method="first", ascending=False)
             .astype(int)
         )
 
-        feature_ranking = feature_ranking.sort_values(
-            "rank"
-        ).reset_index(drop=True)
+        feature_ranking = (
+            feature_ranking
+            .sort_values(
+                by=[ranking_column, "feature"],
+                ascending=[False, True],
+                kind="mergesort",
+            )
+            .reset_index(drop=True)
+        )
+
+        feature_ranking["rank"] = np.arange(
+            1,
+            len(feature_ranking) + 1,
+        )
 
         return feature_ranking
 
@@ -440,7 +474,7 @@ class FeatureSelectionEngine:
         # Find best and worst from all scores
         best_idx = scores.idxmax()
         worst_idx = scores.idxmin()
-        
+
         stats = {
             'total_features': total,
             'selected_count': len(selected),
@@ -458,7 +492,7 @@ class FeatureSelectionEngine:
             'selection_threshold': self.predictive_threshold,
             'stability_threshold': self.stability_threshold
         }
-        
+
         return stats
 
     def save_outputs(
@@ -472,23 +506,23 @@ class FeatureSelectionEngine:
     ) -> None:
         """Save all outputs."""
         output_dir.mkdir(parents=True, exist_ok=True)
-        
+
         # Selected features
         selected_df = pd.DataFrame({'selected_features': selected})
         selected_path = output_dir / "selected_features.csv"
         selected_df.to_csv(selected_path, index=False)
         print(f"  Saved selected features to {selected_path}")
-        
+
         # Feature scores
         scores_path = output_dir / "feature_scores.csv"
         scores_df.to_csv(scores_path, index=False)
         print(f"  Saved feature scores to {scores_path}")
-        
+
         # Feature ranking
         ranking_path = output_dir / "feature_ranking.csv"
         ranking_df.to_csv(ranking_path, index=False)
         print(f"  Saved feature ranking to {ranking_path}")
-        
+
         # Statistics
         stats_df = pd.DataFrame([stats])
         stats_path = output_dir / "feature_selection_statistics.csv"
@@ -508,10 +542,10 @@ class FeatureSelectionEngine:
         Main computation method.
         """
         print("\n  Computing Feature Selection & Ranking...")
-        
+
         if output_dir is None:
             output_dir = Path("data/feature_store/selected")
-        
+
         # Load all inputs
         print(f"  Loading predictive matrix from: {predictive_matrix_path}")
         predictive_df = self.load_predictive_matrix(predictive_matrix_path)
@@ -534,20 +568,20 @@ class FeatureSelectionEngine:
             )
 
         print(f"  Found {len(features)} features")
-        
+
         print(f"  Loading stability scores from: {stability_file}")
         stability_df = self.load_stability_scores(stability_file)
-        
+
         print(f"  Loading interaction scores from: {interaction_file}")
         interaction_df = self.load_interaction_scores(interaction_file)
-        
+
         print(f"  Loading redundancy data from: {redundancy_file}")
         redundancy_df = self.load_redundancy_data(redundancy_file)
-        
+
         print(f"  Loading removed features from: {removed_file}")
         removed_features = self.load_removed_features(removed_file)
         print(f"  Found {len(removed_features)} previously removed features")
-        
+
         # ------------------------------------------------------------
         # Predictive scores: Module 203
         # ------------------------------------------------------------
@@ -632,13 +666,13 @@ class FeatureSelectionEngine:
             "  No independent interaction metric supplied; "
             "using neutral interaction baseline (0.5)"
         )
-        
+
         # Synergy scores (Module 204 - conditional MI)
         if 'conditional_mi' in redundancy_df.columns:
             synergy_dict = {}
             for feature in features:
                 rows = redundancy_df[
-                    (redundancy_df['feature_a'] == feature) | 
+                    (redundancy_df['feature_a'] == feature) |
                     (redundancy_df['feature_b'] == feature)
                 ]
                 if not rows.empty:
@@ -647,13 +681,13 @@ class FeatureSelectionEngine:
                     synergy_dict[feature] = 0.5
         else:
             synergy_dict = {f: 0.5 for f in features}
-        
+
         # Redundancy scores (Module 204 - composite score)
         if 'composite_score' in redundancy_df.columns:
             redundancy_dict = {}
             for feature in features:
                 rows = redundancy_df[
-                    (redundancy_df['feature_a'] == feature) | 
+                    (redundancy_df['feature_a'] == feature) |
                     (redundancy_df['feature_b'] == feature)
                 ]
                 if not rows.empty:
@@ -662,14 +696,14 @@ class FeatureSelectionEngine:
                     redundancy_dict[feature] = 0.0
         else:
             redundancy_dict = {f: 0.0 for f in features}
-        
+
         # Create series (with proper defaults for missing features)
         predictive_scores = pd.Series({f: predictive_dict.get(f, 0.5) for f in features})
         stability_series = pd.Series({f: stability_dict.get(f, 0.5) for f in features})
         interaction_series = pd.Series({f: interaction_dict.get(f, 0.5) for f in features})
         synergy_series = pd.Series({f: synergy_dict.get(f, 0.5) for f in features})
         redundancy_series = pd.Series({f: redundancy_dict.get(f, 0.0) for f in features})
-        
+
         # Compute final scores
         print("  Computing final scores...")
         scores_df = self.compute_final_scores(
@@ -681,7 +715,7 @@ class FeatureSelectionEngine:
             redundancy_series,
             module203_decisions=predictive_decisions,
         )
-        
+
         # Apply hard filters
         print("  Applying hard filters...")
         filtered_df, selected, rejected = self.apply_hard_filters(
@@ -693,7 +727,7 @@ class FeatureSelectionEngine:
         )
         print(f"    Selected: {len(selected)} features")
         print(f"    Rejected: {len(rejected)} features")
-        
+
         # ------------------------------------------------------------
         # Rank ALL scored features — not just the selected subset.
         #
@@ -701,17 +735,22 @@ class FeatureSelectionEngine:
         # feature that received a final_score, including rejected
         # ones. Filtering the ranking to only `selected` would
         # discard the score evidence for rejected features.
+        #
+        # rank_features() orders by final_score (fallback:
+        # predictive_score) using a stable mergesort with a
+        # secondary ascending key on feature name, so the persisted
+        # artifact is deterministic across runs.
         # ------------------------------------------------------------
         print("  Ranking features...")
         ranking_df = self.rank_features(scores_df)
-        
+
         # Compute statistics (using scores_df which contains ALL features)
         stats = self.compute_statistics(scores_df, selected, rejected)
-        
+
         # Save outputs
         print("\n  Saving outputs...")
         self.save_outputs(selected, rejected, scores_df, ranking_df, stats, output_dir)
-        
+
         print(f"\n  Selection Summary:")
         print(f"    Total Features: {stats['total_features']}")
         print(f"    Selected: {stats['selected_count']}")
@@ -719,7 +758,7 @@ class FeatureSelectionEngine:
         print(f"    Average Score: {stats['average_score']:.3f}")
         print(f"    Best Feature: {stats['best_feature']}")
         print(f"    Worst Feature: {stats['worst_feature']}")
-        
+
         return FeatureSelectionResult(
             selected_features=selected,
             rejected_features=rejected,
@@ -744,7 +783,7 @@ def run_module205(
 ) -> FeatureSelectionResult:
     """
     Convenience function to run Module 205.
-    
+
     Args:
         predictive_matrix_path: Path to predictive feature matrix (Module 203)
         stability_file: Path to feature_stability.csv (Module 202)
@@ -753,7 +792,7 @@ def run_module205(
         removed_file: Path to removed_redundant_features.csv (Module 204)
         output_dir: Directory for output artifacts (defaults to data/feature_store/selected)
         **kwargs: Additional arguments passed to FeatureSelectionEngine
-        
+
     Returns:
         FeatureSelectionResult
     """
@@ -770,7 +809,7 @@ def run_module205(
 
 if __name__ == "__main__":
     import argparse
-    
+
     parser = argparse.ArgumentParser(
         description="Module 205 - Feature Selection & Ranking Engine"
     )
@@ -786,9 +825,9 @@ if __name__ == "__main__":
                         help="Path to removed_redundant_features.csv (Module 204)")
     parser.add_argument("--output", type=str, default=None,
                         help="Output directory")
-    
+
     args = parser.parse_args()
-    
+
     result = run_module205(
         predictive_matrix_path=Path(args.matrix),
         stability_file=Path(args.stability),
@@ -797,5 +836,5 @@ if __name__ == "__main__":
         removed_file=Path(args.removed),
         output_dir=Path(args.output) if args.output else None,
     )
-    
+
     print("\nDone.")
