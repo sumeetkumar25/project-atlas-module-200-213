@@ -266,6 +266,11 @@ def test_pipeline():
         trade_log_path = tmp_path / "trade_log.parquet"
         trade_log.to_parquet(trade_log_path, index=False)
 
+        # Bar-based windows keep this test deterministic:
+        # the synthetic trade log spans only ~21 calendar days at
+        # 500 hourly trades, which is too short for the calendar
+        # heuristic to produce the expected window count. Production
+        # continues to use the calendar default.
         research = WalkForwardValidation(
             train_window_bars=100,
             test_window_bars=50,
