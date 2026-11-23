@@ -26,10 +26,10 @@ from .exporter import FeatureSelectionExporter
 
 class FeatureSelectionResearch(BaseResearchModule):
     """Main research module for feature selection."""
-    
+
     MODULE_OUTPUT = "module205"
     METADATA = FeatureSelectionStatisticsEngine.METADATA
-    
+
     def __init__(
         self,
         registry: Optional[AtlasRegistry] = None,
@@ -39,7 +39,7 @@ class FeatureSelectionResearch(BaseResearchModule):
     ):
         """
         Initialize the feature selection module.
-        
+
         Args:
             registry: Optional Atlas registry
             predictive_threshold: Minimum predictive score to keep
@@ -50,7 +50,7 @@ class FeatureSelectionResearch(BaseResearchModule):
             module_name="Feature Selection",
             module_version=self.METADATA["version"],
         )
-        
+
         self.registry = registry or AtlasRegistry()
         self.engine = FeatureSelectionEngine(
             predictive_threshold=predictive_threshold,
@@ -72,19 +72,19 @@ class FeatureSelectionResearch(BaseResearchModule):
             ("validate", self._validate),
             ("export", self._export_results),
         ]
-    
+
     def _prepare_data(self) -> Dict[str, Any]:
         """Prepare data."""
         if self._paths is None:
             raise ValueError("File paths not provided. Use run_selection() method.")
         return self._paths
-    
+
     def _select_features(self) -> Dict[str, Any]:
         """Step 1: Select and rank features."""
         self.logger.info("Step 1: Selecting and ranking features")
-        
+
         prepared = self._prepare_data()
-        
+
         self.result_data = self.engine.compute(
             predictive_matrix_path=prepared["predictive_matrix"],
             stability_file=prepared["stability_file"],
@@ -93,7 +93,7 @@ class FeatureSelectionResearch(BaseResearchModule):
             removed_file=prepared["removed_file"],
             output_dir=self._output_dir
         )
-        
+
         self.logger.metric(
             "Total Features",
             str(self.result_data.summary_statistics["total_features"])
@@ -115,59 +115,59 @@ class FeatureSelectionResearch(BaseResearchModule):
             f"{self.result_data.summary_statistics['average_score']:.3f}"
         )
         self.logger.success("Feature selection complete")
-        
+
         # Generate report
         self.ranking_report = FeatureSelectionReport.generate_ranking_table(
             self.result_data.feature_ranking,
             top_n=10
         )
-        
+
         return {
             "total_features": self.result_data.summary_statistics["total_features"],
             "selected_count": self.result_data.summary_statistics["selected_count"],
             "rejected_count": self.result_data.summary_statistics["rejected_count"],
             "average_score": self.result_data.summary_statistics["average_score"]
         }
-    
+
     def _compute_statistics(self) -> Dict[str, Any]:
         """Step 2: Computing statistics."""
         self.logger.info("Step 2: Computing statistics")
         self.statistics = self.stats_engine.analyze(self.result_data)
-        
+
         self.logger.metric(
             "Selection Rate",
             f"{self.statistics.selected_percentage:.1f}%"
         )
         self.logger.success("Statistics computed")
-        
+
         return self.stats_engine.summary_dict(self.statistics)
-    
+
     def _validate(self) -> Dict[str, Any]:
         """Step 3: Validation."""
         self.logger.info("Step 3: Validation")
         passed = run_validation(self.result_data, self.statistics)
         self.logger.success("Validation complete")
         return {"software_validation_passed": passed}
-    
+
     def _export_results(self) -> Dict[str, Any]:
         """Step 4: Export."""
         self.logger.info("Step 4: Export")
-        
+
         # Register DataFrames as artifacts
         self.result.artifacts["feature_scores"] = self.result_data.feature_scores
         self.result.artifacts["feature_ranking"] = self.result_data.feature_ranking
-        
+
         # Store selected and rejected features
         selected_df = pd.DataFrame({'selected_features': self.result_data.selected_features})
         rejected_df = pd.DataFrame({'rejected_features': self.result_data.rejected_features})
-        
+
         self.result.artifacts["selected_features"] = selected_df
         self.result.artifacts["rejected_features"] = rejected_df
-        
+
         # Store summary
         summary_df = pd.DataFrame([self.result_data.summary_statistics])
         self.result.artifacts["feature_selection_statistics"] = summary_df
-        
+
         # Generate and register reports
         main_report = FeatureSelectionReport.generate(
             self.statistics,
@@ -176,17 +176,17 @@ class FeatureSelectionResearch(BaseResearchModule):
         )
         self.result.artifacts["feature_selection_report"] = main_report
         self.result.artifacts["ranking_report"] = self.ranking_report
-        
+
         self.logger.metric("Artifacts", str(len(self.result.artifacts)))
         self.logger.success("Export complete")
-        
+
         return {
             "export_status": "complete",
             "artifact_count": len(self.result.artifacts),
             "selected_count": self.result_data.summary_statistics["selected_count"],
             "rejected_count": self.result_data.summary_statistics["rejected_count"]
         }
-    
+
     def compute(self) -> Dict[str, Any]:
         """Run the full computation pipeline."""
         self.logger.section("Feature Selection Pipeline")
@@ -194,17 +194,17 @@ class FeatureSelectionResearch(BaseResearchModule):
         self.result.status = "completed"
         self.logger.success("Module 205 complete")
         return results
-    
+
     def run(self, filepath: str, output_dir=None):
         """Run module on file."""
         self._output_dir = Path(output_dir) if output_dir else None
         return super().run(filepath, output_dir)
-    
+
     def run_dataframe(self, df, dataset_id="in_memory", output_dir=None):
         """Run module on a single DataFrame."""
         self._output_dir = Path(output_dir) if output_dir else None
         return super().run_dataframe(df, dataset_id, output_dir)
-    
+
     def run_selection(
         self,
         predictive_matrix: Path,
@@ -217,7 +217,7 @@ class FeatureSelectionResearch(BaseResearchModule):
     ) -> Any:
         """
         Run the feature selection.
-        
+
         Args:
             predictive_matrix: Path to the predictive feature matrix
             stability_file: Path to the stability scores CSV
@@ -235,14 +235,26 @@ class FeatureSelectionResearch(BaseResearchModule):
             "removed_file": removed_file
         }
         self._output_dir = Path(output_dir) if output_dir else Path("data/feature_store/selected")
-        
-        # Create a dummy DataFrame to satisfy BaseResearchModule
+
+        # Create a dummy DataFrame to satisfy BaseResearchModule.
+        #
+        # Module 205 operates on feature-artifact files rather than
+        # market candles, but the shared base framework still
+        # validates standard market columns. These neutral values
+        # satisfy the framework without affecting feature-selection
+        # calculations — every selection decision is derived from
+        # the upstream artifact paths supplied above.
         dummy = pd.DataFrame(
             {
-                "timestamp": [pd.Timestamp("2000-01-01")]
+                "timestamp": [pd.Timestamp("2000-01-01")],
+                "open": [1.0],
+                "high": [1.0],
+                "low": [1.0],
+                "close": [1.0],
+                "volume": [1.0],
             }
         )
-        
+
         return super().run_dataframe(
             dummy,
             dataset_id=dataset_id,
