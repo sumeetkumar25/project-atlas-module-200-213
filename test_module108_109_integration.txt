@@ -13,13 +13,30 @@ Validates:
     - Target column 'future_breakout' is properly created
     - Full pipeline executes successfully
 
-FIXED: Module 108 now publishes its output table under the
-       "features" artifact key. Every test reads breakout targets
-       from result108.artifacts["features"] (previously
-       "state_probabilities"). The matching assertion on the
-       artifact key has been updated alongside the read sites so
-       that all seven integration tests exercise a single,
-       consistent artifact contract.
+FIXED: Module 108 publishes two distinct artifacts with
+       different granularity:
+
+         - "features": row-level feature table containing
+           timestamp plus the full per-horizon breakout set:
+               timestamp
+               breakout_1
+               breakout_3
+               breakout_5
+               breakout_10
+               breakout_20
+
+         - "state_probabilities": table aggregated by market
+           state, and therefore correctly does NOT contain
+           breakout_5 (there is no per-row column to expose
+           after aggregation).
+
+       Every test reads breakout targets from
+       result108.artifacts["features"]. Reading from
+       "state_probabilities" would fail the
+       `assert "breakout_5" in targets.columns` check on the
+       aggregated table. The matching artifact-key assertions
+       have also been updated so that all seven integration
+       tests exercise a single, consistent artifact contract.
 """
 
 import sys
